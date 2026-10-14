@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mdgan-pytorch"
+version = "0.1.0"
+description = "PyTorch research reproduction of MD-GAN for water diffusion in polymers"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["torch", "numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

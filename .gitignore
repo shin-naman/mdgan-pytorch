@@ -1,0 +1,24 @@
+# Python and tooling
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+
+# Model outputs and large datasets
+checkpoints/
+runs/
+outputs/
+data/raw/
+data/processed/
+*.pt
+*.pth
+*.ckpt
+*.xtc
+*.trr
+*.tpr
+*.edr
+*.cpt
