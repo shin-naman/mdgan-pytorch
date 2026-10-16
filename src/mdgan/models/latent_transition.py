@@ -32,19 +32,13 @@ class LatentTransitionGenerator(nn.Module):
         self.validate_finite = validate_finite
         self.use_running_stats = use_running_stats
 
-        self.network = nn.Sequential(
-            nn.Linear(latent_dim + noise_dim, hidden_dim),
-            nn.LeakyReLU(negative_slope=negative_slope),
-
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(negative_slope=negative_slope),
-
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(negative_slope=negative_slope),
-
-            nn.Linear(hidden_dim, latent_dim),
-            nn.BatchNorm1d(latent_dim, track_running_stats=use_running_stats)
-        )
+        # [z, r] -> Affine+LReLU -> Affine+LReLU -> Affine+LReLU -> Affine -> BatchNorm -> z'
+        self.input_layer = nn.Linear(latent_dim + noise_dim, hidden_dim)
+        self.hidden1 = nn.Linear(hidden_dim, hidden_dim)
+        self.hidden2 = nn.Linear(hidden_dim, hidden_dim)
+        self.output_layer = nn.Linear(hidden_dim, latent_dim)
+        self.output_norm = nn.BatchNorm1d(latent_dim, track_running_stats=use_running_stats)
+        self.act = nn.LeakyReLU(negative_slope=negative_slope)  # stateless; shared by all three uses
 
     def forward(self, z: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
         """Compute the next latent state from the current state and noise."""
@@ -70,7 +64,15 @@ class LatentTransitionGenerator(nn.Module):
                     raise ValueError(f"Input {name} contains NaN or inf values")
 
         x = torch.cat((z, r), dim=1)
-        return self.network(x)
+        h = self.act(self.input_layer(x))
+        h = self.act(self.hidden1(h))
+        h = self.act(self.hidden2(h))
+        return self.output_norm(self.output_layer(h))
+
+    def sample_noise(self, batch: int, *, device=None, dtype=None,
+                     generator: torch.Generator | None = None) -> torch.Tensor:
+        """r for `batch` samples: r ~ U[0,1), shape (B, noise_dim)."""
+        return torch.rand(batch, self.noise_dim, device=device, dtype=dtype, generator=generator)
 
     def unroll(self, z0: torch.Tensor, steps: int,
                generator: torch.Generator | None = None) -> torch.Tensor:
@@ -85,8 +87,7 @@ class LatentTransitionGenerator(nn.Module):
         states = [z0]
         z = z0
         for _ in range(steps):
-            r = torch.rand(z.shape[0], self.noise_dim,
-                           device=z.device, dtype=z.dtype, generator=generator)
+            r = self.sample_noise(z.shape[0], device=z.device, dtype=z.dtype, generator=generator)
             z = self(z, r)
             states.append(z)
         return torch.stack(states, dim=0)

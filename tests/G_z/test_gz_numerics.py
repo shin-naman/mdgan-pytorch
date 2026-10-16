@@ -192,3 +192,12 @@ def test_no_unexpected_submodules(model):
     kinds = {type(m) for m in model.modules()}
     assert kinds <= {LatentTransitionGenerator, nn.Sequential, nn.Linear,
                      nn.LeakyReLU, nn.BatchNorm1d}
+
+# 6. Sample noise
+
+def test_sample_noise_shape_range_and_reproducibility(model):
+    r1 = model.sample_noise(4096, generator=torch.Generator().manual_seed(0))
+    r2 = model.sample_noise(4096, generator=torch.Generator().manual_seed(0))
+    assert r1.shape == (4096, 3)
+    assert r1.min() >= 0 and r1.max() < 1
+    assert torch.equal(r1, r2)

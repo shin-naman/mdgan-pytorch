@@ -37,25 +37,54 @@ def _inputs(batch: int = 8, latent_dim: int = 7, noise_dim: int = 3):
 def test_reference_network_layers_and_dimensions():
     """Catch swapped dimensions, missing layers, wrong activations/normalizer."""
     gz = LatentTransitionGenerator(32, 11, hidden_dim=48, negative_slope=0.17)
-    layers = list(gz.network.children())
-    expected_types = [
-        nn.Linear, nn.LeakyReLU,
-        nn.Linear, nn.LeakyReLU,
-        nn.Linear, nn.LeakyReLU,
-        nn.Linear, nn.BatchNorm1d,
-    ]
-    assert len(layers) == len(expected_types)
-    assert [type(layer) for layer in layers] == expected_types
+    assert isinstance(gz.input_layer, nn.Linear)
+    assert isinstance(gz.hidden1, nn.Linear)
+    assert isinstance(gz.hidden2, nn.Linear)
+    assert isinstance(gz.output_layer, nn.Linear)
+    assert isinstance(gz.output_norm, nn.BatchNorm1d)
+    assert isinstance(gz.act, nn.LeakyReLU)
     linear_shapes = [(layer.in_features, layer.out_features)
-                     for layer in layers if isinstance(layer, nn.Linear)]
+                     for layer in (gz.input_layer, gz.hidden1, gz.hidden2, gz.output_layer)]
     assert linear_shapes == [(43, 48), (48, 48), (48, 48), (48, 32)]
-    for activation in (layer for layer in layers if isinstance(layer, nn.LeakyReLU)):
-        assert activation.negative_slope == pytest.approx(0.17)
-    assert layers[-1].num_features == 32
+    assert gz.act.negative_slope == pytest.approx(0.17)
+    assert gz.output_norm.num_features == 32
     # Decision: batch statistics in train AND eval by default (docs/decisions.md).
-    assert layers[-1].track_running_stats is False
+    assert gz.output_norm.track_running_stats is False
     gz_rs = LatentTransitionGenerator(32, 11, hidden_dim=48, use_running_stats=True)
-    assert list(gz_rs.network.children())[-1].track_running_stats is True
+    assert gz_rs.output_norm.track_running_stats is True
+    # Exactly these submodules and no others (no hidden Sequential, dropout, etc.).
+    assert sorted(name for name, _ in gz.named_children()) == sorted(
+        ["input_layer", "hidden1", "hidden2", "output_layer", "output_norm", "act"])
+
+
+def test_forward_uses_every_layer_in_reference_order():
+    """Hooks record the call order; a skipped layer or wrong wiring shows up here."""
+    gz = LatentTransitionGenerator(7, 3, hidden_dim=24)
+    gz.eval()
+    order = []
+    handles = [getattr(gz, n).register_forward_hook(lambda m, i, o, n=n: order.append(n))
+               for n in ("input_layer", "hidden1", "hidden2", "output_layer", "output_norm")]
+    try:
+        with torch.no_grad():
+            gz(torch.rand(4, 7), torch.rand(4, 3))
+    finally:
+        for h in handles:
+            h.remove()
+    assert order == ["input_layer", "hidden1", "hidden2", "output_layer", "output_norm"]
+
+
+def test_activation_applied_after_each_hidden_affine_but_not_after_output():
+    """act is called exactly three times per forward (after input, hidden1, hidden2)."""
+    gz = LatentTransitionGenerator(7, 3, hidden_dim=24)
+    gz.eval()
+    calls = []
+    handle = gz.act.register_forward_hook(lambda m, i, o: calls.append(i[0].shape))
+    try:
+        with torch.no_grad():
+            gz(torch.rand(4, 7), torch.rand(4, 3))
+    finally:
+        handle.remove()
+    assert calls == [(4, 24), (4, 24), (4, 24)]
 
 
 def test_default_width_matches_reference_design():
@@ -81,7 +110,7 @@ def test_independent_latent_noise_and_batch_dimensions(latent_dim, noise_dim, ba
 
 def test_concat_is_featurewise_and_in_z_then_r_order(model):
     """A forward pre-hook catches a silently reversed cat((r,z)) or dim error."""
-    first_layer = next(m for m in model.network if isinstance(m, nn.Linear))
+    first_layer = model.input_layer
     seen = []
     handle = first_layer.register_forward_pre_hook(
         lambda module, inputs: seen.append(inputs[0].detach().clone())
@@ -217,8 +246,8 @@ def test_optimizer_step_really_updates_model_parameters(model):
                if not torch.equal(before[name], p.detach())]
     assert changed, "optimizer.step() did not change any learnable parameters"
     # More discriminating than just checking the BatchNorm bias changed:
-    assert any(name.startswith("network.0.") for name in changed), changed
-    assert any(name.startswith("network.6.") for name in changed), changed
+    assert any(name.startswith("input_layer.") for name in changed), changed
+    assert any(name.startswith("output_layer.") for name in changed), changed
 
 
 # 5. BatchNorm behavior
