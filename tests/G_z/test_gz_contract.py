@@ -8,7 +8,7 @@ Assumed production API:
         -> Tensor[B, latent_dim]
 
 These tests are independent of G_Y, GROMACS, and model training quality.
-Run: python -m pytest tests/test_gz_contract.py -v
+Run: python -m pytest tests/G_z/test_gz_contract.py -v
 """
 
 import pytest
@@ -52,7 +52,10 @@ def test_reference_network_layers_and_dimensions():
     for activation in (layer for layer in layers if isinstance(layer, nn.LeakyReLU)):
         assert activation.negative_slope == pytest.approx(0.17)
     assert layers[-1].num_features == 32
-    assert layers[-1].track_running_stats is True
+    # Decision: batch statistics in train AND eval by default (docs/decisions.md).
+    assert layers[-1].track_running_stats is False
+    gz_rs = LatentTransitionGenerator(32, 11, hidden_dim=48, use_running_stats=True)
+    assert list(gz_rs.network.children())[-1].track_running_stats is True
 
 
 def test_default_width_matches_reference_design():
@@ -218,53 +221,116 @@ def test_optimizer_step_really_updates_model_parameters(model):
     assert any(name.startswith("network.6.") for name in changed), changed
 
 
-# 5. BatchNorm correctness and inference behavior
+# 5. BatchNorm behavior
+#
+# Default mode (use_running_stats=False): batch statistics in train and eval.
+# The output BatchNorm is then a distribution-stabilization mechanism that is
+# active during the long estimation rollout. Running-stats mode is kept as an
+# opt-in for comparison experiments.
 
-def test_training_mode_updates_batchnorm_statistics(model):
+@pytest.fixture
+def model_rs():
+    torch.manual_seed(717)
+    return LatentTransitionGenerator(
+        latent_dim=7, noise_dim=3, hidden_dim=24, negative_slope=0.17,
+        use_running_stats=True,
+    )
+
+
+def test_default_mode_has_no_running_statistics(model):
     bn = next(m for m in model.modules() if isinstance(m, nn.BatchNorm1d))
-    model.train()
-    old_count = bn.num_batches_tracked.item()
+    assert bn.running_mean is None and bn.running_var is None
+
+
+def test_default_mode_eval_equals_train_output(model):
+    """Batch statistics are used in both modes, so the only difference is autograd."""
     z, r = _inputs(batch=8)
-    model(z, r)
+    model.train()
+    with torch.no_grad():
+        out_train = model(z, r)
+    model.eval()
+    with torch.no_grad():
+        out_eval = model(z, r)
+    torch.testing.assert_close(out_train, out_eval, rtol=0, atol=0)
+
+
+def test_default_mode_output_is_batch_normalized_in_eval(model):
+    """Each latent dimension has zero mean and variance v/(v+eps) across the
+    batch, where v is the pre-BatchNorm batch variance (gamma=1, beta=0 at
+    init). This is the stabilization property; the eps term matters only when
+    pre-BN activations are tiny, as with this small test width.
+    """
+    model.eval()
+    bn = next(m for m in model.modules() if isinstance(m, nn.BatchNorm1d))
+    captured = []
+    handle = bn.register_forward_pre_hook(lambda m, inp: captured.append(inp[0].detach()))
+    z, r = _inputs(batch=256)
+    try:
+        with torch.no_grad():
+            out = model(z, r)
+    finally:
+        handle.remove()
+    pre_var = captured[0].var(0, unbiased=False)
+    expected_var = pre_var / (pre_var + bn.eps)
+    torch.testing.assert_close(out.mean(0), torch.zeros(7), atol=1e-5, rtol=0)
+    torch.testing.assert_close(out.var(0, unbiased=False), expected_var, atol=1e-4, rtol=1e-4)
+    # And the property we actually rely on: output variance is O(1), never
+    # growing or collapsing with the input scale.
+    with torch.no_grad():
+        out_big = model(z * 1e3, r)
+    assert (out_big.var(0, unbiased=False) > 0.99).all()
+
+
+def test_default_mode_rejects_singleton_batch_in_both_modes(model):
+    z, r = _inputs(batch=1)
+    for mode in (model.train, model.eval):
+        mode()
+        with pytest.raises(ValueError, match="at least 2"):
+            model(z, r)
+
+
+def test_running_stats_mode_updates_statistics_in_train(model_rs):
+    bn = next(m for m in model_rs.modules() if isinstance(m, nn.BatchNorm1d))
+    model_rs.train()
+    old_count = bn.num_batches_tracked.item()
+    model_rs(*_inputs(batch=8))
     assert bn.num_batches_tracked.item() == old_count + 1
 
 
-def test_eval_mode_keeps_batchnorm_statistics_fixed(model):
-    bn = next(m for m in model.modules() if isinstance(m, nn.BatchNorm1d))
-    model.train()
+def test_running_stats_mode_keeps_statistics_fixed_in_eval(model_rs):
+    bn = next(m for m in model_rs.modules() if isinstance(m, nn.BatchNorm1d))
+    model_rs.train()
     for _ in range(3):
-        model(*_inputs())
-    model.eval()
+        model_rs(*_inputs())
+    model_rs.eval()
     before_mean = bn.running_mean.clone()
     before_var = bn.running_var.clone()
     with torch.no_grad():
-        model(*_inputs())
+        model_rs(*_inputs())
     torch.testing.assert_close(before_mean, bn.running_mean, rtol=0, atol=0)
     torch.testing.assert_close(before_var, bn.running_var, rtol=0, atol=0)
 
 
-def test_eval_state_is_independent_of_other_samples_in_batch(model):
-    """Important when inference is chunked into different batch sizes."""
-    model.train()
+def test_running_stats_mode_eval_is_sample_independent(model_rs):
+    model_rs.train()
     for _ in range(3):
-        model(*_inputs())
-    model.eval()
+        model_rs(*_inputs())
+    model_rs.eval()
     z, r = _inputs(batch=8)
     with torch.no_grad():
-        isolated = model(z[:1], r[:1])
-        together = model(z, r)[:1]
+        isolated = model_rs(z[:1], r[:1])
+        together = model_rs(z, r)[:1]
     torch.testing.assert_close(isolated, together, atol=1e-6, rtol=1e-5)
 
 
-def test_singleton_batch_is_supported_in_eval_but_not_train(model):
-    """KNOWN BatchNorm1d limitation, not automatically a G_z implementation bug."""
+def test_running_stats_mode_singleton_batch_eval_only(model_rs):
     z, r = _inputs(batch=1)
-    model.eval()
+    model_rs.eval()
     with torch.no_grad():
-        assert model(z, r).shape == (1, 7)
-    model.train()
-    with pytest.raises(ValueError, match="more than 1 value per channel"):
-        model(z, r)
+        assert model_rs(z, r).shape == (1, 7)
+    model_rs.train()
+    with pytest.raises(ValueError, match="at least 2"):
+        model_rs(z, r)
 
 
 # 6. State management and short rollouts (not a stationarity test)
@@ -280,6 +346,7 @@ def test_model_checkpoint_state_dict_restores_exact_eval_predictions(model, tmp_
     path = tmp_path / "gz_weights.pt"
     torch.save(model.state_dict(), path)
     restored = LatentTransitionGenerator(7, 3, hidden_dim=24, negative_slope=0.17)
+    assert set(restored.state_dict()) == set(torch.load(path, weights_only=True))
     restored.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     restored.eval()
     with torch.no_grad():

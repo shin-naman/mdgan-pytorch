@@ -4,7 +4,7 @@ Unlike test_gz_contract.py, these tests MAY FAIL against a minimal working
 G_z. That is their point. Decide whether these safeguards belong in G_z or
 at the dataset/training boundary before modifying production code.
 
-Run: python -m pytest tests/test_gz_hardening.py -v
+Run: python -m pytest tests/G_z/test_gz_hardening.py -v
 """
 
 import pytest
@@ -34,12 +34,10 @@ def test_invalid_dimensions_rejected_at_construction(name, kwargs):
     ("r", -float("inf")),
 ])
 def test_nonfinite_inputs_rejected_before_poisoning_batchnorm(which, bad_value):
-    """Strict safety policy: reject NaNs/Infs before they reach BN running stats.
-
-    G_z may instead rely on a validated data/trainer boundary. In that case,
-    MOVE these tests to that boundary; do not silently ignore the risk.
+    """Opt-in debug check (validate_finite=True). It costs a device sync per
+    call, so it is OFF by default; the trainer owns divergence detection.
     """
-    gz = LatentTransitionGenerator(7, 3, hidden_dim=16)
+    gz = LatentTransitionGenerator(7, 3, hidden_dim=16, validate_finite=True)
     gz.train()
     z = torch.rand(8, 7)
     r = torch.rand(8, 3)
@@ -52,11 +50,7 @@ def test_nonfinite_inputs_rejected_before_poisoning_batchnorm(which, bad_value):
 
 
 def test_training_batch_of_one_has_an_explicit_error_policy():
-    """Optional: require our own actionable error, not low-level BN exception.
-
-    Unlike the contract test documenting the existing BatchNorm restriction,
-    this requires the model to validate B >= 2 in train mode explicitly.
-    """
+    """Require our own actionable error, not the low-level BatchNorm exception."""
     gz = LatentTransitionGenerator(7, 3, hidden_dim=16)
     gz.train()
     with pytest.raises(ValueError, match="batch size|batch_size|at least 2"):
