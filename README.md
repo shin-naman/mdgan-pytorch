@@ -20,14 +20,15 @@ pytest
 ```
 
 ## Layout
-- `src/mdgan/models/`: trainable networks (`latent_transition.py` is intentionally a placeholder)
+- `src/mdgan/models/`: trainable networks 
 - `tests/`: model and tensor contract tests
+- `tools/`: model test mutation tools 
 - `docs/architecture.md`: scientific architecture contract and reference
 - `docs/decisions.md`: known unknowns and research decisions
 
 ## Roadmap
-1. Implement and test `G_z`.
-2. Implement `G_Y` and critic `D_G`.
+1. Implement and test `G_z`. DONE
+2. Implement `G_Y` and critic `D_G`. DONE
 3. Implement WGAN-GP training and synthetic-data tests.
 4. Add GROMACS processing and physical evaluation.
 

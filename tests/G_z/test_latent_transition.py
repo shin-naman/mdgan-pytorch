@@ -6,7 +6,7 @@ from mdgan.models.latent_transition import LatentTransitionGenerator
 def test_gz_output_shape():
     batch_size = 64
     latent_dim = 32
-    noise_dim = 32  # Provisional choice; not sure how many more dimensions to give exploration
+    noise_dim = 32  
 
     model = LatentTransitionGenerator(
         latent_dim=latent_dim,
