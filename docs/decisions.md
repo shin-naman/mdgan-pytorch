@@ -65,3 +65,5 @@ Sources: Endo et al. 2018 (AAAI), Kawada et al. 2022 (Soft Matter) + ESI, Kawada
 | Preprocessing | Decided | Unwrap PBC before water COM; diff positions → displacements; apply step skip n_s; windows of 2M = 128. Units nm. |
 
 We will explicitly distinguish reproduced architecture from undocumented implementation assumptions.
+
+| Critic output bias | Confirmed (property) | Has identically zero gradient under WGAN-GP with equal real/fake batch sizes; D is defined up to a constant. Stays at init forever. Not a bug; nothing to tune. |
