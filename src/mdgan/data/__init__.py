@@ -1,0 +1,1 @@
+"""Data extraction: XTC -> water COM displacements -> training windows and reference MSD."""
