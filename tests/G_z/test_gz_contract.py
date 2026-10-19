@@ -48,6 +48,7 @@ def test_reference_network_layers_and_dimensions():
     assert linear_shapes == [(43, 48), (48, 48), (48, 48), (48, 32)]
     assert gz.act.negative_slope == pytest.approx(0.17)
     assert gz.output_norm.num_features == 32
+    assert gz.output_norm.affine is True   # learnable gamma/beta; the paper's BatchNorm has them
     # Decision: batch statistics in train AND eval by default (docs/decisions.md).
     assert gz.output_norm.track_running_stats is False
     gz_rs = LatentTransitionGenerator(32, 11, hidden_dim=48, use_running_stats=True)
@@ -361,6 +362,13 @@ def test_running_stats_mode_singleton_batch_eval_only(model_rs):
     with pytest.raises(ValueError, match="at least 2"):
         model_rs(z, r)
 
+def test_constructor_defaults_match_decisions():
+    """docs/decisions.md: batch-stat BatchNorm, no finite checks in the hot path, slope 0.2."""
+    gz = LatentTransitionGenerator(7, 3)
+    assert gz.use_running_stats is False
+    assert gz.validate_finite is False
+    assert gz.act.negative_slope == pytest.approx(0.2)
+
 
 # 6. State management and short rollouts (not a stationarity test)
 
@@ -375,7 +383,12 @@ def test_model_checkpoint_state_dict_restores_exact_eval_predictions(model, tmp_
     path = tmp_path / "gz_weights.pt"
     torch.save(model.state_dict(), path)
     restored = LatentTransitionGenerator(7, 3, hidden_dim=24, negative_slope=0.17)
-    assert set(restored.state_dict()) == set(torch.load(path, weights_only=True))
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    assert set(state) == {
+        "input_layer.weight", "input_layer.bias", "hidden1.weight", "hidden1.bias",
+        "hidden2.weight", "hidden2.bias", "output_layer.weight", "output_layer.bias",
+        "output_norm.weight", "output_norm.bias",
+    }
     restored.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     restored.eval()
     with torch.no_grad():
