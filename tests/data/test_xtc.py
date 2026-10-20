@@ -215,7 +215,7 @@ def test_missing_file():
 @pytest.mark.skipif("MDGAN_PE_DIR" not in os.environ, reason="set MDGAN_PE_DIR to the PE trajectory dir")
 def test_real_pe_trajectory_facts():
     """Facts established by inspection and relied on downstream."""
-    raw = read_xtc(Path(os.environ["MDGAN_PE_DIR"]) / "traj001.xtc")
+    raw = read_xtc(Path(os.environ["MDGAN_PE_DIR"]) / "trajectory" / "traj001.xtc")
     assert raw.n_frames == 8001 and raw.n_atoms == 3
     assert raw.dt_ps == pytest.approx(10.0)
     assert raw.time_ps[0] == 0.0 and raw.time_ps[-1] == pytest.approx(80000.0)
