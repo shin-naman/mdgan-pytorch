@@ -11,10 +11,22 @@ requires-python = ">=3.11"
 dependencies = ["torch", "numpy"]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "ruff"]
+data = ["mdtraj"]            # reading .xtc trajectories (src/mdgan/data/xtc.py)
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Default run: the fast tier. Everything else is selected explicitly (see docs/testing.md).
+addopts = "--strict-markers -m 'not slow and not gpu and not learning and not mutation'"
+markers = [
+    "slow: takes more than ~10 s; nightly",
+    "gpu: needs CUDA or MPS; smoke only",
+    "real_data: needs MDGAN_PE_DIR (skips itself when unset; never excluded by default)",
+    "statistical: asserts a sampling tolerance; the docstring derives it",
+    "ablation: exercises an option the baseline does not use",
+    "learning: trains something and asserts what it learned",
+    "mutation: applies a deliberate breakage and asserts the suite catches it",
+]

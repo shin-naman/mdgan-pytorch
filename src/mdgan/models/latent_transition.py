@@ -4,14 +4,13 @@ from torch import nn
 
 class LatentTransitionGenerator(nn.Module):
     """Stochastic latent transition generator (G_z) for MD-GAN."""
-    
-    def __init__(self, 
-                 latent_dim: int, 
+
+    def __init__(self,
+                 latent_dim: int,
                  noise_dim: int,
                  hidden_dim: int = 2048,
                  negative_slope: float = 0.2,
-                 use_running_stats: bool = False,
-                 validate_finite: bool = False):
+                 use_running_stats: bool = False):
         super().__init__()
 
         for name, value in {
@@ -29,7 +28,6 @@ class LatentTransitionGenerator(nn.Module):
         self.latent_dim = latent_dim
         self.noise_dim = noise_dim
         self.hidden_dim = hidden_dim
-        self.validate_finite = validate_finite
         self.use_running_stats = use_running_stats
 
         # [z, r] -> Affine+LReLU -> Affine+LReLU -> Affine+LReLU -> Affine -> BatchNorm -> z'
@@ -42,7 +40,6 @@ class LatentTransitionGenerator(nn.Module):
 
     def forward(self, z: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
         """Compute the next latent state from the current state and noise."""
-
         if z.dim() != 2 or r.dim() != 2:
             raise ValueError(
                 f"z and r must be rank-2 (B, features); got z{tuple(z.shape)} r{tuple(r.shape)}"
@@ -57,11 +54,6 @@ class LatentTransitionGenerator(nn.Module):
             raise ValueError(
                 "batch size must be at least 2 when BatchNorm uses batch statistics"
             )
-        
-        if self.validate_finite:
-            for name, tensor in (("z", z), ("r", r)):
-                if not torch.isfinite(tensor).all().item():
-                    raise ValueError(f"Input {name} contains NaN or inf values")
 
         x = torch.cat((z, r), dim=1)
         h = self.act(self.input_layer(x))
