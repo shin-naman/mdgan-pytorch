@@ -1,6 +1,8 @@
-"""Synthetic rigid-water trajectories with known unwrapped ground truth.
+"""Synthetic data helpers shared by the tests (not a test module).
 
-Shared by the water tests. Not a test module (no test_ prefix).
+- rigid_water / unwrapped_trajectory / wrap: rigid TIP3P water on a random-walk
+  COM with a known unwrapped ground truth.
+- write_xtc: write a small .xtc with mdtraj (imported lazily).
 """
 
 import numpy as np
@@ -41,3 +43,20 @@ def unwrapped_trajectory(rng, n_frames, box, step_std=0.1, hop_every=None, hop_s
 def wrap(xyz, box):
     """Wrap into [0, L) per atom, like a trajectory written with wrapped coordinates."""
     return xyz - box * np.floor(xyz / box)
+
+
+def write_xtc(path, xyz, *, box, time=None, dt=10.0):
+    """Write coordinates to an .xtc.
+
+    box: (3,) box lengths, tiled over frames, or a full (T, 3, 3) box-vector array.
+    time: (T,) time stamps; defaults to arange(T) * dt.
+    """
+    from mdtraj.formats import XTCTrajectoryFile
+    xyz = np.asarray(xyz)
+    T = xyz.shape[0]
+    box = np.asarray(box)
+    boxes = np.tile(np.diag(box), (T, 1, 1)) if box.shape == (3,) else box
+    time = np.arange(T) * dt if time is None else np.asarray(time)
+    with XTCTrajectoryFile(str(path), "w") as f:
+        f.write(xyz.astype(np.float32), time=time.astype(np.float32),
+                step=np.arange(T), box=boxes.astype(np.float32))

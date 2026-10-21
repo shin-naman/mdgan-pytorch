@@ -3,13 +3,10 @@
 Part 1 tests the validation and the RawTrajectory container directly on
 in-memory arrays: no files, no mdtraj. Part 2 writes small synthetic .xtc
 files with mdtraj into tmp_path and reads them back (skipped if mdtraj is
-absent). Part 3 runs only when MDGAN_PE_DIR points at the PE trajectory dir.
+absent). Part 3 uses the `pe_dir` fixture (real_data; skips unless MDGAN_PE_DIR is set).
 
 Run: python -m pytest tests/data/test_xtc.py -v
 """
-
-import os
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -154,6 +151,21 @@ def test_single_tilted_frame_is_enough_to_reject():
         _validate(xyz, time, box, "mem")
 
 
+def test_float32_ulp_jitter_still_counts_as_constant_box():
+    """XTC stores boxes as float32. One ulp at 4.75 nm is ~4.8e-7 nm, just below
+    ORTHORHOMBIC_TOL_NM = 1e-6. A real file whose box differs only by float32
+    rounding must not be reported as a varying box (which preprocess rejects)."""
+    xyz, time, box = arrays()
+    L = np.float32(4.7)
+    jitter = np.where(np.arange(50) % 2 == 0, L, np.nextafter(L, np.float32(10)))   # alternate by one ulp
+    box[:, 0, 0] = jitter
+    raw = _validate(xyz, time, box, "mem")
+    assert np.ptp(raw.box_nm[:, 0]) > 0                   # the jitter is really there
+    assert raw.box_is_constant
+    box[25:, 0, 0] = L * np.float32(1.0001)               # a genuine 0.5 pm-per-nm change
+    assert not _validate(xyz, time, box, "mem").box_is_constant
+
+
 def test_off_diagonal_within_tolerance_accepted():
     xyz, time, box = arrays()
     box[:, 0, 1] = ORTHORHOMBIC_TOL_NM / 10
@@ -170,22 +182,16 @@ def test_bad_box_shape_rejected():
 # Part 2: real .xtc files written with mdtraj
 # =============================================================================
 
-mdtraj = pytest.importorskip("mdtraj", reason="file round-trip tests need mdtraj")
-from mdtraj.formats import XTCTrajectoryFile  # noqa: E402
+from synthetic_water import write_xtc  # noqa: E402
 
 XTC_PRECISION_NM = 1e-3   # the format stores coordinates with 3 decimals
 
 
-def write_xtc(path, xyz, time, box):
-    with XTCTrajectoryFile(str(path), "w") as f:
-        f.write(xyz.astype(np.float32), time=time.astype(np.float32),
-                step=np.arange(len(time)), box=box.astype(np.float32))
-
-
 def test_file_round_trip(tmp_path):
+    pytest.importorskip("mdtraj")
     xyz, time, box = arrays()
     p = tmp_path / "t.xtc"
-    write_xtc(p, xyz, time, box)
+    write_xtc(p, xyz, time=time, box=box)
     raw = read_xtc(p)
     assert raw.n_frames == 50 and raw.n_atoms == 3 and raw.dt_ps == pytest.approx(10.0)
     np.testing.assert_allclose(raw.xyz, xyz, atol=XTC_PRECISION_NM)
@@ -195,15 +201,17 @@ def test_file_round_trip(tmp_path):
 
 
 def test_file_validation_errors_carry_the_path(tmp_path):
+    pytest.importorskip("mdtraj")
     xyz, time, box = arrays()
     box[:, 1, 0] = 0.5
     p = tmp_path / "tilted.xtc"
-    write_xtc(p, xyz, time, box)
+    write_xtc(p, xyz, time=time, box=box)
     with pytest.raises(ValueError, match="tilted.xtc"):
         read_xtc(p)
 
 
 def test_missing_file():
+    pytest.importorskip("mdtraj")
     with pytest.raises(FileNotFoundError):
         read_xtc("/nonexistent/traj.xtc")
 
@@ -212,10 +220,10 @@ def test_missing_file():
 # Part 3: real data (opt-in)
 # =============================================================================
 
-@pytest.mark.skipif("MDGAN_PE_DIR" not in os.environ, reason="set MDGAN_PE_DIR to the PE trajectory dir")
-def test_real_pe_trajectory_facts():
+@pytest.mark.real_data
+def test_real_pe_trajectory_facts(pe_dir):
     """Facts established by inspection and relied on downstream."""
-    raw = read_xtc(Path(os.environ["MDGAN_PE_DIR"]) / "trajectory" / "traj001.xtc")
+    raw = read_xtc(pe_dir / "trajectory" / "traj001.xtc")
     assert raw.n_frames == 8001 and raw.n_atoms == 3
     assert raw.dt_ps == pytest.approx(10.0)
     assert raw.time_ps[0] == 0.0 and raw.time_ps[-1] == pytest.approx(80000.0)

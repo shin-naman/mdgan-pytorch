@@ -30,3 +30,15 @@ markers = [
     "learning: trains something and asserts what it learned",
     "mutation: applies a deliberate breakage and asserts the suite catches it",
 ]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# Correctness-focused and pinned explicitly, so a ruff upgrade cannot change what CI enforces.
+select = ["E4", "E7", "E9", "F", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Compact one-line setups (`m.train(); a = m(x)`, `if p == "x": z = ...`) are idiomatic in these tests.
+"tests/**" = ["E701", "E702", "E741", "B017"]

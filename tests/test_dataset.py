@@ -7,9 +7,6 @@ into windows or sigma is unmistakable.
 Run: python -m pytest tests/data/test_dataset.py -v
 """
 
-import os
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
@@ -80,6 +77,23 @@ def test_all_phases_counts_and_region():
     ds = WindowDataset(make_system(), block_len=M, step_skip=NS, phase_mode="all")
     assert ds.n_windows == 5 * NS
     assert ds.region_steps == 2 * M * NS + (NS - 1)
+
+
+def test_phase_windows_are_shifted_by_exactly_one_fine_step():
+    """With fine displacements d[t] = t (a ramp), the phase-p coarse step j is
+    sum_{k<n_s} (p + j*n_s + k), so consecutive phases differ by exactly n_s per
+    coarse step. Checks that phase p really starts p fine steps later, not just
+    that the counts are right."""
+    ns, n_traj = 2, 3
+    ramp = np.arange(300, dtype=np.float32)[None, :, None].repeat(n_traj, 0).repeat(3, 2)
+    sys_ = SystemData(name="ramp", displacements=ramp, dt_ps=10.0,
+                      box_nm=np.full((n_traj, 3), 4.75), meta={})
+    ds = WindowDataset(sys_, block_len=M, step_skip=ns, phase_mode="all")
+    w = ds.windows.numpy().astype(np.float64) * ds.sigma_nm          # back to nm
+    phase0, phase1 = w[:n_traj], w[n_traj:]
+    j = np.arange(2 * M)[None, :, None]
+    np.testing.assert_allclose(phase0, (2 * j * ns + 1) * np.ones_like(phase0), rtol=1e-5)
+    np.testing.assert_allclose(phase1 - phase0, ns, rtol=1e-5)
 
 
 def test_modes_identical_for_step_skip_one():
@@ -215,11 +229,10 @@ def test_metadata_is_complete_and_json_serializable():
 
 # --- real data (opt-in) --------------------------------------------------------------------------------
 
-@pytest.mark.skipif("MDGAN_PE_DIR" not in os.environ, reason="set MDGAN_PE_DIR to MD_data/PE")
-def test_real_pe_training_set():
+@pytest.mark.real_data
+def test_real_pe_training_set(pe):
     """2023 paper, PE: M = 64, n_s = 1 -> 1.28 ns input = one window per trajectory."""
-    from mdgan.data.preprocess import process_system
-    ds = WindowDataset(process_system(Path(os.environ["MDGAN_PE_DIR"])), block_len=64, step_skip=1)
+    ds = WindowDataset(pe[0], block_len=64, step_skip=1)
     assert ds.n_windows == 60 and ds.window_len == 128 and ds.region_steps == 128
     assert ds.dt_ps == 10.0
     assert 0.15 < ds.sigma_nm < 0.20            # measured ~0.17 nm per-axis step std

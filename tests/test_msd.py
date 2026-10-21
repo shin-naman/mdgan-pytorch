@@ -1,12 +1,9 @@
 """Unit tests for mdgan.data.msd (synthetic), plus opt-in real-data checks.
 
-Real-data tests need MDGAN_PE_DIR = MD_data/PE (with msd.out inside).
+Real-data tests use the session `pe` fixture (real_data; skips unless MDGAN_PE_DIR is set).
 
 Run: python -m pytest tests/data/test_msd.py -v
 """
-
-import os
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -92,27 +89,50 @@ def test_ensemble_msd_definition():
     assert msd_ensemble(d)[0] == 0.0
 
 
+@pytest.mark.statistical
 def test_ensemble_and_time_average_agree_for_brownian_motion():
-    """Equal in expectation; with 2000 chains both are within a few % of 6 D t."""
-    rng = np.random.default_rng(5)
-    d = brownian(rng, 2000, 400)
+    """Both estimators match 6 D t on Brownian motion.
+
+    Tolerance. Per chain, |r(t)|^2 is a sum of 3 axes, each s * chi^2_1 with
+    s = 2 D t, so mean 3s and variance 3 * 2 s^2 = 6 s^2: relative std sqrt(2/3).
+    Over N independent chains the ensemble MSD has relative standard error
+    sqrt(2 / (3N)). The time average uses many correlated origins, so its error
+    at every lag is AT MOST that of a single origin (equality at the last lag,
+    where only one origin exists); the same bound covers it. rtol = 5 standard
+    errors: a correct implementation essentially never exceeds it under any seed,
+    while the bugs this test exists for (wrong factor 2/3/6, wrong dt, missing
+    axis) are errors of 30 % or more.
+    """
+    N, T = 2000, 400
+    d = brownian(np.random.default_rng(5), N, T)
     ens = msd_ensemble(d)
     ta, _ = msd_time_averaged(d)
-    t = np.arange(401) * 10.0
-    theory = 6 * (1.3e-10 / 1e-6) * t
-    np.testing.assert_allclose(ens[1:], theory[1:], rtol=0.08)
-    np.testing.assert_allclose(ta[1:], theory[1:], rtol=0.08)
+    theory = 6 * (1.3e-10 / 1e-6) * np.arange(T + 1) * 10.0
+    rtol = 5 * np.sqrt(2 / (3 * N))                       # = 0.091
+    np.testing.assert_allclose(ens[1:], theory[1:], rtol=rtol)
+    np.testing.assert_allclose(ta[1:], theory[1:], rtol=rtol)
 
 
 # --- diffusion coefficient ---------------------------------------------------------------------------
 
+@pytest.mark.statistical
 def test_diffusion_coefficient_recovers_known_D():
-    rng = np.random.default_rng(6)
-    d = brownian(rng, 4000, 2500, D_m2s=1.3e-10)
-    ens = msd_ensemble(d)
-    D, slope = diffusion_coefficient(ens, 10.0)
-    assert D == pytest.approx(1.3e-10, rel=0.05)
-    assert slope == pytest.approx(0.78, rel=0.05)      # 6 D in nm^2/ns
+    """OLS over 10-20 ns of an ensemble MSD recovers the input D.
+
+    Tolerance. The slope is set by the MSD increment between the window ends.
+    With r2 = r1 + Delta (independent, per-axis variances s each),
+    |r2|^2 - |r1|^2 = 2 r1.Delta + |Delta|^2 has mean 3s and variance
+    4 * 3 s^2 + 6 s^2 = 18 s^2 per chain: relative std sqrt(2). Over N chains the
+    relative standard error of D is ~sqrt(2 / N); OLS over the window is no worse
+    than the two-endpoint difference. rtol = 5 standard errors (0.11 for N = 4000);
+    a factor-of-2/3/6 or unit bug is far outside it.
+    """
+    N = 4000
+    d = brownian(np.random.default_rng(6), N, 2500, D_m2s=1.3e-10)
+    D, slope = diffusion_coefficient(msd_ensemble(d), 10.0)
+    rtol = 5 * np.sqrt(2 / N)
+    assert D == pytest.approx(1.3e-10, rel=rtol)
+    assert slope == pytest.approx(0.78, rel=rtol)      # 6 D in nm^2/ns
 
 
 def test_diffusion_coefficient_exact_on_a_line():
@@ -174,15 +194,7 @@ def test_err_rejects_off_grid_and_bad_windows():
 
 # --- real data (opt-in) -----------------------------------------------------------------------------------
 
-@pytest.fixture(scope="module")
-def pe():
-    if "MDGAN_PE_DIR" not in os.environ:
-        pytest.skip("set MDGAN_PE_DIR to MD_data/PE")
-    from mdgan.data.preprocess import process_system
-    d = Path(os.environ["MDGAN_PE_DIR"])
-    return process_system(d), np.loadtxt(d / "msd.out")
-
-
+@pytest.mark.real_data
 def test_real_pe_reference_msd_reproduces_msd_out(pe):
     data, ref = pe
     mean, per = msd_time_averaged(data.displacements)
@@ -191,6 +203,7 @@ def test_real_pe_reference_msd_reproduces_msd_out(pe):
     np.testing.assert_allclose(per[:, 1:].std(0, ddof=1), ref[1:, 3], rtol=1e-3)
 
 
+@pytest.mark.real_data
 def test_real_pe_diffusion_coefficient(pe):
     data, _ = pe
     mean, _ = msd_time_averaged(data.displacements)

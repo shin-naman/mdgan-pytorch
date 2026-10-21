@@ -61,6 +61,9 @@ class TestArchitecture:
         w = window()
         with torch.no_grad():
             ref = reference_forward(dg, w)
+            dg.output_layer.bias -= ref.median()          # make scores straddle zero
+            ref = reference_forward(dg, w)
+            assert (ref < 0).any() and (ref > 0).any()
             dg.train(); a = dg(w)
             dg.eval(); b = dg(w)
         torch.testing.assert_close(a, ref, rtol=0, atol=0)
@@ -86,10 +89,14 @@ class TestArchitecture:
 # =============================================================================
 class TestScore:
     def test_output_is_bias_when_output_weights_are_zero(self, dg):
+        """Pins output_layer as the last op. The bias is set NEGATIVE on purpose:
+        an activation after the output (LeakyReLU, ReLU, sigmoid, tanh) changes
+        negative values, while for positive values LeakyReLU is the identity."""
         with torch.no_grad():
             dg.output_layer.weight.zero_()
+            dg.output_layer.bias.fill_(-1.5)
             s = dg(window(batch=3))
-        torch.testing.assert_close(s, dg.output_layer.bias.detach().expand(3), rtol=0, atol=0)
+        torch.testing.assert_close(s, torch.full((3,), -1.5), rtol=0, atol=0)
 
     def test_score_is_unbounded_and_unsquashed(self, dg):
         """A Wasserstein score must not pass through sigmoid/tanh/clamp: scaling the

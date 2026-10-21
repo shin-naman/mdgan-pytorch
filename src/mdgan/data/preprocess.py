@@ -172,7 +172,10 @@ def process_system(system_dir, name: str | None = None, cache=None, force: bool 
     disp, boxes, dts, frames = [], [], [], []
     for p in files:
         d, dt, box, n_frames = process_trajectory(p)
-        disp.append(d.astype(np.float32)); boxes.append(box); dts.append(dt); frames.append(n_frames)
+        disp.append(d.astype(np.float32))
+        boxes.append(box)
+        dts.append(dt)
+        frames.append(n_frames)
 
     # Cross-trajectory consistency: one array needs one shape, one dt, one geometry.
     if len(set(frames)) != 1:
