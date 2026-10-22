@@ -50,14 +50,12 @@ class TestArchitecture:
                     + 2 * 32)                        # BatchNorm gamma, beta
         assert sum(p.numel() for p in m.parameters()) == expected
 
-    def test_defaults_match_decisions(self):
-        """docs/decisions.md: width 2048, slope 0.2, batch-stat BatchNorm."""
-        m = LatentTransitionGenerator(32, 32)
-        assert m.hidden_dim == 2048 and m.input_layer.in_features == 64
-        assert m.act.negative_slope == pytest.approx(0.2)
+    def test_default_batchnorm_keeps_no_running_statistics(self):
+        """The default VALUES live in Config (tests/test_config.py, TestNoDrift). This pins
+        what the default means for the module: batch statistics, no running buffers."""
+        m = LatentTransitionGenerator(LAT, NR, hidden_dim=H)
         assert m.use_running_stats is False
-        assert m.output_norm.track_running_stats is False
-        assert m.output_norm.running_mean is None
+        assert m.output_norm.track_running_stats is False and m.output_norm.running_mean is None
 
     def test_forward_equals_reference(self, gz):
         """Both modes: the default BatchNorm uses batch statistics in eval too,

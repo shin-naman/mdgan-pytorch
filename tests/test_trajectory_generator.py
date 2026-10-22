@@ -56,11 +56,9 @@ class TestArchitecture:
         expected = (3 * 3 + 3 + n_in * 2048 + 2048 + 2 * (2048 * 2048 + 2048) + 2048 * 192 + 192)
         assert sum(p.numel() for p in m.parameters()) == expected
 
-    def test_defaults_match_decisions(self):
-        m = TrajectoryGenerator(32, 32)
-        assert (m.block_len, m.n_channels, m.hidden_dim, m.flat_dim) == (64, 3, 2048, 192)
-        assert m.input_act.negative_slope == pytest.approx(0.2)
-        assert list(m.buffers()) == []                       # no running statistics of any kind
+    def test_has_no_buffers(self):
+        """No running statistics or fixed constants of any kind (default values live in Config)."""
+        assert list(TrajectoryGenerator(**SMALL).buffers()) == []
 
     def test_forward_equals_reference_in_both_modes(self, gy):
         z, r, u = inputs()

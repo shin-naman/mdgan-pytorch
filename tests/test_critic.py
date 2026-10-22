@@ -51,11 +51,9 @@ class TestArchitecture:
         expected = 3 * 2048 * 128 + 2048 + 3 * (2048 * 2048 + 2048) + 2048 + 1
         assert sum(p.numel() for p in Critic().parameters()) == expected
 
-    def test_defaults_match_decisions(self):
-        d = Critic()
-        assert (d.block_len, d.n_channels, d.hidden_dim, d.window_len) == (64, 3, 2048, 128)
-        assert d.act.negative_slope == pytest.approx(0.2)
-        assert list(d.buffers()) == []
+    def test_has_no_buffers(self):
+        """No running statistics or fixed constants of any kind (default values live in Config)."""
+        assert list(Critic(M, C, hidden_dim=H).buffers()) == []
 
     def test_forward_equals_reference_in_both_modes(self, dg):
         w = window()

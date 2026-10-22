@@ -48,6 +48,11 @@ One test file per source module, flat under `tests/`; cross-module tests in subf
 | `models/trajectory_generator.py` | `tests/test_trajectory_generator.py` |
 | `models/critic.py` | `tests/test_critic.py` |
 | `ops.py` | `tests/test_ops.py` |
+| `losses.py` | `tests/test_losses.py` |
+| `rollout.py` | `tests/test_rollout.py` |
+| `checkpoint.py` | `tests/test_checkpoint.py` |
+| `evaluate.py` | `tests/test_evaluate.py` |
+| `config.py`, `_util.py` | `tests/test_config.py`, `tests/test_util.py` |
 | `data/water.py` | `tests/test_water.py` |
 | `data/xtc.py` | `tests/test_xtc.py` |
 | `data/preprocess.py` | `tests/test_preprocess.py` |
@@ -67,14 +72,8 @@ shape check by accident.
 
 ### Parked tests
 
-`tests/integration/test_three_networks.py` holds tests whose home module does not
-exist yet. They move when it does:
-
-| Tests | Moves to | When |
-| --- | --- | --- |
-| `_gp` reference, GP reaches weights not biases | `test_losses.py` (must agree with `losses.gradient_penalty`) | `losses.py` |
-| fake-window pairing, consecutive blocks differ, cumsum, 80 ns = 125 blocks, 8192 chains | `test_rollout.py` | `rollout.py` |
-| cross-module state-dict hazards | `test_checkpoint.py` (as tests of the strict loader) | `checkpoint.py` |
+None. `tests/integration/test_three_networks.py` holds the three-network training-step
+tests; they move to `test_train.py` when the trainer exists.
 
 ## What a test must do to be kept
 
@@ -114,13 +113,18 @@ survived (fail), anything else = the patch itself is broken (fail, output shown)
 A baseline run per target proves the unmutated file passes first.
 `MDGAN_PE_DIR` is removed in the subprocesses.
 
-Current state: **60 mutants, all killed** (8 baselines pass), ~65 s.
+Current state: **102 mutants, all killed** (14 baselines pass), ~115 s.
 
 | Group | Mutants | Examples |
 | --- | --- | --- |
 | G_z | 15 | concat order, activation placement, BatchNorm removed / running stats / no affine, singleton accepted, unroll detached / off by one / drops z0 |
 | G_Y | 14 | channel-major flatten or reshape, temporal leak in the noise conv, residual without skip, activation after the add, noise ignored, uniform u |
 | D_G | 15 | accepts 4M windows, squeeze without axis, BatchNorm added, input detached, sigmoid or LReLU on the score, second block ignored, stride 1 |
+| losses | 8 | one ε for the whole batch, penalty on ‖g‖², no `create_graph`, λ ignored, critic or generator sign flipped, fake not detached, penalty leaking into the generators |
+| rollout | 9 | pair not consecutive, j below the burn-in, j fixed, mean flag ignored (training or estimation), burn-in skipped, transition before decode, noise reused, modes not restored |
+| checkpoint | 9 | non-strict load, class check removed, format version unchecked, iteration / σ / optimizer / generator state not saved or restored, non-atomic write, save without the model–config check |
+| evaluate | 9 | σ instead of σ², no trim to 80 ns, dt ignoring n_s, burn-in or mean flag not taken from the Config, D_ref from the generated curve, chain count or err window not from the Config, seed ignored |
+| config / util | 4 | `from_dict` ignoring unknown keys, estimation blocks rounded down, `build_models` dropping an option, `positive_int` accepting `True` |
 | data | 16 | minimum image with floor, molecule not made whole, equal masses, guard at L/4 or disabled, triclinic accepted, cache ignores source changes, time average over T, D without /6, linear err weights, σ from the full trajectory (leak), phase ignored |
 
 Removed when the suites were consolidated, with reasons:
@@ -131,11 +135,22 @@ Removed when the suites were consolidated, with reasons:
   resume test (`test_checkpoint.py`).
 
 Adding a mutant: append a tuple to `MUTANTS`; the patch runs before pytest imports
-the target, so monkeypatching the module or class in place is enough. If it
+the target, so monkeypatching the module or class in place is enough. The checkpoint
+mutants instead edit the module's source text and re-execute it; each asserts its edit
+applied, so a stale mutant shows up as a broken patch rather than a false survival. If it
 survives, add the test that kills it; never weaken the mutant.
 
 A generic tool (`mutmut`) has not been run yet; Python 3.14 support is uncertain.
 Its survivors would be triaged into: new test, equivalent mutant, or accepted gap.
+
+### Bugs found by mutation
+
+- `D_G:act_after_output` survived the consolidated critic suite: the reference-forward test
+  only saw positive scores. Fixed in the test (negative bias, scores straddling zero).
+- `evaluate:err_window_ignores_config` survived because the code itself was permissive:
+  `err` and `diffusion_coefficient` silently shrank their window when the curve ended
+  inside it. Fixed in the product: both now refuse a curve shorter than the window, and
+  `Config` refuses windows that end after `estimation_time_ps`. Three mutants pin it.
 
 ## CI
 
@@ -149,8 +164,9 @@ what CI enforces; tests may use compact one-line statements (`E701/E702`).
 
 ## Known gaps
 
-- No `learning` tests yet: nothing verifies that the model learns. First one is the
-  synthetic Brownian D-recovery test, with the trainer.
+- One `learning` test so far (the critic separates two distributions; catches a flipped
+  loss sign). Nothing yet verifies that the full model learns: that is the synthetic
+  Brownian D-recovery test, with the trainer.
 - No golden-output tests. Deliberately: comparing forward outputs across torch or
   BLAS versions produces spurious failures. Reference-forward tests cover the same
   regressions without depending on kernel arithmetic.

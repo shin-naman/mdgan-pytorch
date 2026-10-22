@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 
+from mdgan._util import positive_int
+
 
 class LatentTransitionGenerator(nn.Module):
     """Stochastic latent transition generator (G_z) for MD-GAN."""
@@ -13,17 +15,9 @@ class LatentTransitionGenerator(nn.Module):
                  use_running_stats: bool = False):
         super().__init__()
 
-        for name, value in {
-            "latent_dim": latent_dim,
-            "noise_dim": noise_dim,
-            "hidden_dim": hidden_dim,
-        }.items():
-            if (
-                not isinstance(value, int)
-                or isinstance(value, bool)
-                or value <= 0
-            ):
-                raise ValueError(f"{name} must be a positive integer")
+        positive_int("latent_dim", latent_dim)
+        positive_int("noise_dim", noise_dim)
+        positive_int("hidden_dim", hidden_dim)
 
         self.latent_dim = latent_dim
         self.noise_dim = noise_dim

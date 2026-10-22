@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 
+from mdgan._util import positive_int
+
 
 class ResidualAffineBlock(nn.Module):
     """x -> x + Affine(LReLU(Affine(x))). Width is preserved; the skip is an identity.
@@ -27,19 +29,11 @@ class TrajectoryGenerator(nn.Module):
                  negative_slope: float = 0.2):
         super().__init__()
 
-        for name, value in {
-            "latent_dim": latent_dim,
-            "noise_dim": noise_dim,
-            "block_len": block_len,
-            "n_channels": n_channels,
-            "hidden_dim": hidden_dim,
-        }.items():
-            if (
-                not isinstance(value, int)
-                or isinstance(value, bool)
-                or value <= 0
-            ):
-                raise ValueError(f"{name} must be a positive integer")
+        positive_int("latent_dim", latent_dim)
+        positive_int("noise_dim", noise_dim)
+        positive_int("block_len", block_len)
+        positive_int("n_channels", n_channels)
+        positive_int("hidden_dim", hidden_dim)
 
         self.latent_dim = latent_dim
         self.noise_dim = noise_dim

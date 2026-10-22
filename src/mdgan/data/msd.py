@@ -84,10 +84,25 @@ def msd_time_averaged(d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 # --- generated-trajectory estimator ----------------------------------------------------
 
-def msd_ensemble(d: np.ndarray) -> np.ndarray:
-    """Ensemble MSD from origin for generated displacements (N, T, 3): (T+1,)."""
-    pos = positions_from_displacements(d)
-    return (pos ** 2).sum(axis=2).mean(axis=0)
+def msd_ensemble(d, chunk_steps: int = 256) -> np.ndarray:
+    """Ensemble MSD from origin for generated displacements (N, T, 3): (T+1,).
+
+    mean over chains of |r(t) - r(0)|^2 with r(0) = 0. Positions are accumulated in
+    float64 over chunks of `chunk_steps` time steps, so memory stays O(N * chunk)
+    instead of a float64 copy of the whole (N, T, 3) array (1.6 GB for the paper's
+    8192 x 8000 estimation). Accepts numpy arrays or CPU torch tensors.
+    """
+    d = np.asarray(d)
+    if d.ndim != 3 or d.shape[2] != 3:
+        raise ValueError(f"displacements must be (N, T, 3); got {d.shape}")
+    n, t, _ = d.shape
+    out = np.zeros(t + 1)
+    pos = np.zeros((n, 3))
+    for s in range(0, t, chunk_steps):
+        block = np.cumsum(d[:, s:s + chunk_steps].astype(np.float64), axis=1) + pos[:, None, :]
+        out[s + 1:s + 1 + block.shape[1]] = (block ** 2).sum(axis=2).mean(axis=0)
+        pos = block[:, -1]
+    return out
 
 
 # --- diffusion coefficient ----------------------------------------------------------------
@@ -102,6 +117,9 @@ def diffusion_coefficient(msd: np.ndarray, dt_ps: float,
     """
     msd = np.asarray(msd, dtype=np.float64)
     t = np.arange(len(msd)) * dt_ps
+    if t[-1] < t_max_ps - 1e-9:
+        raise ValueError(f"MSD curve ends at {t[-1]} ps; the fit window needs {t_max_ps} ps "
+                         "(a shorter curve would silently fit a shorter window)")
     m = (t >= t_min_ps) & (t <= t_max_ps)
     if m.sum() < 2:
         raise ValueError(f"fewer than two MSD points in [{t_min_ps}, {t_max_ps}] ps at dt={dt_ps}")
@@ -121,7 +139,8 @@ def err(msd_gen: np.ndarray, dt_gen_ps: float, msd_ref: np.ndarray, dt_ref_ps: f
     Discretized as in the 2022 ESI eq. S4 on the GENERATED grid: with
     t_k = k*dt_gen, err = sum_k f(t_k)/k / sum_k 1/k over k with t1 <= t_k <= t2
     (endpoints inclusive, k >= 1 always since t1 > 0). The reference is looked
-    up at exactly those times, so dt_gen must be a multiple of dt_ref.
+    up at exactly those times, so dt_gen must be a multiple of dt_ref. Both curves
+    must reach t2: a window is never silently shortened.
     Returns percent.
     """
     msd_gen = np.asarray(msd_gen, dtype=np.float64)
@@ -135,6 +154,9 @@ def err(msd_gen: np.ndarray, dt_gen_ps: float, msd_ref: np.ndarray, dt_ref_ps: f
 
     k = np.arange(len(msd_gen))
     t = k * dt_gen_ps
+    if t[-1] < t2_ps - 1e-9:
+        raise ValueError(f"generated MSD ends at {t[-1]} ps; the err window needs {t2_ps} ps "
+                         "(a shorter curve would silently average over a shorter window)")
     m = (t >= t1_ps - 1e-9) & (t <= t2_ps + 1e-9) & (k >= 1)
     if not m.any():
         raise ValueError("no generated MSD points inside [t1, t2]")

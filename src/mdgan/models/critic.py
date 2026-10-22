@@ -2,6 +2,8 @@
 import torch
 from torch import nn
 
+from mdgan._util import positive_int
+
 
 class Critic(nn.Module):
     """WGAN-GP critic (D_G) for MD-GAN. Reference: Kawada et al. (2022) ESI Fig. S2(C).
@@ -18,17 +20,9 @@ class Critic(nn.Module):
                  negative_slope: float = 0.2):
         super().__init__()
 
-        for name, value in {
-            "block_len": block_len,
-            "n_channels": n_channels,
-            "hidden_dim": hidden_dim,
-        }.items():
-            if (
-                not isinstance(value, int)
-                or isinstance(value, bool)
-                or value <= 0
-            ):
-                raise ValueError(f"{name} must be a positive integer")
+        positive_int("block_len", block_len)
+        positive_int("n_channels", n_channels)
+        positive_int("hidden_dim", hidden_dim)
 
         self.block_len = block_len            # M
         self.n_channels = n_channels          # C

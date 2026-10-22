@@ -89,6 +89,21 @@ def test_ensemble_msd_definition():
     assert msd_ensemble(d)[0] == 0.0
 
 
+@pytest.mark.parametrize("chunk_steps", [1, 7, 256, 10_000])
+def test_ensemble_msd_is_independent_of_chunking_and_accepts_float32(chunk_steps):
+    """Positions are accumulated chunk by chunk to bound memory; the result must not
+    depend on the chunk size, and float32 input is accumulated in float64."""
+    d = np.random.default_rng(3).normal(size=(50, 300, 3)).astype(np.float32)
+    pos = positions_from_displacements(d)
+    expected = (pos ** 2).sum(2).mean(0)
+    np.testing.assert_allclose(msd_ensemble(d, chunk_steps=chunk_steps), expected, rtol=1e-12)
+
+
+def test_ensemble_msd_rejects_bad_shape():
+    with pytest.raises(ValueError):
+        msd_ensemble(np.zeros((5, 3)))
+
+
 @pytest.mark.statistical
 def test_ensemble_and_time_average_agree_for_brownian_motion():
     """Both estimators match 6 D t on Brownian motion.
@@ -180,6 +195,20 @@ def test_err_endpoints_inclusive_and_k0_excluded():
     e = err(gen, 10.0, ref, 10.0)
     w = 1 / np.arange(20, 7801); expected = (100 / 20 + 100 / 7800) / w.sum()
     assert e == pytest.approx(expected, rel=1e-9)
+
+
+def test_err_refuses_a_generated_curve_shorter_than_the_window():
+    """Found by mutation: a curve ending inside [t1, t2] used to shrink the window silently."""
+    ref = np.ones(8001)
+    with pytest.raises(ValueError, match="ends at"):
+        err(np.ones(401), 10.0, ref, 10.0)                  # 4 ns curve, default window to 78 ns
+    err(np.ones(401), 10.0, ref, 10.0, t1_ps=200, t2_ps=4000)   # exactly reaching t2 is fine
+
+
+def test_diffusion_coefficient_refuses_a_curve_shorter_than_the_fit_window():
+    with pytest.raises(ValueError, match="ends at"):
+        diffusion_coefficient(np.arange(1501, dtype=float), 10.0)   # ends at 15 ns, window to 20 ns
+    diffusion_coefficient(np.arange(2001, dtype=float), 10.0)       # exactly 20 ns is fine
 
 
 def test_err_rejects_off_grid_and_bad_windows():

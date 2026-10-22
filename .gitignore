@@ -13,7 +13,7 @@ checkpoints/
 runs/
 outputs/
 data/raw/
-data/processed/
+data/cache/
 *.pt
 *.pth
 *.ckpt

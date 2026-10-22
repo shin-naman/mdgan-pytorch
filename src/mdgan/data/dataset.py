@@ -38,6 +38,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from mdgan._util import positive_int
 from mdgan.data.preprocess import SystemData
 
 PHASE_MODES = ("single", "all")
@@ -53,8 +54,7 @@ def coarsen(displacements: np.ndarray, step_skip: int, phase: int = 0) -> np.nda
     d = np.asarray(displacements)
     if d.ndim != 3:
         raise ValueError(f"displacements must be (N, T, 3); got {d.shape}")
-    if not isinstance(step_skip, int) or isinstance(step_skip, bool) or step_skip < 1:
-        raise ValueError("step_skip must be a positive integer")
+    positive_int("step_skip", step_skip)
     if not isinstance(phase, int) or isinstance(phase, bool) or not 0 <= phase < step_skip:
         raise ValueError("phase must be an integer in [0, step_skip)")
     n_coarse = (d.shape[1] - phase) // step_skip
@@ -69,9 +69,8 @@ class WindowDataset:
 
     def __init__(self, system: SystemData, block_len: int = 64, step_skip: int = 1,
                  phase_mode: str = "single"):
-        for name, value in (("block_len", block_len), ("step_skip", step_skip)):
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                raise ValueError(f"{name} must be a positive integer")
+        positive_int("block_len", block_len)
+        positive_int("step_skip", step_skip)
         if phase_mode not in PHASE_MODES:
             raise ValueError(f"phase_mode must be one of {PHASE_MODES}")
 
@@ -117,8 +116,7 @@ class WindowDataset:
     def sample(self, batch: int, generator: torch.Generator | None = None,
                device=None) -> torch.Tensor:
         """`batch` windows drawn WITH replacement (W may be < batch): (B, 2M, C) float32."""
-        if not isinstance(batch, int) or isinstance(batch, bool) or batch < 1:
-            raise ValueError("batch must be a positive integer")
+        positive_int("batch", batch)
         idx = torch.randint(0, self.n_windows, (batch,), generator=generator)
         out = self._windows[idx]
         return out.to(device) if device is not None else out
