@@ -12,7 +12,7 @@ submission, GPUs, checkpointing, large data and Docker (October 2026).
 | `tools/chtc/pe_paper.sub` | The paper's protocol: 5 jobs, seeds 0-4, 300k iterations each. |
 | `tools/chtc/run_train.sh` | The job's executable: prints the environment, runs `mdgan.train`, passes the exit code through. |
 | `configs/pe_paper.json` | The protocol written out in full (n_s = 1, n_z = 32, M = 64, width 2048, lr 1e-4, c = 7, K = 4). |
-| `tools/chtc/stamp_commit.sh` | Records the commit in `src/mdgan/_commit.json` before submitting. |
+| `tools/chtc/stamp_commit.sh` | Records the commit in `src/mdgan/_commit.json`; run on the laptop before rsync. |
 
 Each job carries three inputs (a few MB): `src/` (the package, on `PYTHONPATH`; nothing is
 installed), `pe_paper.json` and `PE.npz` (preprocessed displacements: no `.xtc`, no mdtraj).
@@ -41,45 +41,52 @@ never overwrites earlier results.
 
 | Item | Size | Location | Why |
 | --- | --- | --- | --- |
-| Repository | < 1 MB | `/home/nkansal/mdgan-pytorch` | Submit from here (CHTC: submit only from `/home`). |
+| Code (rsync copy, no `.git`) | < 1 MB | `/home/nkansal/mdgan-pytorch` | Submit from here (CHTC: submit only from `/home`). |
 | `data/cache/PE.npz` | ~6 MB | `/home/nkansal/mdgan-pytorch/data/cache/` | < 1 GB, normal file transfer. |
 | One finished run | ~2.6 GB, largest file 375 MB | `/home/nkansal/mdgan-pytorch/run_c<cluster>_seedN/` | Every file < 1 GB, so `/home`, not `/staging`. |
 | Five runs | ~13 GB | same | Fits the 40 GB `/home` quota. Copy off and delete: CHTC does not back up. |
 
 `/staging` (100 GB) is not needed: CHTC reserves it for individual files over 1 GB.
 
-## One-time setup
+## Getting code and data onto the access point
 
-On your laptop:
+One method only: **rsync from your laptop**. It copies the code, the commit stamp and
+`data/cache/PE.npz` in one step (the cache is git-ignored, so it never travels through git).
+Do not also clone the repository on the access point: the copy has no `.git`, and the stamp
+written on your laptop is the only record of which commit ran.
 
-```
-python -m mdgan.data.preprocess data/raw/wat_in_polymer_mdgan/MD_data/PE --out data/cache/PE.npz   # if missing
-git push
-```
-
-On the access point (`ssh nkansal@ap2002.chtc.wisc.edu`):
+Once, if the cache does not exist yet (on the laptop):
 
 ```
-cd ~
-git clone https://github.com/shin-naman/mdgan-pytorch.git
-cd mdgan-pytorch
-mkdir -p data/cache logs
+python -m mdgan.data.preprocess data/raw/wat_in_polymer_mdgan/MD_data/PE --out data/cache/PE.npz
 ```
 
-From your laptop, copy the cache (small, so through the access point is fine):
+Before every submission, on the laptop, in the repository root:
 
 ```
-scp data/cache/PE.npz nkansal@ap2002.chtc.wisc.edu:~/mdgan-pytorch/data/cache/
+git status                                  # clean: commit first
+bash tools/chtc/stamp_commit.sh             # must report git_dirty false
+rsync -av \
+  --exclude runs --exclude data/raw --exclude .venv --exclude .git \
+  --exclude __pycache__ --exclude .pytest_cache --exclude .ruff_cache \
+  ./ nkansal@ap2002.chtc.wisc.edu:mdgan-pytorch/
 ```
+
+Never add `--delete`: finished runs live in `~/mdgan-pytorch/run_c…` on the access point and
+do not exist on the laptop, so `--delete` would erase them.
+
+Then on the access point (`ssh nkansal@ap2002.chtc.wisc.edu`):
+
+```
+cd ~/mdgan-pytorch
+mkdir -p logs
+ls data/cache/PE.npz src/mdgan/_commit.json   # both must exist
+```
+
+Optional check that the cache arrived intact: `md5sum data/cache/PE.npz` on the access point
+equals `md5 data/cache/PE.npz` on the Mac.
 
 ## Every submission
-
-On the access point, in `~/mdgan-pytorch`:
-
-```
-git pull                              # the code you mean to run
-bash tools/chtc/stamp_commit.sh       # records the commit for provenance.json; must say git_dirty false
-```
 
 ### Step 1: sizing run
 
@@ -103,6 +110,8 @@ the `checkpoint` events in `run_sizing_c<cluster>/events.jsonl`). Pick `+GPUJobL
 `MAX_HOURS` in `pe_paper.sub` from that (short 12 h / 11; medium 24 h / 23; long 7 days / 160).
 If the log shows memory or disk far below the request, lower the request: smaller requests
 match more machines.
+Make these edits on the laptop, commit, then stamp and rsync again, so the run's recorded
+commit includes the submit file it used.
 
 ### Step 2: the five seeds
 

@@ -1,33 +1,29 @@
-# Sizing run: paper-scale PE (configs/pe_paper.json), 2,000 iterations on one GPU, with two
-# 8192-chain evaluations. Measures iterations/second and evaluation cost, so the full
-# 300k-iteration jobs can be sized. Submit from the repo root:  condor_submit tools/chtc/pe_sizing.sub
-#
-# Lines marked VERIFY are CHTC-specific; check them against CHTC's current GPU and
-# container guides before the first submission (docs/cluster.md).
+# Sizing run: paper-scale PE (configs/pe_paper.json) for 2,000 iterations on one GPU, with two
+# 8192-chain evaluations. Measures iterations/second, evaluation time, memory and disk, so the
+# full jobs can be sized. Submit from the repository root in /home:
+#     condor_submit tools/chtc/pe_sizing.sub
 
 universe                = container
-# VERIFY tag
 container_image         = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 executable              = tools/chtc/run_train.sh
-arguments               = sizing 0 --set n_iterations=2000 --set checkpoint_every=1000
+arguments               = sizing_c$(Cluster) 0 --set n_iterations=2000 --set checkpoint_every=1000
+environment             = "MAX_HOURS=11"
 
 should_transfer_files   = YES
 transfer_input_files    = src, configs/pe_paper.json, data/cache/PE.npz
 when_to_transfer_output = ON_EXIT
-transfer_output_files   = run_sizing
+transfer_output_files   = run_sizing_c$(Cluster)
 
 request_gpus            = 1
-# VERIFY
 +WantGPULab             = true
-# VERIFY: short / medium / long
 +GPUJobLength           = "short"
 request_cpus            = 2
-request_memory          = 24GB
+request_memory          = 16GB
 request_disk            = 10GB
 
-log                     = logs/sizing.log
-output                  = logs/sizing.out
-error                   = logs/sizing.err
+log                     = logs/sizing_c$(Cluster).log
+output                  = logs/sizing_c$(Cluster).out
+error                   = logs/sizing_c$(Cluster).err
 
 queue 1

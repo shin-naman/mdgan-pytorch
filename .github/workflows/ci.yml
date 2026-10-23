@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install "ruff>=0.17,<0.18"
-      - run: ruff check src tests
+      - run: ruff check src tests tools
 
   test:
     # Fast tier: everything except slow, gpu, learning, mutation (pyproject addopts).

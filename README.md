@@ -1,12 +1,19 @@
 # MD-GAN PyTorch Reproduction
 
-A research-oriented reproduction of the MD-GAN method for water diffusion in polymer systems.
+A research reproduction of MD-GAN for water diffusion in polymers: a generative model that
+learns short MD trajectories and predicts long-time diffusion.
 
 ## Research basis
-- Kawada et al. (2022), *MD-GAN with multi-particle input: the machine learning of long-time molecular behavior from short-time MD data* (Soft Matter), especially supplementary Fig. S2.
-- Kawada et al. (2023), *Prediction of Water Diffusion in Wide Varieties of Polymers with All-Atom Molecular Dynamics Simulations and Deep Generative Models* (JCIM).
+- Endo et al. (2018), AAAI: the original MD-GAN.
+- Kawada et al. (2022), Soft Matter: MD-GAN with multi-particle input; architecture in ESI Fig. S2.
+- Kawada et al. (2023), JCIM: water diffusion in 28 polymers. The first target here is its PE
+  setup: single water center-of-mass displacements, 1.28 ns input, 80 ns prediction.
 
-The initial target is the **single water center-of-mass displacement** in polyethylene, following the 2023 experiment. GROMACS integration will be added in a later stage.
+## Status
+Implemented and tested: preprocessing of the published GROMACS trajectories, the three
+networks (G_z, G_Y, D_G), WGAN-GP losses, rollout, checkpoints, evaluation (MSD, D, err) and the
+training loop, with cluster support for CHTC. Learning is verified on synthetic Brownian
+data; the paper-scale PE runs are next. Findings and open questions: `docs/decisions.md`.
 
 ## Getting started (macOS/Linux)
 
@@ -14,22 +21,32 @@ The initial target is the **single water center-of-mass displacement** in polyet
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e '.[dev]'
-python -c 'import torch; print("torch:", torch.__version__, "MPS:", torch.backends.mps.is_available())'
-pytest
+python -m pip install -e '.[dev,data]'      # data = mdtraj, for reading .xtc trajectories
+python -m pytest -q                          # fast tier; see docs/testing.md for the others
+```
+
+Data: the trajectories are on Zenodo (10.5281/zenodo.7295407). Preprocess one system into a cache:
+
+```sh
+python -m mdgan.data.preprocess data/raw/wat_in_polymer_mdgan/MD_data/PE --out data/cache/PE.npz
+```
+
+Train and evaluate locally (small runs) or on CHTC (`docs/cluster.md`):
+
+```sh
+python -m mdgan.train data/cache/PE.npz --out runs/pe_test --set n_iterations=1000 --device mps
+python -m mdgan.evaluate runs/pe_test/snap_001000.pt data/cache/PE.npz
 ```
 
 ## Layout
-- `src/mdgan/models/`: trainable networks 
-- `tests/`: model and tensor contract tests
-- `tools/`: model test mutation tools 
-- `docs/architecture.md`: scientific architecture contract and reference
-- `docs/decisions.md`: known unknowns and research decisions
+- `src/mdgan/`: the package
+  - `models/`: G_z (latent transition), G_Y (trajectory decoder), D_G (critic)
+  - `data/`: `.xtc` reading, water COM unwrapping, preprocessing, MSD, training windows
+  - `config.py`, `losses.py`, `rollout.py`, `checkpoint.py`, `evaluate.py`, `train.py`
+- `tests/`: one file per module; `integration/`; `mutation/` (deliberate breakages the suite must catch)
+- `configs/`: run configurations (`pe_paper.json` = the paper's PE protocol)
+- `tools/`: `chtc/` (HTCondor submit files and job scripts), `diag_brownian.py` (training-stability experiments)
+- `docs/`: `architecture.md` (the networks), `decisions.md` (decisions, findings, open questions),
+  `testing.md` (test tiers and policy), `cluster.md` (running on CHTC)
 
-## Roadmap
-1. Implement and test `G_z`. DONE
-2. Implement `G_Y` and critic `D_G`. DONE
-3. Implement WGAN-GP training and synthetic-data tests.
-4. Add GROMACS processing and physical evaluation.
-
-This repository does not contain MD trajectories or trained weights.
+This repository does not contain MD trajectories, caches or trained weights.
