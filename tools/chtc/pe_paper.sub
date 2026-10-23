@@ -29,8 +29,8 @@ request_gpus              = 1
 +WantGPULab               = true
 +GPUJobLength             = "short"
 request_cpus              = 2
-request_memory            = 16GB
-request_disk              = 10GB
+request_memory            = 4GB
+request_disk              = 5GB
 
 log                       = logs/pe_c$(Cluster)_seed$(Process).log
 output                    = logs/pe_c$(Cluster)_seed$(Process).out
