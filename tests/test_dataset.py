@@ -4,7 +4,7 @@ A synthetic SystemData is built in memory. Its displacements carry a HUGE
 value beyond the training region so that any leak of the reference region
 into windows or sigma is unmistakable.
 
-Run: python -m pytest tests/data/test_dataset.py -v
+Run: python -m pytest tests/test_dataset.py -v
 """
 
 import numpy as np

@@ -5,7 +5,7 @@ in-memory arrays: no files, no mdtraj. Part 2 writes small synthetic .xtc
 files with mdtraj into tmp_path and reads them back (skipped if mdtraj is
 absent). Part 3 uses the `pe_dir` fixture (real_data; skips unless MDGAN_PE_DIR is set).
 
-Run: python -m pytest tests/data/test_xtc.py -v
+Run: python -m pytest tests/test_xtc.py -v
 """
 
 import numpy as np

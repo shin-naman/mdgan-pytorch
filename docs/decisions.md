@@ -110,15 +110,15 @@ Miniature model (n_z = 8, M = 8, width 128). Known answer: MSD = 6Dt, no correla
 
 Modules: `xtc.py` (read + validate), `water.py` (make whole, COM, unwrap), `preprocess.py`
 (per-system cache with provenance), `dataset.py` (training windows + σ), `msd.py` (reference
-MSD, ensemble MSD, D, err). Tests in `tests/data/` (154; the five real-data tests run when
-`MDGAN_PE_DIR` points at `MD_data/PE`).
+MSD, ensemble MSD, D, err). Tests in `tests/test_{xtc,water,preprocess,msd,dataset}.py`; the
+five real-data tests run when `MDGAN_PE_DIR` points at `MD_data/PE`.
 
 | Item | Status | Decision / reasoning |
 | --- | --- | --- |
 | Source data | Confirmed | Zenodo 10.5281/zenodo.7295407 (`MD_data/<system>/trajectory/trajNNN.xtc`, `msd.out`), the MD of Kojima et al. 2021 used by the 2023 paper. Kept unzipped under `data/raw/` (gitignored); caches under `data/cache/`. Used to validate the pipeline; our own trajectories will follow the same layout. |
 | File facts (PE) | Confirmed | 60 files × 8001 frames at 10 ps (0–80 ns), 3 atoms in (O, H, H) order (TIP3P geometry verified), cubic box ≈ 4.75 nm constant within a trajectory but **different between trajectories** (each run NPT-equilibrated separately), coordinates wrapped per frame. |
 | Reader | Decided | mdtraj's topology-free `XTCTrajectoryFile`; ~0.01 s/trajectory. Validates ≥ 2 frames, finite data, uniform strictly increasing time, orthorhombic box, positive lengths. Does not require a constant box (reported as a property). |
-| Unwrapping | Decided | Minimum image, vectorized in numpy: make the molecule whole by folding each H relative to O, mass-weighted COM, then fold frame-to-frame COM differences. Identical arithmetic to MDAnalysis `unwrap` + `NoJump` (agreement 2e-6 nm, float32 round-off; `tools/compare_unwrap.py`), ~1000× faster because it is not per-frame Python. MDAnalysis is not a dependency. |
+| Unwrapping | Decided | Minimum image, vectorized in numpy: make the molecule whole by folding each H relative to O, mass-weighted COM, then fold frame-to-frame COM differences. Identical arithmetic to MDAnalysis `unwrap` + `NoJump` (agreement 2e-6 nm, float32 round-off; one-off comparison script, kept outside the repository), ~1000× faster because it is not per-frame Python. MDAnalysis is not a dependency. |
 | Masses / geometry | Confirmed | 16.0 / 1.008 / 1.008 from the dataset's `water.top`; 15.999 is indistinguishable at the tested precision. Geometry check against SETTLE (O–H 0.09572, H–H 0.15139 nm, tol 0.01) rejects wrong atom order, non-water, or Å input. |
 | Step guard | Decided | Hard error if any folded step exceeds **0.45 L**. A quality-control heuristic below the 0.5 L ambiguity bound, not a physical invariant. L/4 was rejected: real PE has 109 steps above L/4 (max 1.84 nm, cavity-to-cavity hops) that reproduce `msd.out`. Validity on other polymers Open until their data are processed (PE is the fastest). |
 | Varying box | Decided | Rejected within a trajectory (minimum image across a changing box is ill-defined; nothing downstream could use it). Differences *between* trajectories are stored per trajectory, (N, 3). `water.gro`'s 10 nm box is never used; the XTC box is. |
@@ -134,6 +134,6 @@ MSD, ensemble MSD, D, err). Tests in `tests/data/` (154; the five real-data test
 | Scientific framing (PE) | Confirmed | In the training region the MSD exponent is 0.63 (anomalous); it reaches 0.97 only by 10–20 ns. The model must extrapolate through the anomalous→normal crossover from data that lie entirely before it. Step displacements are heavy-tailed (99.99th percentile 1.16 nm ≈ 7σ): a Gaussian step model is wrong for this system. |
 | Authors' results (archive) | Confirmed, not used | `gen_data/MSD_gen/PE` holds 30 checkpoints × 5 runs × 7 d_z (index k ↔ t = 100·(k+1) ps); `dc_result_mdgan.txt` gives their PE MD-GAN D = 1.45025e-10 (run 1, checkpoint 190k, reproduced to 5e-5). Checkpoint-to-checkpoint err swings 7 → 27 → 7 % within one run: the paper's numbers are best-of-30. Reproduction target: best checkpoint of a 300k run at ≈5–7 % err and D within ~10 %. Not loaded by the pipeline; only used as expected values here. |
 | Other systems | Decided | Nothing PE-specific in code: frame count, dt, box, trajectory count are read from files; n_s is a `WindowDataset` argument (paper values: PE 1, E-VDF 3, PVDF 5, PVAC/E-VAC 7, PAAM/E-AAM 20). `water.py` is water-specific by design (all 28 systems). |
-| MDAnalysis cross-check | Open | `tools/compare_unwrap.py` is a standalone script; promotion to `tests/integration` deferred. |
+| MDAnalysis cross-check | Decided | Done once (agreement 2e-6 nm). The comparison script is kept outside the repository, since MDAnalysis is not a dependency; re-run it if unwrapping ever changes. The synthetic wrapping tests in `tests/test_water.py` are the standing guarantee. |
 
 We explicitly distinguish reproduced architecture from undocumented implementation assumptions.

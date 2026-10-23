@@ -5,7 +5,7 @@ tmp_path from rigid-water random walks with known unwrapped displacements, so
 every check runs without the dataset (fixture `synthetic_system` in conftest).
 The real-data test uses the session `pe` fixture (real_data marker).
 
-Run: python -m pytest tests/data/test_preprocess.py -v
+Run: python -m pytest tests/test_preprocess.py -v
 """
 
 import numpy as np

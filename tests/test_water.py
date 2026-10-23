@@ -4,7 +4,7 @@ Strategy: build an UNWRAPPED ground truth, wrap it, and require the module to
 recover the ground truth exactly. Merges the former test_water.py and
 test_water_wrapping.py; the wrapping scenarios are the backbone.
 
-Run: python -m pytest tests/data/test_water.py -v
+Run: python -m pytest tests/test_water.py -v
 """
 
 import numpy as np

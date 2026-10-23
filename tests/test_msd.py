@@ -2,7 +2,7 @@
 
 Real-data tests use the session `pe` fixture (real_data; skips unless MDGAN_PE_DIR is set).
 
-Run: python -m pytest tests/data/test_msd.py -v
+Run: python -m pytest tests/test_msd.py -v
 """
 
 import numpy as np

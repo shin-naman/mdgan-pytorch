@@ -25,8 +25,8 @@ fixes (a); applied to frame-to-frame COM differences it fixes (b). The result is
 the trajectory the molecule actually followed: per-step displacements whose
 cumulative sum runs to infinity, never wrapped. This is the same operation
 MDAnalysis' `unwrap` + `NoJump` performs frame by frame; here it is done for
-all frames at once with numpy (verified to agree to ~2e-6 nm, see
-tools/compare_unwrap.py).
+all frames at once with numpy (verified to agree to ~2e-6 nm by a one-off comparison
+script kept outside the repository; see docs/decisions.md, "Unwrapping").
 
 WHEN MINIMUM IMAGE IS VALID
 ---------------------------
@@ -56,7 +56,7 @@ GEOMETRY_TOL_NM = 0.01                          # how far a rigid bond may devia
 # 0.45 L leaves a margin while admitting the real cavity-to-cavity hops seen in
 # PE (max 1.84 nm, i.e. 0.39 L). Validity on other polymers is to be confirmed
 # when their data are processed; PE is the fastest-diffusing system in the set.
-# The silent-fold limit is pinned by tests/data/test_water.py::TestDocumentedLimit.
+# The silent-fold limit is pinned by tests/test_water.py::TestDocumentedLimit.
 MAX_STEP_FRACTION = 0.45
 
 
