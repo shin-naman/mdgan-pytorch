@@ -19,7 +19,7 @@ python -c "import sys, torch, numpy; print('python', sys.version.split()[0], '| 
 if [ -f "run_${NAME}/latest.pt" ]; then echo "resuming from run_${NAME}/latest.pt"; fi
 
 set +e
-python -m mdgan.train PE.npz --out "run_${NAME}" --config pe_paper.json --set "seed=${SEED}" \
+python -u -m mdgan.train PE.npz --out "run_${NAME}" --config pe_paper.json --set "seed=${SEED}" \
     --device cuda --auto-resume --max-hours "${MAX_HOURS:-4}" --log-every 100 "$@"
 status=$?
 set -e

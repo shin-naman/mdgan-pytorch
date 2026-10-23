@@ -152,12 +152,13 @@ class Trainer:
 
     def __init__(self, config: Config, dataset: WindowDataset, out_dir, *, device="cpu",
                  reference: tuple[np.ndarray, float] | None = None, log_every: int = 100,
-                 resume: bool = False):
+                 resume: bool = False, progress: bool = False):
         _check_dataset_matches_config(config, dataset)
         self.config, self.dataset, self.reference = config, dataset, reference
         self.out = Path(out_dir)
         self.device = torch.device(device)
         self.log_every = log_every
+        self.progress = progress                  # one line per log/evaluation on stdout (condor_tail)
         self.gen = torch.Generator()
         self.rollbacks: list[dict] = []
         self._rollbacks_since_checkpoint = 0
@@ -275,9 +276,14 @@ class Trainer:
             return
         values = (self._acc / self._acc_n).tolist()
         dt = time.perf_counter() - self._t0
-        _append_jsonl(self.out / "metrics.jsonl", {
-            "iteration": self.iteration, **dict(zip(METRIC_NAMES, values, strict=True)),
-            "iterations_per_second": self._acc_n / dt if dt > 0 else None, "rollbacks": len(self.rollbacks)})
+        rate = self._acc_n / dt if dt > 0 else None
+        record = {"iteration": self.iteration, **dict(zip(METRIC_NAMES, values, strict=True)),
+                  "iterations_per_second": rate, "rollbacks": len(self.rollbacks)}
+        _append_jsonl(self.out / "metrics.jsonl", record)
+        if self.progress:
+            print(f"it {self.iteration:7d} | W {record['wasserstein']:7.3f}  gp {record['gradient_penalty']:.3f}  "
+                  f"|g| {record['grad_norm']:.2f}  step std {record['fake_step_std']:.3f} | "
+                  f"{(rate or 0):.1f} it/s | rollbacks {len(self.rollbacks)}", flush=True)
         self._reset_metrics()
 
     def _save_latest(self) -> None:
@@ -299,6 +305,9 @@ class Trainer:
                               generator=torch.Generator().manual_seed(self.config.seed))   # never self.gen
             _append_jsonl(self.out / "evaluations.jsonl", result.to_dict())
             np.save(self.out / f"msd_{self.iteration:06d}.npy", result.msd_gen_nm2)
+            if self.progress:
+                print(f"eval {self.iteration:7d} | err {result.err_percent:.1f} %  D_rel {result.D_rel_error:+.3f}  "
+                      f"D_gen {result.D_gen_m2s:.3e} m^2/s", flush=True)
 
     def _rollback(self) -> None:
         self._rollbacks_since_checkpoint += 1
@@ -414,7 +423,7 @@ def main(argv=None) -> int:
     dataset = WindowDataset(system, config.block_len, config.step_skip, config.phase_mode, config.scale_inputs)
     reference = None if args.no_eval else reference_msd(system)
     trainer = Trainer(config, dataset, args.out, device=args.device, reference=reference,
-                      log_every=args.log_every, resume=resume)
+                      log_every=args.log_every, resume=resume, progress=True)
     status = trainer.run(max_seconds=None if args.max_hours is None else args.max_hours * 3600)
     print(json.dumps({"out": str(trainer.out), "iteration": trainer.iteration, "status": status,
                       "rollbacks": len(trainer.rollbacks)}))

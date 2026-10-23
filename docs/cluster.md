@@ -1,123 +1,154 @@
-# Running on CHTC (HTCondor)
+# Running on CHTC (HTCondor GPU Lab)
 
-Independent single-GPU jobs (one per seed or setting) through HTCondor's GPU Lab. The
-Slurm HPC cluster is for multi-node MPI work and is not needed here.
+Independent single-GPU jobs through HTCondor on the HTC system (access point `ap2002`).
+Slurm/HPC is for multi-node MPI work and is not used. Written against CHTC's guides on job
+submission, GPUs, checkpointing, large data and Docker (October 2026).
 
-Files:
+## What gets submitted
 
-| File | Purpose |
+| File | Role |
 | --- | --- |
-| `configs/pe_paper.json` | The paper's PE protocol, written out in full (equal to `Config()` today, but explicit so a later default change cannot alter a run). |
-| `tools/chtc/run_train.sh` | Job wrapper: prints the environment, runs `mdgan.train` with `--auto-resume --max-hours`, passes the exit code through. |
-| `tools/chtc/pe_sizing.sub` | One 2,000-iteration job to measure speed. Submit first. |
-| `tools/chtc/pe_paper.sub` | Five seeds of the full 300k-iteration protocol. |
+| `tools/chtc/pe_sizing.sub` | One 2,000-iteration paper-scale job. Submit first; it measures speed, memory and disk. |
+| `tools/chtc/pe_paper.sub` | The paper's protocol: 5 jobs, seeds 0-4, 300k iterations each. |
+| `tools/chtc/run_train.sh` | The job's executable: prints the environment, runs `mdgan.train`, passes the exit code through. |
+| `configs/pe_paper.json` | The protocol written out in full (n_s = 1, n_z = 32, M = 64, width 2048, lr 1e-4, c = 7, K = 4). |
+| `tools/chtc/stamp_commit.sh` | Records the commit in `src/mdgan/_commit.json` before submitting. |
 
-## What a job carries
+Each job carries three inputs (a few MB): `src/` (the package, on `PYTHONPATH`; nothing is
+installed), `pe_paper.json` and `PE.npz` (preprocessed displacements: no `.xtc`, no mdtraj).
+Software comes from the container `pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime`
+(Python 3.11, torch with CUDA, numpy); CHTC recommends PyTorch's `-runtime` images.
 
-Only three inputs, a few MB in total: `src/` (the package, put on `PYTHONPATH`; nothing is
-installed), `configs/pe_paper.json`, and `data/cache/PE.npz` (the preprocessed
-displacements). Training reads the `.npz` directly, so jobs need neither the `.xtc` files
-nor mdtraj. The container image provides Python, torch with CUDA, and numpy; the code needs
-Python ≥ 3.10.
+## How a job runs
+
+1. `condor_submit` (on the access point) queues the job.
+2. HTCondor matches it to a GPU Lab machine with 1 GPU, 2 CPUs, 16 GB RAM, 10 GB disk.
+3. That machine pulls the container image and creates an empty working directory holding the
+   three inputs and the wrapper.
+4. The wrapper trains into `run_<name>/` inside that directory. Progress lines go to stdout,
+   which you can watch live with `condor_tail`.
+5. On exit 0, HTCondor copies `run_<name>/` back to the directory you submitted from (in
+   `/home`), and the `.out`/`.err` files to `logs/`. The `.log` file is written on the access
+   point throughout.
+6. Safety net: if training is not finished after `MAX_HOURS`, the job saves `latest.pt` and
+   exits 85. HTCondor keeps `run_<name>/` in `/spool`, puts the job back in the queue, and the
+   restarted job (possibly on another machine) resumes from `latest.pt`.
+
+Run names include `$(Cluster)`, the ID HTCondor assigns per submission, so a later submission
+never overwrites earlier results.
+
+## Where things live
+
+| Item | Size | Location | Why |
+| --- | --- | --- | --- |
+| Repository | < 1 MB | `/home/nkansal/mdgan-pytorch` | Submit from here (CHTC: submit only from `/home`). |
+| `data/cache/PE.npz` | ~6 MB | `/home/nkansal/mdgan-pytorch/data/cache/` | < 1 GB, normal file transfer. |
+| One finished run | ~2.6 GB, largest file 375 MB | `/home/nkansal/mdgan-pytorch/run_c<cluster>_seedN/` | Every file < 1 GB, so `/home`, not `/staging`. |
+| Five runs | ~13 GB | same | Fits the 40 GB `/home` quota. Copy off and delete: CHTC does not back up. |
+
+`/staging` (100 GB) is not needed: CHTC reserves it for individual files over 1 GB.
 
 ## One-time setup
 
-On your laptop, if the cache does not exist yet:
+On your laptop:
 
 ```
-python -m mdgan.data.preprocess data/raw/wat_in_polymer_mdgan/MD_data/PE --out data/cache/PE.npz
+python -m mdgan.data.preprocess data/raw/wat_in_polymer_mdgan/MD_data/PE --out data/cache/PE.npz   # if missing
+git push
 ```
 
-Commit your changes, stamp the commit, and copy the repository (without `runs/`, `data/raw/`,
-`.venv/`, `.git/`) and the cache to the submit node:
+On the access point (`ssh nkansal@ap2002.chtc.wisc.edu`):
 
 ```
-bash tools/chtc/stamp_commit.sh
-rsync -a --exclude runs --exclude data/raw --exclude .venv --exclude .git ./ <user>@<submit-node>:mdgan-pytorch/
+cd ~
+git clone https://github.com/shin-naman/mdgan-pytorch.git
+cd mdgan-pytorch
+mkdir -p data/cache logs
 ```
 
-The stamp (`src/mdgan/_commit.json`, git-ignored) travels inside `src/`, so each run's
-`provenance.json` records the commit even though the cluster copy has no `.git`. If the
-stamp says `"git_dirty": true`, the run used uncommitted code: commit first.
+From your laptop, copy the cache (small, so through the access point is fine):
 
-On the submit node, from the repository root: `mkdir -p logs`.
+```
+scp data/cache/PE.npz nkansal@ap2002.chtc.wisc.edu:~/mdgan-pytorch/data/cache/
+```
 
-## Step 1: sizing run
+## Every submission
+
+On the access point, in `~/mdgan-pytorch`:
+
+```
+git pull                              # the code you mean to run
+bash tools/chtc/stamp_commit.sh       # records the commit for provenance.json; must say git_dirty false
+```
+
+### Step 1: sizing run
 
 ```
 condor_submit tools/chtc/pe_sizing.sub
-condor_q                                  # wait until it leaves the queue
-cat logs/sizing.out                       # environment line: torch version, "cuda available True"
+condor_watch_q                        # idle -> running -> gone; Ctrl+C to stop watching
+condor_tail -f <job id>               # live progress lines while it runs
 ```
 
-Then read `run_sizing/metrics.jsonl` (`iterations_per_second`) and `run_sizing/events.jsonl`
-(the time between a `checkpoint` event and the next metrics line is about one evaluation).
-Estimated wall time for the full protocol:
+When it is done:
 
-    300,000 / iterations_per_second  +  30 x (one evaluation)
+```
+cat logs/sizing_c<cluster>.out        # environment line: torch version, "cuda available True"
+tail -20 logs/sizing_c<cluster>.log   # memory and disk actually used vs requested
+cat run_sizing_c<cluster>/metrics.jsonl | tail -3          # iterations_per_second
+cat run_sizing_c<cluster>/evaluations.jsonl                # two 8192-chain evaluations ran
+```
 
-If `logs/sizing.err` shows an import error or `cuda available False`, fix the image or the GPU
-request before going further; nothing about the full runs differs from the sizing run except
-length and self-checkpointing.
+Full-run time ≈ 300,000 / iterations_per_second + 30 × (time of one evaluation; read it from
+the `checkpoint` events in `run_sizing_c<cluster>/events.jsonl`). Pick `+GPUJobLength` and
+`MAX_HOURS` in `pe_paper.sub` from that (short 12 h / 11; medium 24 h / 23; long 7 days / 160).
+If the log shows memory or disk far below the request, lower the request: smaller requests
+match more machines.
 
-## Step 2: the five-seed protocol
+### Step 2: the five seeds
 
 ```
 condor_submit tools/chtc/pe_paper.sub
-condor_q
-condor_tail -f <job id>                   # live stdout of one job
+condor_q -nobatch
+condor_tail -f <job id>
 ```
 
-Each job trains seed `$(Process)` (0-4) into `run_seed$(Process)/`. Every `MAX_HOURS`
-(4 by default, set in the submit file) the job saves `latest.pt` and exits with code 85;
-HTCondor copies `run_seedN/` back and restarts the job, which resumes from `latest.pt`. An
-eviction therefore loses at most `MAX_HOURS` of training. Exit 0 means finished; any other
-exit code is a real failure (see `logs/pe_seedN.err`).
+`condor_q -hold` explains any held job; `condor_rm <job id>` removes one.
 
-## Results
+### Step 3: results
 
-Per run, in `run_seedN/`:
+Each finished job leaves `run_c<cluster>_seedN/` in `~/mdgan-pytorch`:
 
 | File | Contents |
 | --- | --- |
-| `evaluations.jsonl` | err and D (and D_rel against the MD reference) at every 10k checkpoint |
+| `evaluations.jsonl` | err, D, D_rel at every 10k checkpoint |
 | `metrics.jsonl` | W, gradient penalty, gradient norm, step std, iterations/s every 100 iterations |
 | `events.jsonl` | start, checkpoints, time limits, resumes, rollbacks |
-| `snap_XXXXXX.pt` | G_z + G_Y at each checkpoint (evaluation needs only these) |
-| `latest.pt` | full resume state (models, optimizers, RNG) |
+| `snap_XXXXXX.pt` | G_z + G_Y at each checkpoint (all evaluation needs) |
+| `latest.pt` | full resume state |
 | `config.json`, `dataset.json`, `provenance.json` | exactly what ran, on which data, from which commit |
 
-Re-evaluate any snapshot anywhere, from the cache alone:
+Copy them to your laptop and then delete them from CHTC:
 
 ```
-python -m mdgan.evaluate run_seed0/snap_150000.pt data/cache/PE.npz --seed 0
+rsync -av nkansal@ap2002.chtc.wisc.edu:~/mdgan-pytorch/run_c<cluster>_seed* runs/chtc/   # on the laptop
 ```
 
-What to look at first: `step std` near 1 (the data-starvation warning sign is a value well
-below 1 with W stuck high), err and D_rel across checkpoints, and whether W keeps rising.
+Re-evaluate any snapshot anywhere:
 
-## Disk and transfer
+```
+python -m mdgan.evaluate runs/chtc/run_c<cluster>_seed0/snap_150000.pt data/cache/PE.npz --seed 0
+```
 
-At width 2048: `latest.pt` ≈ 375 MB (31M parameters plus two Adam buffers), each snapshot
-≈ 72 MB. A finished run holds `latest.pt` + 30 snapshots ≈ 2.6 GB; five seeds ≈ 13 GB.
+What to look at first: step std near 1 (well below 1 with W stuck high is the data-starvation
+sign), err and D_rel across checkpoints, and whether W keeps rising.
 
-Each self-checkpoint transfers the whole run directory, so transfers grow from ~0.4 GB to
-~2.6 GB over a run. That is the simplest correct setup (an eviction restores everything),
-but it may exceed what CHTC wants moved through normal file transfer or stored in `/home`.
-Options, to settle with CHTC's guidance:
+## Notes
 
-- keep the setup and raise `MAX_HOURS` so fewer transfers happen;
-- write snapshots to `/staging` from the wrapper and checkpoint only `latest.pt` and the logs;
-- keep fewer snapshots (for example every 20k) by setting `checkpoint_every`.
-
-## To verify with CHTC before the first submission
-
-These lines in the submit files are CHTC-specific and marked `VERIFY`:
-
-- `universe = container` with a `docker://` image, and the image tag (needs CUDA support
-  matching the GPU Lab drivers).
-- `+WantGPULab` and `+GPUJobLength` (allowed values and time limits).
-- `+is_resumable` together with `checkpoint_exit_code` (CHTC's self-checkpointing guide).
-- Size limits for file transfer and `/home`, and when `/staging` is required.
-
-CHTC's research computing facilitators can confirm all four in one conversation.
+- Do not run training on the access point; the sizing job is the test.
+- `condor_ssh_to_job` is disabled on shared GPUs; `condor_tail` is the way to look inside.
+- The first job on a machine pulls the container image (several GB), so start-up can take a while.
+- Evictions: a job restarts from the last checkpoint HTCondor stored (the last exit 85), not
+  from `latest.pt` in the lost working directory. Within its GPU Lab length a job is not
+  evicted, so in practice this matters only for the MAX_HOURS safety net. To exercise the safety
+  net once, submit the sizing job with `environment = "MAX_HOURS=0.1"`: it should exit 85
+  after about six minutes, be requeued, and resume from `latest.pt`.

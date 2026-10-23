@@ -417,6 +417,16 @@ class TestCluster:
         (tmp_path / "_commit.json").write_text(json.dumps({"git_commit": "abc123", "git_dirty": False}))
         assert train_module._git_state() == {"git_commit": "abc123", "git_dirty": False, "git_source": "stamp"}
 
+    def test_progress_lines_for_condor_tail(self, tmp_path, capsys):
+        """A running cluster job is only visible through stdout; one line per log and evaluation."""
+        system = brownian()
+        trainer(tmp_path / "run", system=system, reference=reference_msd(system), progress=True).run()
+        lines = capsys.readouterr().out.splitlines()
+        assert [ln.split()[1] for ln in lines if ln.startswith("it ")] == ["1", "2", "3", "4", "5", "6"]
+        assert [ln.split()[1] for ln in lines if ln.startswith("eval ")] == ["3", "6"]
+        trainer(tmp_path / "quiet").run()
+        assert capsys.readouterr().out == ""                         # library default stays silent
+
     def test_load_system_from_cache_and_refuse_stale_versions(self, tmp_path):
         cache, system = self._cache(tmp_path)
         loaded = load_system(str(cache))
