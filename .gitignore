@@ -23,5 +23,5 @@ data/cache/
 *.edr
 *.cpt
 
-# Testing tools that don't need to be tracked
-compute_unwrap.py 
+# Commit stamp written for cluster copies (tools/chtc/stamp_commit.sh)
+src/mdgan/_commit.json

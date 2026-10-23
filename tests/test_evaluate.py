@@ -218,3 +218,18 @@ class TestCheckpoint:
         assert main([str(tmp_path / "ck.pt"), str(sys_dir), "--seed", "1"]) == 0
         out = json.loads(capsys.readouterr().out)
         assert out["iteration"] == 10 and out["n_chains"] == 16 and out["n_steps"] == 150
+
+    def test_cli_accepts_a_cache_file(self, tmp_path, capsys):
+        """Cluster snapshots can be evaluated from the preprocessed .npz alone."""
+        from mdgan.checkpoint import save_snapshot
+        from mdgan.data.preprocess import PREPROCESS_VERSION
+        from mdgan.models import build_models
+        system = brownian_system(16, 400)
+        system.meta = {"preprocess_version": PREPROCESS_VERSION, "md5": []}
+        system.save(tmp_path / "sys.npz")
+        c = cfg(estimation_chains=16)
+        torch.manual_seed(0)
+        gz, gy, _ = build_models(c)
+        save_snapshot(tmp_path / "snap.pt", config=c, gz=gz, gy=gy, iteration=7, sigma_nm=0.2)
+        assert main([str(tmp_path / "snap.pt"), str(tmp_path / "sys.npz"), "--seed", "1"]) == 0
+        assert json.loads(capsys.readouterr().out)["iteration"] == 7

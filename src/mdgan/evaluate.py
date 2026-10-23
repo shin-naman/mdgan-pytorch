@@ -115,13 +115,13 @@ def evaluate_checkpoint(path, system, *, msd_ref: np.ndarray | None = None, n_ch
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Evaluate an MD-GAN checkpoint against MD.")
     ap.add_argument("checkpoint")
-    ap.add_argument("system_dir", help="MD_data/<system>")
-    ap.add_argument("--cache", help="preprocess cache .npz (created if missing)")
+    ap.add_argument("data", help="MD_data/<system> directory, or a preprocessed cache .npz")
+    ap.add_argument("--cache", help="preprocess cache .npz for a directory (created if missing)")
     ap.add_argument("--chains", type=int, help="override estimation_chains")
     ap.add_argument("--seed", type=int)
     args = ap.parse_args(argv)
-    from mdgan.data.preprocess import process_system
-    system = process_system(args.system_dir, cache=args.cache)
+    from mdgan.train import load_system          # imported here: train imports this module
+    system = load_system(args.data, args.cache)
     result = evaluate_checkpoint(args.checkpoint, system, n_chains=args.chains, seed=args.seed)
     print(json.dumps(result.to_dict(), indent=2))
     return 0

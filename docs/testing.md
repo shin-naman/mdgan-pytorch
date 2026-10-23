@@ -114,7 +114,7 @@ survived (fail), anything else = the patch itself is broken (fail, output shown)
 A baseline run per target proves the unmutated file passes first.
 `MDGAN_PE_DIR` is removed in the subprocesses.
 
-Current state: **118 mutants, all killed** (15 baselines pass), ~4 min.
+Current state: **123 mutants, all killed** (15 baselines pass), ~5 min.
 
 | Group | Mutants | Examples |
 | --- | --- | --- |
@@ -125,7 +125,7 @@ Current state: **118 mutants, all killed** (15 baselines pass), ~4 min.
 | rollout | 9 | pair not consecutive, j below the burn-in, j fixed, mean flag ignored (training or estimation), burn-in skipped, transition before decode, noise reused, modes not restored |
 | checkpoint | 9 | non-strict load, class check removed, format version unchecked, iteration / σ / optimizer / generator state not saved or restored, non-atomic write, save without the model–config check |
 | evaluate | 9 | σ instead of σ², no trim to 80 ns, dt ignoring n_s, burn-in or mean flag not taken from the Config, D_ref from the generated curve, chain count or err window not from the Config, seed ignored |
-| train | 13 | critic not frozen, freeze not restored on error, n_critic ignored, no finite check, rollback not re-seeded, rollback limit changed, counter never reset, no checkpoint at 0, logs not truncated, generator state not restored, config or dataset change accepted on resume, evaluation using the training generator |
+| train | 18 | time limit without saving, without the progress guard, or exiting 0; auto-resume ignored; cache version unchecked; critic not frozen, freeze not restored on error, n_critic ignored, no finite check, rollback not re-seeded, rollback limit changed, counter never reset, no checkpoint at 0, logs not truncated, generator state not restored, config or dataset change accepted on resume, evaluation using the training generator |
 | config / util | 4 | `from_dict` ignoring unknown keys, estimation blocks rounded down, `build_models` dropping an option, `positive_int` accepting `True` |
 | data | 16 | minimum image with floor, molecule not made whole, equal masses, guard at L/4 or disabled, triclinic accepted, cache ignores source changes, time average over T, D without /6, linear err weights, σ from the full trajectory (leak), phase ignored |
 

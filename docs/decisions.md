@@ -20,10 +20,10 @@ Sources: Endo et al. 2018 (AAAI), Kawada et al. 2022 (Soft Matter) + ESI, Kawada
 | Data representation | Confirmed | Per-step displacements, not positions; cumsum from origin for MSD. 2022 §3.1, 2023 Method. |
 | Framework / layout | Decided | PyTorch. Tensors are (B, T, C); transpose to (B, C, T) only inside Conv1d calls. |
 | Module style | Decided | Named layer attributes, not `nn.Sequential`, in all three networks: readable state-dict keys, stable hook targets, index-free tests. |
-| Randomness | Decided | All randomness enters via explicit tensors or an explicit `torch.Generator`; no `forward` consumes the global RNG. Each generator has `sample_noise`; G_z has `unroll`, G_Y has `generate`. |
-| Input validation | Decided | Cheap shape checks only (rank, feature counts, batch match). No NaN/inf checks in the hot path (G_z `validate_finite=False`; opt-in forces a device sync). Divergence detection, checkpointing and rollback belong to the trainer. |
+| Randomness | Decided | All randomness enters via explicit tensors or an explicit `torch.Generator`; no `forward` consumes the global RNG. Each generator has `sample_noise`; G_z has `unroll`, G_Y has `generate`. Noise is drawn on the generator's device and moved to the model's, so one CPU generator gives the same stream on CPU, CUDA and MPS. |
+| Input validation | Decided | Cheap shape checks only (rank, feature counts, batch match), via `_util.positive_int` for constructor arguments. No NaN/inf checks in the hot path (the G_z `validate_finite` option was removed). Divergence detection, checkpointing and rollback belong to the trainer. |
 | Weight initialization | Decided | PyTorch default everywhere. Measured G_z pre-BN variance at production width ≈ 1e-4 (eps = 1e-5), output variance at init ≈ 0.92; harmless. A shared init helper may be revisited if WGAN-GP training proves sensitive to the critic's initial input-gradient scale (recorded by a test). |
-| Test strategy | Decided | Per module: contract (architecture pinned to the figure), numerics (regimes met in a real run), adversarial (silent-failure modes). `tools/mutate_*.py` applies deliberate breakages and requires every mutant to be killed. A failing test on real code → investigate the product; a surviving mutant → strengthen the tests. |
+| Test strategy | Decided | `docs/testing.md`. One test file per module; tiers by marker (fast default; `real_data`, `statistical`, `gpu`, `slow`, `learning`, `mutation`). Hand-written mutants in `tests/mutation/` must all be killed. A failing test on real code → investigate the product; a surviving mutant → strengthen the tests (twice it exposed a real product flaw: see Evaluation). |
 
 ## G_z (latent transition) — implemented, `src/mdgan/models/latent_transition.py`
 
@@ -71,23 +71,40 @@ Sources: Endo et al. 2018 (AAAI), Kawada et al. 2022 (Soft Matter) + ESI, Kawada
 | --- | --- | --- |
 | Mean operation (2023 eq. 9) | Decided | `mean_operation(x)` subtracts the batch mean per step per axis. Applied by the trainer to the **generated** 128×3 displacement window, inside the autograd graph, **before** gradient-penalty interpolation. Not applied to real data (as the paper states). Never applied to latents. Centering displacements per step ≡ centering positions per time (cumsum is linear). Its Jacobian is a projection (w − mean w), not a detach. At N = 8192 the removed mean is ~σ/90, so the paper's accuracy gain is a training-time regularizer. |
 
-## Training design — decided, not yet implemented
+## Training — implemented, `src/mdgan/{config,losses,rollout,checkpoint,evaluate,train}.py`
 
 | Item | Status | Decision / reasoning |
 | --- | --- | --- |
+| Configuration | Decided | One frozen `Config` holds every default; module and function keyword defaults must agree with it (`TestNoDrift`). σ (derived from data), device and paths are deliberately not in it. Stored in every checkpoint; `configs/pe_paper.json` writes the PE protocol out in full. |
 | Base loss | Confirmed | WGAN-GP (2022 eq. 5). Critic maximizes L; G_z and G_Y jointly minimize. |
-| λ, optimizer, schedule | Decided | λ = 10, Adam lr = 1e-4, betas = (0.0, 0.9), 5 critic updates per generator update (WGAN-GP paper defaults; 2022 says Adam only). |
-| "300,000 iterations" | Decided | Interpreted as generator updates; checkpoint/estimate every 10,000. |
+| λ, optimizer, schedule | Decided | λ = 10, Adam lr = 1e-4, betas = (0.0, 0.9), 5 critic updates per generator update (WGAN-GP paper defaults; 2022 says Adam only). lr 1e-4 is now also **measured** to be more stable than 5e-4 (Learning experiments). |
+| "300,000 iterations" | Decided | Interpreted as generator updates; checkpoint and estimate every 10,000. |
 | Batch sizes | Confirmed | 64 in training; 8192 in estimation. |
-| Latent pair selection | Decided | Unroll each chain to c + K steps (K = 4), draw one random j ∈ [c, c+K−1] per iteration, decode (z_j, z_{j+1}), concatenate to one 128×3 window. One fake window per chain → 64 real vs 64 fake. Matches 2018's randomized post-burn-in pair; avoids training G_Y only on step-c latents. Encoded by `_fake_window` in `tests/integration`. |
-| Gradient flow | Decided | Generator step: loss −E[D(fake)] backprops through the critic into G_Y and G_z; the critic's gradients are discarded (its optimizer does not step). Critic step: the fake window is `.detach()`ed before the critic so no gradient reaches the generators. |
-| Gradient penalty | Decided | Reference implementation in `tests/D_G/test_dg_numerics.py::_gp` (and `tests/integration`). The trainer's `gradient_penalty` must agree with it; the integration tests will import the trainer's version when it exists. |
-| Input scaling | Decided | Divide displacements by one scalar σ = pooled std over x,y,z of training step-displacements; rescale G_Y output by σ only when computing physical MSD/D. Reasoning: WGAN-GP's unit-gradient-norm penalty is in input units; water-in-PE step displacements are ~0.04 nm, which would force a nearly flat critic. One isotropic scalar preserves rotational symmetry. σ saved with checkpoints. |
-| Checkpoint format and loading | Decided | One file keyed by module name (`G_z`, `G_Y`, `D_G`) each with class name + constructor config + state dict, plus optimizers, RNG states, iteration, σ. The loader rebuilds from config, verifies the class name, and uses `strict=True` only; no non-strict path exists. Reason: modules share key names (`input_layer.*`, `hidden1.*`, `output_layer.*`); a non-strict cross-load silently copies same-shaped tensors (tested in `tests/G_Y/test_gy_adversarial.py`). |
-| Estimation rollout | Decided | 8192 chains; burn in c steps; then alternate G_z → G_Y, concatenate blocks; 80 ns at n_s = 1 is 125 blocks of M = 64; cumsum from origin; multiply by σ. Reproducible from a seed via explicit generators. |
-| Checkpoint selection | Open | Papers pick the checkpoint with lowest err against long MD (uses ground truth). For blind use, the latent-distribution diagnostic (2023 Fig. 4B/C) is the proposed alternative. |
-| First learning test | Decided | Synthetic Brownian walk with known D before any MD data: the full model must recover D. First test of the model rather than the code. |
-| Robustness policy | Decided | Modules never sanitize NaNs. The trainer owns: atomic checkpoints every N iterations, a NaN/inf guard on losses each step, and rollback to the last checkpoint on repeated divergence. |
+| Latent pair selection | Decided | `rollout.make_fake_window`: one j ~ U{c, …, c+K−1} per call (c = 7, K = 4), unroll to j+1 (same distribution and gradients as unrolling to c+K, less compute), decode (z_j, z_{j+1}) into one 2M window. |
+| Gradient flow | Decided | `critic_loss` detaches the fake window itself, and the trainer builds it under `no_grad` for critic steps (its graph would be discarded). Generator step: −E[D(fake)] through a critic frozen by a context manager (no parameter gradients; restored even on error). |
+| Gradient penalty | Decided | `losses.gradient_penalty`: one ε ~ U[0,1) per sample broadcast over the window; the interpolate is detached (a critic-only term, never reaching the generators); `create_graph=True`. Pinned by closed forms on a linear critic. Reaches every critic weight and no bias. |
+| Input scaling | Decided | Divide displacements by one scalar σ = std of the training windows; MSD in nm is the σ-unit MSD × σ². WGAN-GP's unit-gradient-norm penalty is in input units, and raw steps (~0.04 nm) would force a nearly flat critic. `WindowDataset(scale_inputs=False)` is the unscaled ablation (σ = 1); the raw spread `window_std_nm` is recorded either way. |
+| Estimation rollout | Decided | `rollout.rollout`: z_0 → c burn-in steps → block k decoded from z_{c+k}; mean operation per block (2023, at estimation as in training); eval mode, modes restored; output on CPU. All chains run as **one batch**: G_z's batch-statistics BatchNorm couples chains, so chunking would change results. |
+| Evaluation | Decided | `evaluate`: rollout, trim to `estimation_time_ps`, ensemble MSD (accumulated in time chunks: no 1.6 GB float64 copy), err and D against an MD reference computed once. `err` and `diffusion_coefficient` refuse a curve that ends inside their window, and `Config` refuses windows beyond the estimation time: both were silently shortening windows before mutation testing exposed it. |
+| Randomness in training | Decided | One CPU generator drives data sampling and model noise. Evaluation uses a separate generator with a fixed seed at every checkpoint, so turning evaluation on or off leaves training bit-identical and every checkpoint is evaluated on the same noise. Bit-exact reproducibility is a CPU guarantee. |
+| Checkpoints | Decided | Two kinds, one strict loader (format v2). `latest.pt` (full resume state, ≈375 MB at width 2048) is written at iteration 0 and every checkpoint, overwritten atomically; `snap_XXXXXX.pt` (G_z + G_Y, ≈72 MB) is kept per checkpoint for evaluation. Models are rebuilt from the stored Config; class names checked before any tensor; `strict=True` only; read with `weights_only=True`. |
+| Divergence | Decided | One finiteness check per iteration. On failure: roll back to `latest.pt` and re-seed deterministically (seed + 1000 × rollback count); history stored in the checkpoint and `events.jsonl`. More than 3 consecutive rollbacks to the same checkpoint stop the run (a total limit would kill long runs with unrelated NaNs). |
+| Resume | Decided | Config must equal the checkpoint's except `n_iterations`; dataset metadata (files' md5, windows, σ, raw spread) must be equal; logs truncated to the restored iteration. CLI overrides are applied on top of the checkpoint's config, so a restarted job repeating its arguments resumes cleanly. |
+| Cluster execution | Decided | `docs/cluster.md`. HTCondor self-checkpointing: `--max-hours` saves and exits 85, `--auto-resume` continues; jobs train from the preprocessed `.npz` (no `.xtc`, no mdtraj); the commit is stamped into the code copy for provenance. |
+| Checkpoint selection | Open | Papers pick the checkpoint with lowest err against long MD (uses ground truth). Brownian runs show D fluctuating ≈ ±15 % between adjacent late checkpoints, so a single blind pick is noisy. Candidates: average over late checkpoints (Brownian, lr 1e-4: mean D_rel −0.04 over 6k–10k), the 2023 latent-distribution diagnostic. |
+
+## Learning experiments — synthetic Brownian system (`tests/test_train.py`, `tools/diag_brownian.py`)
+
+Miniature model (n_z = 8, M = 8, width 128). Known answer: MSD = 6Dt, no correlations.
+
+| Finding | Status | Evidence / consequence |
+| --- | --- | --- |
+| Data starvation shrinks the variance | Confirmed (measured) | 64 training windows: step std 0.70, W stuck at 6.9, short-time MSD ≈ half. Exact W1 to 64 points in the 48-dim window space is smaller at std 0.5 than at 1.0, so the objective itself rewards shrinking. 2048 windows: std 0.99, W ≈ 0.5, err 6.4 %. Learning tests use 2048 trajectories. **PE has 60 windows in 384 dims: watch `step std`.** Many short MD trajectories beat few long ones. |
+| Long-range block correlations drive D | Confirmed (measured) | D_rel tracks the sum of block-to-block displacement correlations (lags 1–10) together with the block variance. A two-block critic does not constrain correlations beyond one block, so they are what wanders. |
+| Learning rate | Measured | 5e-4: best at 1k (err 6.4 %), then degrades (19.8 %, D_rel +0.81 at 3k). 1e-4: improves through 10k; second-half err 5.6–8.8 %, best err 5.6 % / D_rel −0.07. |
+| Residual D fluctuation | Open | ≈ ±15 % between adjacent late checkpoints at 1e-4. Next: larger K (`--pair-window 16`), longer runs (does rising W turn into degradation?), possibly the 2018 latent critic D_z. |
+| Memory across blocks | Open | Brownian motion has none (a decoder ignoring z could pass). A persistent-walk (AR(1) velocity) test with a known long-time D is planned. |
+| Paper scale | Open | Everything above is at miniature scale; the PE runs (critic window 128 steps instead of 16) will show whether the instability carries over. |
 
 ## Data pipeline — implemented, `src/mdgan/data/`
 

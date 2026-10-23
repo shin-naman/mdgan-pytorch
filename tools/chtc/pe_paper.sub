@@ -1,0 +1,41 @@
+# The paper's protocol on PE: configs/pe_paper.json (n_s = 1, n_z = 32, M = 64, width 2048,
+# 300k iterations, checkpoint + 8192-chain evaluation every 10k), one job per seed.
+# Submit from the repo root, after the sizing run:  condor_submit tools/chtc/pe_paper.sub
+#
+# Self-checkpointing: every MAX_HOURS the job saves latest.pt and exits with code 85;
+# HTCondor copies run_seedN/ back (transfer_checkpoint_files) and restarts the job, which
+# resumes (--auto-resume). An eviction loses at most MAX_HOURS of training.
+# Lines marked VERIFY are CHTC-specific (docs/cluster.md).
+
+universe                  = container
+# VERIFY tag
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+executable                = tools/chtc/run_train.sh
+arguments                 = seed$(Process) $(Process)
+environment               = "MAX_HOURS=4"
+
+should_transfer_files     = YES
+transfer_input_files      = src, configs/pe_paper.json, data/cache/PE.npz
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+transfer_checkpoint_files = run_seed$(Process)
+transfer_output_files     = run_seed$(Process)
+# VERIFY
++is_resumable             = true
+
+request_gpus              = 1
+# VERIFY
++WantGPULab               = true
+# VERIFY: each segment is MAX_HOURS plus one evaluation
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 24GB
+# run directory reaches ~2.6 GB; see docs/cluster.md
+request_disk              = 20GB
+
+log                       = logs/pe_seed$(Process).log
+output                    = logs/pe_seed$(Process).out
+error                     = logs/pe_seed$(Process).err
+
+queue 5

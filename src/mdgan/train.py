@@ -32,6 +32,12 @@ Run directory:
     events.jsonl                                  start / resume / rollback / checkpoint
 On resume or rollback, the .jsonl logs are truncated to the restored iteration, so
 iteration numbers in them are strictly increasing.
+
+Cluster jobs (docs/cluster.md): run(max_seconds=...) stops after the first iteration
+past the limit, saves latest.pt and returns "time_limit"; the CLI then exits with
+CHECKPOINT_EXIT_CODE (85), HTCondor's self-checkpoint signal, and --auto-resume
+continues from latest.pt when the job restarts. Training can read a preprocessed
+cache .npz directly, so a job needs neither the .xtc files nor mdtraj.
 """
 
 from __future__ import annotations
@@ -57,6 +63,7 @@ from mdgan.models import build_models
 from mdgan.rollout import make_fake_window
 
 LATEST = "latest.pt"
+CHECKPOINT_EXIT_CODE = 85          # HTCondor checkpoint_exit_code
 MAX_CONSECUTIVE_ROLLBACKS = 3
 ROLLBACK_SEED_STRIDE = 1000
 METRIC_NAMES = ("wasserstein", "gradient_penalty", "grad_norm", "generator_loss", "fake_step_std")
@@ -103,16 +110,26 @@ def _truncate_jsonl(path: Path, iteration: int) -> None:
     path.write_text("".join(k + "\n" for k in kept))
 
 
+COMMIT_STAMP = Path(__file__).with_name("_commit.json")    # written by tools/chtc/stamp_commit.sh
+
+
 def _git_state() -> dict:
+    """Commit and dirty flag of the code that is running. Asks git; where the code was copied
+    without .git (cluster jobs), falls back to the stamp file written before copying."""
     root = Path(__file__).resolve().parents[2]
     try:
         commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True,
                                 timeout=10, check=True).stdout.strip()
         dirty = bool(subprocess.run(["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True,
                                     timeout=10, check=True).stdout.strip())
-        return {"git_commit": commit, "git_dirty": dirty}
+        return {"git_commit": commit, "git_dirty": dirty, "git_source": "git"}
     except (OSError, subprocess.SubprocessError):
-        return {"git_commit": None, "git_dirty": None}
+        pass
+    try:
+        stamp = json.loads(COMMIT_STAMP.read_text())
+        return {"git_commit": stamp.get("git_commit"), "git_dirty": stamp.get("git_dirty"), "git_source": "stamp"}
+    except (OSError, ValueError):
+        return {"git_commit": None, "git_dirty": None, "git_source": None}
 
 
 def _check_dataset_matches_config(config: Config, dataset: WindowDataset) -> None:
@@ -303,9 +320,19 @@ class Trainer:
 
     # --- driver --------------------------------------------------------------------------------
 
-    def run(self) -> None:
+    def run(self, max_seconds: float | None = None) -> str:
+        """Train to config.n_iterations. Returns "done", or "time_limit" if max_seconds
+        elapsed first (latest.pt is then saved at the current iteration)."""
         c = self.config
+        start, start_iteration = time.monotonic(), self.iteration
         while self.iteration < c.n_iterations:
+            # Stop only after at least one iteration this session, so a restarted job always progresses.
+            if (max_seconds is not None and time.monotonic() - start > max_seconds
+                    and self.iteration > start_iteration):
+                self._write_metrics()
+                self._save_latest()
+                self._event("time_limit")
+                return "time_limit"
             if not self._iteration():
                 self._rollback()
                 continue
@@ -315,6 +342,7 @@ class Trainer:
             if self.iteration % c.checkpoint_every == 0 or self.iteration == c.n_iterations:
                 self._write_metrics()
                 self._checkpoint()
+        return "done"
 
 
 # --- command line ------------------------------------------------------------------------------
@@ -326,9 +354,9 @@ def _parse_value(text: str):
         return text
 
 
-def build_config(config_file: str | None, overrides: list[str]) -> Config:
-    """Config() <- JSON file <- key=value overrides, validated by Config.from_dict."""
-    d = Config().to_dict()
+def build_config(config_file: str | None, overrides: list[str], base: Config | None = None) -> Config:
+    """base (default Config()) <- JSON file <- key=value overrides, validated by Config.from_dict."""
+    d = (base or Config()).to_dict()
     if config_file:
         d.update(json.loads(Path(config_file).read_text()))
     for item in overrides:
@@ -339,40 +367,58 @@ def build_config(config_file: str | None, overrides: list[str]) -> Config:
     return Config.from_dict(d)
 
 
+def load_system(source: str, cache: str | None = None):
+    """A system from an MD_data/<system> directory (preprocessed, with optional cache) or
+    directly from a preprocessed cache .npz (no .xtc files or mdtraj needed)."""
+    from mdgan.data.preprocess import PREPROCESS_VERSION, SystemData, process_system
+    path = Path(source)
+    if path.is_file():
+        system = SystemData.load(path)
+        version = system.meta.get("preprocess_version")
+        if version != PREPROCESS_VERSION:
+            raise ValueError(f"{path} was written by preprocess version {version}; this code is "
+                             f"version {PREPROCESS_VERSION}. Re-run preprocessing.")
+        return system
+    return process_system(path, cache=cache)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Train MD-GAN on one polymer system.")
-    ap.add_argument("system_dir", help="MD_data/<system>")
+    ap.add_argument("data", help="MD_data/<system> directory, or a preprocessed cache .npz")
     ap.add_argument("--out", required=True, help="run directory (must not exist unless --resume)")
     ap.add_argument("--cache", help="preprocess cache .npz (created if missing)")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--config", help="JSON file of Config overrides")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="Config override (repeatable)")
     ap.add_argument("--resume", action="store_true", help="continue the run in --out from latest.pt")
+    ap.add_argument("--auto-resume", action="store_true",
+                    help="resume if --out has latest.pt, otherwise start a new run (for cluster restarts)")
+    ap.add_argument("--max-hours", type=float,
+                    help=f"save latest.pt and exit with code {CHECKPOINT_EXIT_CODE} after this long")
     ap.add_argument("--no-eval", action="store_true", help="skip evaluation at checkpoints")
     ap.add_argument("--log-every", type=int, default=100)
     args = ap.parse_args(argv)
 
-    from mdgan.data.preprocess import process_system
     from mdgan.evaluate import reference_msd
 
-    if args.resume:
+    resume = args.resume or (args.auto_resume and (Path(args.out) / LATEST).exists())
+    if resume:
+        # Overrides apply on top of the CHECKPOINT's config, so a restarted job passing the same
+        # arguments resumes cleanly; Trainer refuses any resulting change except n_iterations.
         ck_config = load_checkpoint(Path(args.out) / LATEST).config
-        override = build_config(args.config, args.set).to_dict()
-        changed = {k for k, v in override.items() if v != Config().to_dict()[k]}
-        if changed - {"n_iterations"}:
-            raise SystemExit(f"--resume only allows overriding n_iterations; got {sorted(changed)}")
-        config = dataclasses.replace(ck_config, n_iterations=override["n_iterations"]) if changed else ck_config
+        config = build_config(args.config, args.set, base=ck_config)
     else:
         config = build_config(args.config, args.set)
 
-    system = process_system(args.system_dir, cache=args.cache)
+    system = load_system(args.data, args.cache)
     dataset = WindowDataset(system, config.block_len, config.step_skip, config.phase_mode, config.scale_inputs)
     reference = None if args.no_eval else reference_msd(system)
     trainer = Trainer(config, dataset, args.out, device=args.device, reference=reference,
-                      log_every=args.log_every, resume=args.resume)
-    trainer.run()
-    print(json.dumps({"out": str(trainer.out), "iteration": trainer.iteration, "rollbacks": len(trainer.rollbacks)}))
-    return 0
+                      log_every=args.log_every, resume=resume)
+    status = trainer.run(max_seconds=None if args.max_hours is None else args.max_hours * 3600)
+    print(json.dumps({"out": str(trainer.out), "iteration": trainer.iteration, "status": status,
+                      "rollbacks": len(trainer.rollbacks)}))
+    return CHECKPOINT_EXIT_CODE if status == "time_limit" else 0
 
 
 if __name__ == "__main__":
