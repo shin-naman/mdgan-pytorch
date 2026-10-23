@@ -17,12 +17,15 @@ Conventions (docs/decisions.md):
   - Gradients of the penalty reach every critic WEIGHT and no bias: for a
     piecewise-linear critic grad_x D is a product of weights and slope masks.
 
-All randomness (eps) goes through an optional explicit torch.Generator.
+All randomness (eps) goes through an optional explicit torch.Generator, drawn on the
+generator's device and moved to the data's, so a CPU generator works with a GPU critic.
 """
 
 from __future__ import annotations
 
 import torch
+
+from mdgan.models.latent_transition import _draw_device
 
 DEFAULT_GP_LAMBDA = 10.0
 
@@ -43,7 +46,10 @@ def gradient_penalty(critic, real: torch.Tensor, fake: torch.Tensor,
     """
     _check_pair(real, fake)
     b = real.shape[0]
-    eps = torch.rand(b, 1, 1, device=real.device, dtype=real.dtype, generator=generator)
+    # Drawn on the generator's device, then moved: a CPU generator must work with a GPU critic
+    # (the same rule as every noise sampler; see models.latent_transition._draw_device).
+    eps = torch.rand(b, 1, 1, device=_draw_device(generator, real.device), dtype=real.dtype,
+                     generator=generator).to(real.device)
     x_hat = (eps * real.detach() + (1 - eps) * fake.detach()).requires_grad_(True)
     score = critic(x_hat)
     grad, = torch.autograd.grad(score.sum(), x_hat, create_graph=True)

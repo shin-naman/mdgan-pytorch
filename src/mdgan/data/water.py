@@ -25,8 +25,8 @@ fixes (a); applied to frame-to-frame COM differences it fixes (b). The result is
 the trajectory the molecule actually followed: per-step displacements whose
 cumulative sum runs to infinity, never wrapped. This is the same operation
 MDAnalysis' `unwrap` + `NoJump` performs frame by frame; here it is done for
-all frames at once with numpy (verified to agree to ~2e-6 nm by a one-off comparison
-script kept outside the repository; see docs/decisions.md, "Unwrapping").
+all frames at once with numpy (checked once against MDAnalysis: agreement ~2e-6 nm;
+see docs/decisions.md, "Unwrapping").
 
 WHEN MINIMUM IMAGE IS VALID
 ---------------------------

@@ -73,3 +73,40 @@ def test_one_cpu_generator_drives_models_on_device(device, three_nets):
     assert w.device.type == device
     out = rollout(gz, gy, 8, 2, 1, generator=torch.Generator().manual_seed(3))
     assert out.device.type == "cpu" and torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_gradient_penalty_with_a_cpu_generator(device, dg):
+    """Found on the first CHTC job: eps was requested from a CPU generator directly on the GPU."""
+    from mdgan.losses import gradient_penalty
+    dg = dg.to(device)
+    real = torch.randn(8, 2 * SMALL["block_len"], SMALL["n_channels"], device=device)
+    gp, norms = gradient_penalty(dg, real, torch.randn_like(real), generator=torch.Generator().manual_seed(0))
+    assert gp.device.type == device and torch.isfinite(gp)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_trainer_runs_on_device(device, tmp_path):
+    """The real training loop on the device, as a cluster job runs it: one CPU generator,
+    critic and generator steps, checkpoints, a snapshot and an 8-chain evaluation."""
+    import json
+
+    import numpy as np
+
+    from mdgan.config import Config
+    from mdgan.data.dataset import WindowDataset
+    from mdgan.data.preprocess import SystemData
+    from mdgan.evaluate import reference_msd
+    from mdgan.train import Trainer
+
+    d = np.random.default_rng(0).normal(scale=0.05, size=(6, 200, 3)).astype(np.float32)
+    system = SystemData(name="smoke", displacements=d, dt_ps=10.0, box_nm=np.full((6, 3), 5.0), meta={})
+    c = Config(latent_dim=7, noise_dim=3, block_len=8, n_channels=3, hidden_dim=24, batch_size=8, n_critic=2,
+               burn_in=2, pair_window=2, checkpoint_every=2, n_iterations=4, estimation_chains=8,
+               estimation_time_ps=1000.0, err_window_ps=(20.0, 900.0), diffusion_fit_ps=(250.0, 500.0))
+    out = tmp_path / "run"
+    t = Trainer(c, WindowDataset(system, 8, 1), out, device=device, reference=reference_msd(system), log_every=1)
+    assert t.run() == "done"
+    assert t.gz.output_layer.weight.device.type == device
+    evals = [json.loads(line) for line in (out / "evaluations.jsonl").read_text().splitlines()]
+    assert [e["iteration"] for e in evals] == [2, 4] and all(np.isfinite(e["err_percent"]) for e in evals)
