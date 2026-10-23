@@ -17,7 +17,9 @@ chains interact through the normalization. rollout therefore processes all chain
 as ONE batch (the paper's 8192); splitting them into chunks would change results.
 
 All randomness goes through an optional explicit torch.Generator, in a fixed order
-(documented per function), so a run is reproducible from a seed.
+(documented per function), so a run is reproducible from a seed. Noise is drawn on
+the generator's device and moved to the model's, so one CPU generator gives the
+same stream on any device.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from contextlib import contextmanager
 import torch
 
 from mdgan._util import positive_int
+from mdgan.models.latent_transition import _draw_device
 from mdgan.ops import mean_operation as _center
 
 
@@ -36,7 +39,9 @@ def _non_negative_int(name, value):
 
 
 def _initial_latents(gz, batch, generator, device, dtype):
-    return torch.rand(batch, gz.latent_dim, device=device, dtype=dtype, generator=generator)
+    """z_0 ~ U[0,1), drawn on the generator's device and moved to the model's."""
+    z0 = torch.rand(batch, gz.latent_dim, device=_draw_device(generator, device), dtype=dtype, generator=generator)
+    return z0.to(device)
 
 
 def make_fake_window(gz, gy, batch: int, burn_in: int, pair_window: int, *,

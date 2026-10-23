@@ -14,6 +14,7 @@ import torch
 
 from conftest import SMALL
 from mdgan.ops import mean_operation
+from mdgan.rollout import make_fake_window, rollout
 
 pytestmark = pytest.mark.gpu
 
@@ -54,3 +55,21 @@ def test_critic_agrees_with_cpu(device, dg):
         cpu = dg(w)
         dev = dg.to(device)(w.to(device)).cpu()
     torch.testing.assert_close(dev, cpu, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_one_cpu_generator_drives_models_on_device(device, three_nets):
+    """Noise is drawn on the generator's device and moved: the same CPU seed gives
+    the same noise on any device, and training/estimation code accepts a CPU generator."""
+    gz, gy, _ = (net.to(device) for net in three_nets)
+    r_dev = gz.sample_noise(4, device=device, generator=torch.Generator().manual_seed(0))
+    r_cpu = gz.sample_noise(4, generator=torch.Generator().manual_seed(0))
+    assert r_dev.device.type == device
+    torch.testing.assert_close(r_dev.cpu(), r_cpu, rtol=0, atol=0)
+    rp_dev, u_dev = gy.sample_noise(4, device=device, generator=torch.Generator().manual_seed(1))
+    rp_cpu, u_cpu = gy.sample_noise(4, generator=torch.Generator().manual_seed(1))
+    torch.testing.assert_close(u_dev.cpu(), u_cpu, rtol=0, atol=0)
+    w = make_fake_window(gz, gy, 8, 2, 2, generator=torch.Generator().manual_seed(2))
+    assert w.device.type == device
+    out = rollout(gz, gy, 8, 2, 1, generator=torch.Generator().manual_seed(3))
+    assert out.device.type == "cpu" and torch.isfinite(out).all()

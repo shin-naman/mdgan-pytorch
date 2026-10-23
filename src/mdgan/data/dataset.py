@@ -30,6 +30,10 @@ paper): WGAN-GP's gradient penalty is in input units, and water steps here are
 ~0.17 nm. sigma is reported in `metadata` so the trainer stores it and the
 estimator multiplies it back before any physical quantity is computed.
 
+scale_inputs=False is the unscaled ablation: windows stay in nm and sigma_nm = 1.
+window_std_nm (the raw spread) is recorded either way, so a resumed run can check it
+is training on the same data.
+
 Units: windows in sigma units (dimensionless); dt_ps and sigma_nm in metadata.
 """
 
@@ -68,7 +72,7 @@ class WindowDataset:
     """The training set: scaled 2M-step coarse displacement windows and sigma."""
 
     def __init__(self, system: SystemData, block_len: int = 64, step_skip: int = 1,
-                 phase_mode: str = "single"):
+                 phase_mode: str = "single", scale_inputs: bool = True):
         positive_int("block_len", block_len)
         positive_int("step_skip", step_skip)
         if phase_mode not in PHASE_MODES:
@@ -97,9 +101,12 @@ class WindowDataset:
         assert windows.shape[1] == self.window_len
 
         # --- 3. Scale by one scalar sigma computed from these windows only ---
-        self.sigma_nm = float(windows.std())
-        if not np.isfinite(self.sigma_nm) or self.sigma_nm <= 0:
+        self.window_std_nm = float(windows.std())
+        if not np.isfinite(self.window_std_nm) or self.window_std_nm <= 0:
             raise ValueError("training windows have zero or non-finite spread")
+        # sigma is the scale actually applied: the spread, or 1 for the unscaled ablation.
+        self.scale_inputs = bool(scale_inputs)
+        self.sigma_nm = self.window_std_nm if self.scale_inputs else 1.0
         self._windows = torch.from_numpy((windows / self.sigma_nm).astype(np.float32))    # (W, 2M, C)
 
         self.n_windows = int(self._windows.shape[0])
@@ -134,6 +141,8 @@ class WindowDataset:
             "n_windows": self.n_windows,
             "n_trajectories": self.n_trajectories,
             "dt_ps": self.dt_ps,
+            "scale_inputs": self.scale_inputs,
+            "window_std_nm": self.window_std_nm,
             "sigma_nm": self.sigma_nm,
             "source_md5": self.source_md5,
         }

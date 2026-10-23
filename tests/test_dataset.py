@@ -128,6 +128,17 @@ def test_sigma_is_one_scalar_and_windows_have_unit_spread():
     assert ds.windows.std(unbiased=False).item() == pytest.approx(1.0, abs=1e-5)
 
 
+def test_unscaled_ablation_keeps_nm_and_records_the_raw_spread():
+    """scale_inputs=False: windows stay in nm, sigma_nm = 1, window_std_nm still recorded."""
+    sys_ = make_system()
+    scaled = WindowDataset(sys_, block_len=M, step_skip=NS)
+    raw = WindowDataset(sys_, block_len=M, step_skip=NS, scale_inputs=False)
+    assert raw.sigma_nm == 1.0 and raw.scale_inputs is False
+    assert raw.window_std_nm == scaled.window_std_nm == scaled.sigma_nm
+    torch.testing.assert_close(raw.windows, scaled.windows * scaled.sigma_nm, rtol=1e-6, atol=1e-7)
+    assert raw.metadata["scale_inputs"] is False and raw.metadata["sigma_nm"] == 1.0
+
+
 def test_sigma_depends_on_step_skip():
     """Coarse steps are sums of n_s fine steps, so their spread grows ~sqrt(n_s)."""
     s1 = WindowDataset(make_system(n_steps=400), block_len=M, step_skip=1).sigma_nm
@@ -221,7 +232,8 @@ def test_metadata_is_complete_and_json_serializable():
     assert m == {
         "system": "synth", "block_len": M, "step_skip": NS, "phase_mode": "all",
         "region_steps": 2 * M * NS + NS - 1, "window_len": 2 * M, "n_windows": 15,
-        "n_trajectories": 5, "dt_ps": 30.0, "sigma_nm": ds.sigma_nm, "source_md5": ["a" * 32] * 5,
+        "n_trajectories": 5, "dt_ps": 30.0, "scale_inputs": True, "window_std_nm": ds.window_std_nm,
+        "sigma_nm": ds.sigma_nm, "source_md5": ["a" * 32] * 5,
     }
     json.dumps(m)
     assert "sigma" in repr(ds)

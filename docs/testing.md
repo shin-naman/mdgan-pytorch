@@ -52,6 +52,7 @@ One test file per source module, flat under `tests/`; cross-module tests in subf
 | `rollout.py` | `tests/test_rollout.py` |
 | `checkpoint.py` | `tests/test_checkpoint.py` |
 | `evaluate.py` | `tests/test_evaluate.py` |
+| `train.py` | `tests/test_train.py` |
 | `config.py`, `_util.py` | `tests/test_config.py`, `tests/test_util.py` |
 | `data/water.py` | `tests/test_water.py` |
 | `data/xtc.py` | `tests/test_xtc.py` |
@@ -113,7 +114,7 @@ survived (fail), anything else = the patch itself is broken (fail, output shown)
 A baseline run per target proves the unmutated file passes first.
 `MDGAN_PE_DIR` is removed in the subprocesses.
 
-Current state: **102 mutants, all killed** (14 baselines pass), ~115 s.
+Current state: **118 mutants, all killed** (15 baselines pass), ~4 min.
 
 | Group | Mutants | Examples |
 | --- | --- | --- |
@@ -124,6 +125,7 @@ Current state: **102 mutants, all killed** (14 baselines pass), ~115 s.
 | rollout | 9 | pair not consecutive, j below the burn-in, j fixed, mean flag ignored (training or estimation), burn-in skipped, transition before decode, noise reused, modes not restored |
 | checkpoint | 9 | non-strict load, class check removed, format version unchecked, iteration / σ / optimizer / generator state not saved or restored, non-atomic write, save without the model–config check |
 | evaluate | 9 | σ instead of σ², no trim to 80 ns, dt ignoring n_s, burn-in or mean flag not taken from the Config, D_ref from the generated curve, chain count or err window not from the Config, seed ignored |
+| train | 13 | critic not frozen, freeze not restored on error, n_critic ignored, no finite check, rollback not re-seeded, rollback limit changed, counter never reset, no checkpoint at 0, logs not truncated, generator state not restored, config or dataset change accepted on resume, evaluation using the training generator |
 | config / util | 4 | `from_dict` ignoring unknown keys, estimation blocks rounded down, `build_models` dropping an option, `positive_int` accepting `True` |
 | data | 16 | minimum image with floor, molecule not made whole, equal masses, guard at L/4 or disabled, triclinic accepted, cache ignores source changes, time average over T, D without /6, linear err weights, σ from the full trajectory (leak), phase ignored |
 
@@ -164,9 +166,10 @@ what CI enforces; tests may use compact one-line statements (`E701/E702`).
 
 ## Known gaps
 
-- One `learning` test so far (the critic separates two distributions; catches a flipped
-  loss sign). Nothing yet verifies that the full model learns: that is the synthetic
-  Brownian D-recovery test, with the trainer.
+- Learning tests: the critic separates two distributions (`test_losses.py`); the generator
+  learns Gaussian step statistics and a Brownian D (`test_train.py`, the latter `slow`). Their
+  bounds are first calibrations, not derivations. Still missing: a persistent-walk test that
+  needs memory across blocks (AR(1) velocity), planned once the Brownian budget is known.
 - No golden-output tests. Deliberately: comparing forward outputs across torch or
   BLAS versions produces spurious failures. Reference-forward tests cover the same
   regressions without depending on kernel arithmetic.

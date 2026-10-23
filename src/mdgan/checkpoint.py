@@ -1,16 +1,25 @@
 """Saving and resuming MD-GAN runs.
 
-One file per checkpoint holding everything needed to resume or evaluate:
+Two kinds of file (both one torch file, same strict loader):
 
+    kind "full"         G_z, G_Y, D_G, optimizer states, RNG states: everything needed
+                        to RESUME training. ~375 MB at width 2048 (31M parameters plus
+                        two Adam moment buffers), so the trainer keeps one, latest.pt,
+                        overwritten in place.
+    kind "generators"   G_z and G_Y only: everything needed to EVALUATE (~72 MB). The
+                        trainer keeps one per checkpoint interval, snap_XXXXXX.pt.
+
+Payload:
     format_version   int, bumped on any incompatible change
+    kind             "full" | "generators"
     config           Config.to_dict(): the models are REBUILT from this on load
-    models           {"G_z" | "G_Y" | "D_G": {"class": <class name>, "state_dict": ...}}
-    optimizers       {name: optimizer.state_dict()}       (optional; for resuming)
+    models           {"G_z" | "G_Y" [| "D_G"]: {"class": <class name>, "state_dict": ...}}
+    optimizers       {name: optimizer.state_dict()}       (full only)
     iteration        generator updates completed
     sigma_nm         the scale the training windows were divided by (1.0 if unscaled)
     rng              {"torch": global CPU state, "generator": explicit generator state | None}
-    dataset          WindowDataset.metadata (optional; provenance)
-    extra            anything JSON-like (optional; e.g. last losses)
+    dataset          WindowDataset.metadata (optional; provenance, resume check)
+    extra            anything JSON-like (optional; e.g. rollback history)
 
 Loading is STRICT, by design (decisions.md "Checkpoint format and loading"):
   - the models are built from the stored Config, never from the caller's;
@@ -35,17 +44,19 @@ import torch
 from mdgan.config import Config
 from mdgan.models import Critic, LatentTransitionGenerator, TrajectoryGenerator, build_models
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 MODULE_KEYS = ("G_z", "G_Y", "D_G")
+KINDS = {"full": ("G_z", "G_Y", "D_G"), "generators": ("G_z", "G_Y")}
 _EXPECTED_CLASS = {"G_z": LatentTransitionGenerator, "G_Y": TrajectoryGenerator, "D_G": Critic}
 
 
 @dataclass
 class Checkpoint:
+    kind: str
     config: Config
     gz: LatentTransitionGenerator
     gy: TrajectoryGenerator
-    dg: Critic
+    dg: Critic | None
     iteration: int
     sigma_nm: float
     optimizer_states: dict = field(default_factory=dict)
@@ -56,38 +67,41 @@ class Checkpoint:
 
     @property
     def models(self):
-        return self.gz, self.gy, self.dg
+        """(G_z, G_Y, D_G) for a full checkpoint, (G_z, G_Y) for a generators-only one."""
+        return (self.gz, self.gy, self.dg) if self.dg is not None else (self.gz, self.gy)
 
 
 def _check_models_match_config(config: Config, models) -> None:
-    gz, gy, dg = models
-    for key, module in zip(MODULE_KEYS, models, strict=True):
+    keys = MODULE_KEYS[:len(models)]
+    for key, module in zip(keys, models, strict=True):
         if type(module) is not _EXPECTED_CLASS[key]:
             raise ValueError(f"{key} must be a {_EXPECTED_CLASS[key].__name__}; got {type(module).__name__}")
+    gz, gy = models[0], models[1]
     checks = {
         "latent_dim": (gz.latent_dim, gy.latent_dim), "noise_dim": (gz.noise_dim, gy.noise_dim),
-        "hidden_dim": (gz.hidden_dim, gy.hidden_dim, dg.hidden_dim),
-        "block_len": (gy.block_len, dg.block_len), "n_channels": (gy.n_channels, dg.n_channels),
+        "hidden_dim": (gz.hidden_dim, gy.hidden_dim), "block_len": (gy.block_len,), "n_channels": (gy.n_channels,),
     }
+    if len(models) == 3:
+        dg = models[2]
+        checks["hidden_dim"] += (dg.hidden_dim,)
+        checks["block_len"] += (dg.block_len,)
+        checks["n_channels"] += (dg.n_channels,)
     for name, values in checks.items():
         if any(v != getattr(config, name) for v in values):
             raise ValueError(f"models do not match the config: {name} = {values}, config has {getattr(config, name)}")
 
 
-def save_checkpoint(path, *, config: Config, models, iteration: int, sigma_nm: float,
-                    optimizers: dict | None = None, generator: torch.Generator | None = None,
-                    dataset: dict | None = None, extra: dict | None = None) -> None:
-    """Write a checkpoint atomically. `models` is (G_z, G_Y, D_G) and must match `config`."""
-    _check_models_match_config(config, models)
+def _payload(kind, config, models, iteration, sigma_nm, optimizers, generator, dataset, extra):
     if not isinstance(iteration, int) or isinstance(iteration, bool) or iteration < 0:
         raise ValueError("iteration must be a non-negative integer")
     if not sigma_nm > 0:
         raise ValueError("sigma_nm must be positive")
-    payload = {
+    return {
         "format_version": FORMAT_VERSION,
+        "kind": kind,
         "config": config.to_dict(),
         "models": {key: {"class": type(m).__name__, "state_dict": m.state_dict()}
-                   for key, m in zip(MODULE_KEYS, models, strict=True)},
+                   for key, m in zip(KINDS[kind], models, strict=True)},
         "optimizers": {name: opt.state_dict() for name, opt in (optimizers or {}).items()},
         "iteration": iteration,
         "sigma_nm": float(sigma_nm),
@@ -96,6 +110,9 @@ def save_checkpoint(path, *, config: Config, models, iteration: int, sigma_nm: f
         "dataset": dataset,
         "extra": extra or {},
     }
+
+
+def _write(path, payload) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -107,25 +124,46 @@ def save_checkpoint(path, *, config: Config, models, iteration: int, sigma_nm: f
             tmp.unlink()
 
 
+def save_checkpoint(path, *, config: Config, models, iteration: int, sigma_nm: float,
+                    optimizers: dict | None = None, generator: torch.Generator | None = None,
+                    dataset: dict | None = None, extra: dict | None = None) -> None:
+    """Full resume state, written atomically. `models` is (G_z, G_Y, D_G) and must match `config`."""
+    if len(models) != 3:
+        raise ValueError("a full checkpoint needs (G_z, G_Y, D_G)")
+    _check_models_match_config(config, models)
+    _write(path, _payload("full", config, models, iteration, sigma_nm, optimizers, generator, dataset, extra))
+
+
+def save_snapshot(path, *, config: Config, gz, gy, iteration: int, sigma_nm: float,
+                  dataset: dict | None = None, extra: dict | None = None) -> None:
+    """Generators only (G_z, G_Y): what evaluation needs. No optimizer or critic state."""
+    _check_models_match_config(config, (gz, gy))
+    _write(path, _payload("generators", config, (gz, gy), iteration, sigma_nm, None, None, dataset, extra))
+
+
 def load_checkpoint(path, map_location="cpu") -> Checkpoint:
     """Rebuild the models from the stored Config and load them strictly."""
     payload = torch.load(Path(path), map_location=map_location, weights_only=True)
     version = payload.get("format_version")
     if version != FORMAT_VERSION:
         raise ValueError(f"checkpoint format_version {version}; this code reads {FORMAT_VERSION}")
+    kind = payload.get("kind")
+    if kind not in KINDS:
+        raise ValueError(f"unknown checkpoint kind {kind!r}; expected one of {sorted(KINDS)}")
     config = Config.from_dict(payload["config"])
-    models = build_models(config)
+    built = dict(zip(MODULE_KEYS, build_models(config), strict=True))
     stored = payload["models"]
-    if set(stored) != set(MODULE_KEYS):
-        raise ValueError(f"checkpoint modules {sorted(stored)}; expected {list(MODULE_KEYS)}")
-    for key, module in zip(MODULE_KEYS, models, strict=True):
+    if set(stored) != set(KINDS[kind]):
+        raise ValueError(f"checkpoint modules {sorted(stored)}; a {kind!r} checkpoint has {list(KINDS[kind])}")
+    for key in KINDS[kind]:
+        module = built[key]
         if stored[key]["class"] != type(module).__name__:
             raise ValueError(f"checkpoint entry {key} holds a {stored[key]['class']}; "
                              f"expected {type(module).__name__}")
         module.load_state_dict(stored[key]["state_dict"], strict=True)
-    gz, gy, dg = models
     rng = payload.get("rng", {})
-    return Checkpoint(config=config, gz=gz, gy=gy, dg=dg,
+    return Checkpoint(kind=kind, config=config, gz=built["G_z"], gy=built["G_Y"],
+                      dg=built["D_G"] if kind == "full" else None,
                       iteration=payload["iteration"], sigma_nm=payload["sigma_nm"],
                       optimizer_states=payload.get("optimizers", {}),
                       generator_state=rng.get("generator"), torch_rng_state=rng.get("torch"),

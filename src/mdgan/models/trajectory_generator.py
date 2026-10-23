@@ -2,6 +2,7 @@ import torch
 from torch import nn
 
 from mdgan._util import positive_int
+from mdgan.models.latent_transition import _draw_device
 
 
 class ResidualAffineBlock(nn.Module):
@@ -89,10 +90,14 @@ class TrajectoryGenerator(nn.Module):
 
     def sample_noise(self, batch: int, *, device=None, dtype=None,
                      generator: torch.Generator | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-        """(r_prime, u) for `batch` samples: r_prime ~ U[0,1), u ~ N(0,1)."""
-        r_prime = torch.rand(batch, self.noise_dim, device=device, dtype=dtype, generator=generator)
-        u = torch.randn(batch, self.block_len, self.n_channels, device=device, dtype=dtype,
-                        generator=generator)
+        """(r_prime, u) for `batch` samples: r_prime ~ U[0,1), u ~ N(0,1).
+
+        Drawn on the generator's device, then moved to `device` (see _draw_device)."""
+        at = _draw_device(generator, device)
+        r_prime = torch.rand(batch, self.noise_dim, device=at, dtype=dtype, generator=generator)
+        u = torch.randn(batch, self.block_len, self.n_channels, device=at, dtype=dtype, generator=generator)
+        if device is not None:
+            r_prime, u = r_prime.to(device), u.to(device)
         return r_prime, u
 
     def generate(self, z: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:

@@ -4,6 +4,13 @@ from torch import nn
 from mdgan._util import positive_int
 
 
+def _draw_device(generator, device):
+    """Noise is drawn on the GENERATOR's device and then moved to `device`. One CPU
+    generator therefore gives the same random stream whether the model runs on
+    CPU, CUDA or MPS (decisions.md, "Randomness")."""
+    return generator.device if generator is not None else device
+
+
 class LatentTransitionGenerator(nn.Module):
     """Stochastic latent transition generator (G_z) for MD-GAN."""
 
@@ -57,8 +64,12 @@ class LatentTransitionGenerator(nn.Module):
 
     def sample_noise(self, batch: int, *, device=None, dtype=None,
                      generator: torch.Generator | None = None) -> torch.Tensor:
-        """r for `batch` samples: r ~ U[0,1), shape (B, noise_dim)."""
-        return torch.rand(batch, self.noise_dim, device=device, dtype=dtype, generator=generator)
+        """r for `batch` samples: r ~ U[0,1), shape (B, noise_dim).
+
+        Drawn on the generator's device, then moved to `device` (see _draw_device)."""
+        r = torch.rand(batch, self.noise_dim, device=_draw_device(generator, device), dtype=dtype,
+                       generator=generator)
+        return r.to(device) if device is not None else r
 
     def unroll(self, z0: torch.Tensor, steps: int,
                generator: torch.Generator | None = None) -> torch.Tensor:

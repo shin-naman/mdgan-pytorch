@@ -12,7 +12,9 @@ curve instead of a copy of the (8192, 8000, 3) displacement array.
 
 The MD reference is computed once (reference_msd) and passed in, so evaluating
 many checkpoints does not recompute it. Evaluation randomness goes through an
-explicit generator created on the models' device from `seed`.
+explicit CPU generator seeded from `seed`; noise is moved to the models' device, so
+the same seed gives the same evaluation noise on any device. Works with both
+checkpoint kinds (only G_z and G_Y are needed).
 """
 
 from __future__ import annotations
@@ -98,15 +100,14 @@ def evaluate(gz, gy, config: Config, sigma_nm: float, msd_ref: np.ndarray, dt_re
 
 def evaluate_checkpoint(path, system, *, msd_ref: np.ndarray | None = None, n_chains: int | None = None,
                         seed: int | None = None, map_location="cpu") -> EvaluationResult:
-    """Load a checkpoint and evaluate it against `system` (a preprocess.SystemData)."""
+    """Load a checkpoint (full or generators-only) and evaluate it against `system`."""
     from mdgan.checkpoint import load_checkpoint
     ck = load_checkpoint(path, map_location=map_location)
     if msd_ref is None:
         msd_ref, dt_ref = reference_msd(system)
     else:
         dt_ref = float(system.dt_ps)
-    device = next(ck.gz.parameters()).device
-    generator = torch.Generator(device=device).manual_seed(ck.config.seed if seed is None else seed)
+    generator = torch.Generator().manual_seed(ck.config.seed if seed is None else seed)   # CPU; see _draw_device
     return evaluate(ck.gz, ck.gy, ck.config, ck.sigma_nm, msd_ref, dt_ref,
                     iteration=ck.iteration, n_chains=n_chains, generator=generator)
 

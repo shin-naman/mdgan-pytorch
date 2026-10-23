@@ -186,6 +186,16 @@ class TestCheckpoint:
         assert res.to_dict() == direct.to_dict()
         np.testing.assert_array_equal(res.msd_gen_nm2, direct.msd_gen_nm2)
 
+    def test_works_on_a_generators_only_snapshot(self, saved, tmp_path):
+        from mdgan.checkpoint import save_snapshot
+        p, c, (gz, gy, _) = saved
+        snap = tmp_path / "snap.pt"
+        save_snapshot(snap, config=c, gz=gz, gy=gy, iteration=30_000, sigma_nm=0.17)
+        system = brownian_system(16, 400)
+        a = evaluate_checkpoint(p, system, seed=3)
+        b = evaluate_checkpoint(snap, system, seed=3)
+        assert a.to_dict() == b.to_dict()
+
     def test_seed_defaults_to_config_and_changes_the_ensemble(self, saved):
         p, _, _ = saved
         system = brownian_system(16, 400)
