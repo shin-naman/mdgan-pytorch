@@ -3,7 +3,8 @@
 #
 #   run_train.sh NAME SEED [extra mdgan.train arguments...]
 #
-# Expects in the job sandbox: src/ (the package), pe_paper.json, PE.npz.
+# Expects in the job sandbox: src/ (the package), the config JSON named by $CONFIG
+# (default pe_paper.json), and PE.npz.
 # Writes run_NAME/. Exit code 85 = "saved at the time limit, restart me" (HTCondor
 # checkpoint_exit_code); 0 = training finished; anything else = a real failure.
 set -euo pipefail
@@ -19,7 +20,8 @@ python -c "import sys, torch, numpy; print('python', sys.version.split()[0], '| 
 if [ -f "run_${NAME}/latest.pt" ]; then echo "resuming from run_${NAME}/latest.pt"; fi
 
 set +e
-python -u -m mdgan.train PE.npz --out "run_${NAME}" --config pe_paper.json --set "seed=${SEED}" \
+echo "config ${CONFIG:-pe_paper.json}"
+python -u -m mdgan.train PE.npz --out "run_${NAME}" --config "${CONFIG:-pe_paper.json}" --set "seed=${SEED}" \
     --device cuda --auto-resume --max-hours "${MAX_HOURS:-4}" --log-every 100 "$@"
 status=$?
 set -e

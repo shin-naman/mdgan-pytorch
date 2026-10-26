@@ -1,0 +1,32 @@
+# Phase 2.0 pipeline-diff arm: scale_inputs = False (train on raw nm displacements; sigma = 1).
+# Everything else is the paper protocol (configs/pe_paper.json); 100k iterations, 3 seeds.
+# Extending a promising arm to 300k needs a follow-up submit that transfers the finished run
+# directory back in under the same name (a new submission gets a new cluster ID, i.e. a new run).
+# Submit from the repository root in /home:  condor_submit tools/chtc/ablation_scale_off.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+executable                = tools/chtc/run_train.sh
+arguments                 = scaleoff_c$(Cluster)_seed$(Process) $(Process)
+environment               = "MAX_HOURS=11 CONFIG=ablation_scale_off.json"
+
+should_transfer_files     = YES
+transfer_input_files      = src, configs/ablation_scale_off.json, data/cache/PE.npz
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+transfer_checkpoint_files = run_scaleoff_c$(Cluster)_seed$(Process)
+transfer_output_files     = run_scaleoff_c$(Cluster)_seed$(Process)
+
+request_gpus              = 1
++WantGPULab               = true
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 5GB
+
+log                       = logs/scaleoff_c$(Cluster)_seed$(Process).log
+output                    = logs/scaleoff_c$(Cluster)_seed$(Process).out
+error                     = logs/scaleoff_c$(Cluster)_seed$(Process).err
+
+queue 3
