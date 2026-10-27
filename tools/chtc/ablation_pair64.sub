@@ -1,0 +1,36 @@
+# Phase 2.0 arm: pair_window 4 -> 64 (training decodes latents up to step 7 + 64 instead of 7 + 4),
+# sigma units, 3 seeds x 100k. Submit only if the GPU queue has room after tools/chtc/ablations.sub.
+# Slower per iteration (longer G_z unroll); MAX_HOURS 11 lets the safety net resume it if needed.
+# Submit from the repository root in /home:  condor_submit tools/chtc/ablation_pair64.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+executable                = tools/chtc/run_train.sh
+arguments                 = $(ARM)_c$(Cluster)_seed$(SEED) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=ablation_$(ARM).json"
+
+should_transfer_files     = YES
+transfer_input_files      = src, configs/ablation_$(ARM).json, data/cache/PE.npz
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+transfer_checkpoint_files = run_$(ARM)_c$(Cluster)_seed$(SEED)
+transfer_output_files     = run_$(ARM)_c$(Cluster)_seed$(SEED)
+
+request_gpus              = 1
++WantGPULab               = true
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 5GB
+
+log                       = logs/$(ARM)_c$(Cluster)_seed$(SEED).log
+output                    = logs/$(ARM)_c$(Cluster)_seed$(SEED).out
+error                     = logs/$(ARM)_c$(Cluster)_seed$(SEED).err
+
+ARM = pair64
+queue SEED from (
+  0
+  1
+  2
+)

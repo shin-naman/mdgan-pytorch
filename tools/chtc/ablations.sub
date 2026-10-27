@@ -1,0 +1,48 @@
+# Phase 2.0 pipeline-diff arms, one submission: 4 arms x 3 seeds x 100k iterations = 12 jobs,
+# sigma units (the paper protocol, configs/pe_paper.json) with one change per arm:
+#   running_stats   G_z BatchNorm keeps running statistics      (configs/ablation_running_stats.json)
+#   init_chainer    Chainer-default Linear/Conv init           (configs/ablation_init_chainer.json)
+#   noise128        noise_dim 32 -> 128 (G_z's r and G_Y's r')  (configs/ablation_noise128.json)
+#   betas05         Adam betas (0.0, 0.9) -> (0.5, 0.9)        (configs/ablation_betas05.json)
+# pair_window = 64 is a separate submission: tools/chtc/ablation_pair64.sub.
+# Submit from the repository root in /home:  condor_submit tools/chtc/ablations.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+executable                = tools/chtc/run_train.sh
+arguments                 = $(ARM)_c$(Cluster)_seed$(SEED) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=ablation_$(ARM).json"
+
+should_transfer_files     = YES
+transfer_input_files      = src, configs/ablation_$(ARM).json, data/cache/PE.npz
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+transfer_checkpoint_files = run_$(ARM)_c$(Cluster)_seed$(SEED)
+transfer_output_files     = run_$(ARM)_c$(Cluster)_seed$(SEED)
+
+request_gpus              = 1
++WantGPULab               = true
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 5GB
+
+log                       = logs/$(ARM)_c$(Cluster)_seed$(SEED).log
+output                    = logs/$(ARM)_c$(Cluster)_seed$(SEED).out
+error                     = logs/$(ARM)_c$(Cluster)_seed$(SEED).err
+
+queue ARM, SEED from (
+  running_stats, 0
+  running_stats, 1
+  running_stats, 2
+  init_chainer, 0
+  init_chainer, 1
+  init_chainer, 2
+  noise128, 0
+  noise128, 1
+  noise128, 2
+  betas05, 0
+  betas05, 1
+  betas05, 2
+)

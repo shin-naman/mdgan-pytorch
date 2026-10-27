@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, fields
 from mdgan._util import positive_int
 
 PHASE_MODES = ("single", "all")
+INIT_SCHEMES = ("pytorch", "chainer")    # see mdgan.models.init
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class Config:
     hidden_dim: int = 2048
     negative_slope: float = 0.2
     use_running_stats: bool = False  # G_z BatchNorm: batch statistics in train and eval
+    init: str = "pytorch"           # weight initialisation scheme (mdgan.models.init)
 
     # --- data ----------------------------------------------------------------------------
     step_skip: int = 1              # n_s (PE 1, E-VDF 3, PVDF 5, PVAC/E-VAC 7, PAAM/E-AAM 20)
@@ -68,6 +70,8 @@ class Config:
             raise ValueError("seed must be a non-negative integer")
         if self.phase_mode not in PHASE_MODES:
             raise ValueError(f"phase_mode must be one of {PHASE_MODES}")
+        if self.init not in INIT_SCHEMES:
+            raise ValueError(f"init must be one of {INIT_SCHEMES}")
         if not self.lr > 0:
             raise ValueError("lr must be positive")
         if len(self.betas) != 2 or not all(0.0 <= b < 1.0 for b in self.betas):

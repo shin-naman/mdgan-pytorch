@@ -6,6 +6,7 @@
   "hidden_dim": 2048,
   "negative_slope": 0.2,
   "use_running_stats": false,
+  "init": "pytorch",
   "step_skip": 1,
   "phase_mode": "single",
   "scale_inputs": true,

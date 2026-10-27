@@ -1,0 +1,16 @@
+ 1267  python tools/diag_runs.py runs/chtc/run_scaleoff_c7166270_seed0 runs/chtc/run_scaleoff_c7166270_seed1 runs/chtc/run_scaleoff_c7166270_seed2 --data data/cache/PE.npz
+ 1268  python tools/diag_runs.py runs/chtc/run_scaleoff_c7166270_seed0 runs/chtc/run_scaleoff_c7166270_seed1 runs/chtc/run_scaleoff_c7166270_seed2 --data data/cache/PE.npz --blocks --device mps
+ 1269  python tools/diag_runs.py runs/chtc/run_c6954730_seed* runs/chtc/run_scaleoff_c7166270_seed* \\n  --data data/cache/PE.npz --blocks --device mps
+ 1270  python tools/latent_cycle.py \\n  runs/chtc/run_scaleoff_c7166270_seed0/snap_030000.pt \\n  runs/chtc/run_scaleoff_c7166270_seed1/snap_060000.pt \\n  --device mps --out runs/latent_cycle
+ 1271  nohup python tools/diag_runs.py runs/chtc/run_c6954730_seed* runs/chtc/run_scaleoff_c7166270_seed* \\n  --data data/cache/PE.npz --blocks --all --device mps --csv runs/diag_blocks_all.csv \\n  > runs/diag_blocks_all.log 2>&1 &\n\ntail -f runs/diag_blocks_all.log          # rows appear as each checkpoint finishes; Ctrl+C stops watching only
+ 1272  python tools/diag_logs.py runs/chtc/run_c6954730_seed* runs/chtc/run_scaleoff_c7166270_seed* \\n  --diag-csv runs/diag_blocks_all.csv --out runs/phase1
+ 1273  ruff check src tests tools
+ 1274  python -m pytest -q
+ 1275  python -m pytest -m mutation tests/mutation -q
+ 1276  echo "Hello"
+ 1277  a
+ 1278  fc -AI ~/terminal_history_backup.txt\n
+ 1279  history > terminal_history.txt\n
+ 1280  y
+ 1281  history > terminal_history.txt\n
+ 1282  Pineapple

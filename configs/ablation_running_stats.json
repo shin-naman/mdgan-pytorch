@@ -1,0 +1,37 @@
+{
+  "latent_dim": 32,
+  "noise_dim": 32,
+  "block_len": 64,
+  "n_channels": 3,
+  "hidden_dim": 2048,
+  "negative_slope": 0.2,
+  "use_running_stats": true,
+  "init": "pytorch",
+  "step_skip": 1,
+  "phase_mode": "single",
+  "scale_inputs": true,
+  "batch_size": 64,
+  "n_iterations": 100000,
+  "n_critic": 5,
+  "lr": 0.0001,
+  "betas": [
+    0.0,
+    0.9
+  ],
+  "gp_lambda": 10.0,
+  "burn_in": 7,
+  "pair_window": 4,
+  "mean_operation": true,
+  "seed": 0,
+  "checkpoint_every": 10000,
+  "estimation_chains": 8192,
+  "estimation_time_ps": 80000.0,
+  "err_window_ps": [
+    200.0,
+    78000.0
+  ],
+  "diffusion_fit_ps": [
+    10000.0,
+    20000.0
+  ]
+}

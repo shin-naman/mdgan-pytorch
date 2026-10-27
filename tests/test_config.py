@@ -20,7 +20,7 @@ class TestDefaults:
         """docs/decisions.md. If one of these changes, decisions.md changes with it."""
         c = Config()
         assert (c.latent_dim, c.noise_dim, c.block_len, c.n_channels, c.hidden_dim) == (32, 32, 64, 3, 2048)
-        assert c.negative_slope == 0.2 and c.use_running_stats is False
+        assert c.negative_slope == 0.2 and c.use_running_stats is False and c.init == "pytorch"
         assert (c.step_skip, c.phase_mode, c.scale_inputs) == (1, "single", True)
         assert (c.batch_size, c.n_iterations, c.n_critic) == (64, 300_000, 5)
         assert (c.lr, c.betas, c.gp_lambda) == (1e-4, (0.0, 0.9), 10.0)
@@ -53,7 +53,7 @@ class TestValidation:
         dict(step_skip=2.0), dict(pair_window=0), dict(estimation_chains=0),
         dict(burn_in=-1), dict(seed=-1), dict(phase_mode="some"),
         dict(lr=0.0), dict(betas=(0.0, 1.0)), dict(betas=(0.5,)), dict(gp_lambda=-1.0),
-        dict(negative_slope=-0.1), dict(err_window_ps=(78_000.0, 200.0)),
+        dict(negative_slope=-0.1), dict(init="xavier"), dict(err_window_ps=(78_000.0, 200.0)),
         dict(diffusion_fit_ps=(0.0, 10.0)), dict(estimation_time_ps=0.0),
         dict(estimation_time_ps=10_000.0), dict(err_window_ps=(200.0, 90_000.0)),
         dict(diffusion_fit_ps=(10_000.0, 85_000.0)),

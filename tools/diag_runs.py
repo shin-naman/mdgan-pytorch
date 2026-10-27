@@ -9,7 +9,11 @@ preprocessed cache of the same system, and prints:
      GROWS with time means correlated drift between blocks; a constant factor means
      a step-size (variance) error;
   3. with --blocks: for the same checkpoints, rolled out again, and for the real MD:
-       block var       variance of one M-step block displacement per axis (sigma units)
+       sigma           the scale that run trained in (nm; 1 for scale_inputs=False runs).
+                       Every row is converted to nm before any statistic, so runs trained in
+                       sigma units and in nm are directly comparable
+       blk var         variance of one M-step block displacement per axis (nm^2)
+       var/MD          blk var relative to the MD's (unit-free)
        corr@lag        correlation between block displacements `lag` blocks apart
        corr sum        sum of those correlations over lags 1-30 (long-time MSD scales
                        roughly by 1 + 2 x this, relative to independent blocks)
@@ -21,6 +25,12 @@ preprocessed cache of the same system, and prints:
 Usage (repository root):
     python tools/diag_runs.py runs/chtc/run_c6954730_seed* --data data/cache/PE.npz
     python tools/diag_runs.py runs/chtc/run_c6954730_seed* --data data/cache/PE.npz --blocks --device mps
+
+    python tools/diag_runs.py runs/chtc/run_* --data data/cache/PE.npz --blocks --all --csv runs/diag_blocks.csv
+
+--all analyses every checkpoint instead of best/median/final; --csv writes one row per analysed
+checkpoint (all section-3 columns, every block lag 1-30, plus that checkpoint's err and D_rel) and
+one MD reference row, for joining with the training logs (Phase 1).
 
 Sections 1-2 read saved files only (seconds, no torch). Section 3 runs one rollout per
 selected checkpoint (--chains, default 1024; about a minute each on CPU, faster on MPS).
@@ -116,28 +126,75 @@ def _latent_persistence(states: np.ndarray) -> dict:
     return out
 
 
-def section_blocks(run_dirs, runs, system, chains: int, device: str) -> None:
+# Section 3 table: one layout for the header and every row, so columns cannot run together.
+_COLS = ([("source", 46, "s"), ("sigma", 6, ".3f"), ("blk var", 8, ".4f"), ("var/MD", 7, ".2f")]
+         + [(f"ρ@{lag}", 7, "+.3f") for lag in BLOCK_LAGS] + [("Σρ1-30", 8, "+.3f")]
+         + [(f"z@{lag}", 7, "+.3f") for lag in LATENT_LAGS])
+
+
+def _fmt_row(values: list) -> str:
+    """values in _COLS order; None prints as a dash (e.g. no latent for the MD row)."""
+    cells = []
+    for (_, width, spec), v in zip(_COLS, values, strict=True):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            cells.append(f"{'—':>{width}}")
+        elif spec == "s":
+            cells.append(f"{v:<{width}}")
+        else:
+            sign, rest = ("+", spec[1:]) if spec.startswith("+") else ("", spec)
+            cells.append(f"{v:>{sign}{width}{rest}}")
+    return "  ".join(cells)
+
+
+def _fmt_header() -> str:
+    return "  ".join(f"{name:<{w}}" if spec == "s" else f"{name:>{w}}" for name, w, spec in _COLS)
+
+
+def _stats_row(label: str, sigma, st: dict, var_md: float, zp: dict | None) -> list:
+    return ([label, sigma, st["var"], st["var"] / var_md]
+            + [st["corr"].get(lag, float("nan")) for lag in BLOCK_LAGS] + [st["corr_sum"]]
+            + [(zp or {}).get(lag) for lag in LATENT_LAGS])
+
+
+def _csv_record(run: str, iteration, label: str, sigma, st: dict, var_md: float, zp: dict | None,
+                e: dict | None) -> dict:
+    rec = {"run": run, "iteration": iteration, "label": label, "sigma_nm": sigma,
+           "blk_var_nm2": st["var"], "var_over_md": st["var"] / var_md,
+           **{f"rho@{lag}": st["corr"].get(lag, float("nan")) for lag in range(1, 31)},
+           "rho_sum_1_30": st["corr_sum"],
+           **{f"z@{lag}": (zp or {}).get(lag, float("nan")) for lag in LATENT_LAGS},
+           "err_percent": (e or {}).get("err_percent", float("nan")),
+           "D_rel": (e or {}).get("D_rel_error", float("nan"))}
+    return rec
+
+
+def section_blocks(run_dirs, runs, system, chains: int, device: str, all_checkpoints: bool = False,
+                   csv_path: str | None = None) -> None:
     import torch
 
     from mdgan.checkpoint import load_checkpoint
     from mdgan.ops import mean_operation
 
-    print(f"3. Block and latent statistics ({chains} chains per rollout; MD = the real trajectories)")
-    lag_head = " ".join(f"{'@' + str(lag):>6}" for lag in BLOCK_LAGS)
-    z_head = " ".join(f"{'z@' + str(lag):>6}" for lag in LATENT_LAGS)
-    print(f"{'source':<44} {'blk var':>8} corr {lag_head} {'sum1-30':>8} | persist {z_head}")
+    print(f"3. Block and latent statistics ({chains} chains per rollout; MD = the real trajectories; "
+          f"everything in nm)")
+    print(_fmt_header())
 
     first = next(iter(runs))
-    ck0 = load_checkpoint(run_dirs[first] / f"snap_{runs[first][0]['iteration']:06d}.pt")
-    sigma, m = ck0.sigma_nm, ck0.config.block_len
-    md = _block_stats(system.displacements.astype(np.float64) / sigma, m)
-    print(f"{'MD (target)':<44} {md['var']:8.2f}      " + " ".join(f"{md['corr'].get(lag, float('nan')):+6.3f}"
-          for lag in BLOCK_LAGS) + f" {md['corr_sum']:+8.3f} |")
+    m = load_checkpoint(run_dirs[first] / f"snap_{runs[first][0]['iteration']:06d}.pt").config.block_len
+    md = _block_stats(system.displacements.astype(np.float64), m)                      # raw nm
+    print(_fmt_row(_stats_row("MD (target)", None, md, md["var"], None)))
+    records = [_csv_record("MD", None, "reference", None, md, md["var"], None, None)]
 
     for name, evals in runs.items():
-        for label, e in pick_checkpoints(evals).items():
+        picked = pick_checkpoints(evals)
+        named = {e["iteration"]: label for label, e in picked.items()}
+        selection = ([(named.get(e["iteration"], "checkpoint"), e) for e in evals] if all_checkpoints
+                     else list(picked.items()))
+        for label, e in selection:
             ck = load_checkpoint(run_dirs[name] / f"snap_{e['iteration']:06d}.pt", map_location="cpu")
             c = ck.config
+            if c.block_len != m:
+                raise ValueError(f"{name}: block_len {c.block_len} differs from {m}; compare like with like")
             gz, gy = ck.gz.to(device).eval(), ck.gy.to(device).eval()
             n_blocks = c.estimation_blocks(system.dt_ps)
             g = torch.Generator().manual_seed(0)
@@ -146,14 +203,21 @@ def section_blocks(run_dirs, runs, system, chains: int, device: str) -> None:
                 states = gz.unroll(z0, c.burn_in + n_blocks - 1, generator=g)           # z_0 .. z_{c+n-1}
                 decoded = states[c.burn_in:]                                           # z_c .. z_{c+n-1}
                 blocks = [mean_operation(gy.generate(z, generator=g)) for z in decoded]
-                d = torch.cat(blocks, dim=1).cpu().double().numpy()
+                d = torch.cat(blocks, dim=1).cpu().double().numpy() * ck.sigma_nm      # model units -> nm
             st = _block_stats(d, m)
             zp = _latent_persistence(decoded.cpu().double().numpy())
-            tag = f"{name} {label} @{e['iteration']}"
-            print(f"{tag:<44} {st['var']:8.2f}      " + " ".join(f"{st['corr'].get(lag, float('nan')):+6.3f}"
-                  for lag in BLOCK_LAGS) + f" {st['corr_sum']:+8.3f} |         "
-                  + " ".join(f"{zp.get(lag, float('nan')):6.3f}" for lag in LATENT_LAGS))
+            print(_fmt_row(_stats_row(f"{name} {label} @{e['iteration']}", ck.sigma_nm, st, md["var"], zp)),
+                  flush=True)
+            records.append(_csv_record(name, e["iteration"], label, ck.sigma_nm, st, md["var"], zp, e))
     print()
+    if csv_path:
+        import csv
+        Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(csv_path, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(records[0]))
+            w.writeheader()
+            w.writerows(records)
+        print(f"wrote {len(records) - 1} checkpoint rows + 1 MD row to {csv_path}")
 
 
 def main(argv=None) -> None:
@@ -163,7 +227,11 @@ def main(argv=None) -> None:
     ap.add_argument("--blocks", action="store_true", help="section 3: rollouts for block and latent statistics")
     ap.add_argument("--chains", type=int, default=1024)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--all", action="store_true", help="section 3 on every checkpoint, not best/median/final")
+    ap.add_argument("--csv", help="write the section-3 rows to this CSV (one per checkpoint + the MD)")
     args = ap.parse_args(argv)
+    if (args.all or args.csv) and not args.blocks:
+        ap.error("--all and --csv apply to section 3; add --blocks")
 
     run_dirs = {Path(r).name: Path(r) for r in sorted(args.runs)}
     runs = {name: _jsonl(p / "evaluations.jsonl") for name, p in run_dirs.items()}
@@ -174,7 +242,7 @@ def main(argv=None) -> None:
     section_summary(runs)
     section_msd(run_dirs, runs, msd_ref, dt_ref)
     if args.blocks:
-        section_blocks(run_dirs, runs, system, args.chains, args.device)
+        section_blocks(run_dirs, runs, system, args.chains, args.device, args.all, args.csv)
 
 
 if __name__ == "__main__":
