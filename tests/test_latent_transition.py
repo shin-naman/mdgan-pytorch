@@ -323,3 +323,142 @@ class TestAblationRunningStats:
             a = bs.unroll(z0, 3, generator=torch.Generator().manual_seed(3))
             b = rs.unroll(z0, 3, generator=torch.Generator().manual_seed(3))
         assert not torch.allclose(a[1:], b[1:])
+
+# =============================================================================
+class TestBatch1Probes:
+    """gz_additive_noise_std, gz_dropout, gz_norm_position: paper behaviour at the defaults,
+    each probe's formula written out with the module's own layers."""
+
+    S, P = 0.5, 0.5
+
+    def _gz(self, seed=31, **kw):
+        torch.manual_seed(seed)
+        return LatentTransitionGenerator(LAT, NR, hidden_dim=H, **kw)
+
+    def test_defaults_are_the_paper_model_bit_for_bit(self):
+        m = self._gz()
+        explicit = self._gz(gz_additive_noise_std=0.0, gz_dropout=0.0, gz_norm_position="output")
+        assert list(m.state_dict()) == ["input_layer.weight", "input_layer.bias", "hidden1.weight", "hidden1.bias",
+                                        "hidden2.weight", "hidden2.bias", "output_layer.weight", "output_layer.bias",
+                                        "output_norm.weight", "output_norm.bias"]
+        for (k, a), (_, b) in zip(m.state_dict().items(), explicit.state_dict().items(), strict=True):
+            assert torch.equal(a, b), k                                  # same init draws, same order
+        assert m.noise_width == NR and m.norm is m.output_norm
+        z, r = inputs()
+        torch.testing.assert_close(m(z, r), reference_forward(m, z, r), rtol=0, atol=0)
+
+    # --- additive noise -----------------------------------------------------------------------
+    def test_additive_structure_and_noise(self):
+        m = self._gz(gz_additive_noise_std=self.S)
+        assert m.input_layer.in_features == LAT and m.noise_width == LAT
+        eps = m.sample_noise(20000, generator=torch.Generator().manual_seed(1))
+        assert eps.shape == (20000, LAT)
+        assert abs(eps.mean().item()) < 0.01 and abs(eps.std().item() - self.S) < 0.01
+
+    def test_additive_forward_is_z_plus_eps(self):
+        m = self._gz(gz_additive_noise_std=self.S)
+        z, eps = torch.rand(8, LAT), m.sample_noise(8, generator=torch.Generator().manual_seed(2))
+        h = m.act(m.input_layer(z + eps))
+        ref = m.output_norm(m.output_layer(m.act(m.hidden2(m.act(m.hidden1(h))))))
+        torch.testing.assert_close(m(z, eps), ref, rtol=0, atol=0)
+
+    def test_additive_rejects_the_paper_noise_vector(self):
+        m = self._gz(gz_additive_noise_std=self.S)
+        with pytest.raises(ValueError, match="sample_noise"):
+            m(torch.rand(8, LAT), torch.rand(8, NR))
+
+    # --- dropout ------------------------------------------------------------------------------
+    def test_dropout_noise_width_depends_on_mode(self):
+        m = self._gz(gz_dropout=self.P)
+        m.train()
+        assert m.noise_width == NR + 3 * H
+        assert m.sample_noise(4, generator=torch.Generator().manual_seed(3)).shape == (4, NR + 3 * H)
+        m.eval()
+        assert m.noise_width == NR
+        assert m.sample_noise(4, generator=torch.Generator().manual_seed(3)).shape == (4, NR)
+
+    def test_dropout_training_forward_uses_the_drawn_masks(self):
+        m = self._gz(gz_dropout=self.P)
+        m.train()
+        z = torch.rand(16, LAT)
+        r = m.sample_noise(16, generator=torch.Generator().manual_seed(4))
+        u = [r[:, NR + i * H: NR + (i + 1) * H] for i in range(3)]
+        keep = [(x >= self.P).float() / (1 - self.P) for x in u]
+        h = m.act(m.input_layer(torch.cat((z, r[:, :NR]), dim=1))) * keep[0]
+        h = m.act(m.hidden1(h)) * keep[1]
+        h = m.act(m.hidden2(h)) * keep[2]
+        torch.testing.assert_close(m(z, r), m.output_norm(m.output_layer(h)), rtol=0, atol=0)
+        frac = (torch.cat(u, dim=1) >= self.P).float().mean().item()
+        assert abs(frac - (1 - self.P)) < 0.05
+
+    def test_dropout_is_off_in_eval_mode(self):
+        m = self._gz(gz_dropout=self.P)
+        plain = self._gz()
+        plain.load_state_dict(m.state_dict())
+        m.eval()
+        plain.eval()
+        z, r = torch.rand(8, LAT), torch.rand(8, NR)
+        torch.testing.assert_close(m(z, r), plain(z, r), rtol=0, atol=0)
+
+    def test_dropout_unroll_is_reproducible_and_leaves_global_rng(self):
+        m = self._gz(gz_dropout=self.P)
+        m.train()
+        z0 = torch.rand(8, LAT, generator=torch.Generator().manual_seed(0))
+        before = torch.get_rng_state().clone()
+        a = m.unroll(z0, 5, generator=torch.Generator().manual_seed(9))
+        b = m.unroll(z0, 5, generator=torch.Generator().manual_seed(9))
+        assert torch.equal(before, torch.get_rng_state())
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+    def test_dropout_mode_and_noise_must_agree(self):
+        m = self._gz(gz_dropout=self.P)
+        m.eval()
+        r_train = torch.rand(8, NR + 3 * H)
+        with pytest.raises(ValueError, match="eval mode"):
+            m(torch.rand(8, LAT), r_train)
+        m.train()
+        with pytest.raises(ValueError, match="training mode"):
+            m(torch.rand(8, LAT), torch.rand(8, NR))
+
+    # --- BatchNorm position -------------------------------------------------------------------
+    def test_hidden_norm_structure(self):
+        m = self._gz(gz_norm_position="hidden")
+        assert not hasattr(m, "output_norm")
+        assert (m.tail_layer.in_features, m.tail_layer.out_features) == (H, H)
+        assert isinstance(m.hidden_norm, nn.BatchNorm1d) and m.hidden_norm.num_features == H
+        assert (m.output_layer.in_features, m.output_layer.out_features) == (H, LAT)
+        assert m.norm is m.hidden_norm
+
+    def test_hidden_norm_forward_formula(self):
+        m = self._gz(gz_norm_position="hidden")
+        z, r = inputs(16)
+        h = m.act(m.input_layer(torch.cat((z, r), dim=1)))
+        h = m.act(m.hidden2(m.act(m.hidden1(h))))
+        ref = m.output_layer(m.hidden_norm(m.tail_layer(h)))           # no activation after tail or BN
+        torch.testing.assert_close(m(z, r), ref, rtol=0, atol=0)
+
+    def test_hidden_norm_output_is_not_normalised(self):
+        m = self._gz(gz_norm_position="hidden")
+        with torch.no_grad():
+            m.output_layer.bias.fill_(3.0)
+            out = m(*inputs(256))
+        assert out.mean().item() > 2.0                                  # an output BatchNorm would centre it
+
+    # --- shared -------------------------------------------------------------------------------
+    @pytest.mark.parametrize("kw", [{}, {"gz_additive_noise_std": 0.5}, {"gz_dropout": 0.3},
+                                    {"gz_norm_position": "hidden"},
+                                    {"gz_additive_noise_std": 0.5, "gz_dropout": 0.3, "gz_norm_position": "hidden"}])
+    @pytest.mark.parametrize("training", [True, False])
+    def test_trunk_norm_head_reproduce_forward(self, kw, training):
+        m = self._gz(**kw)
+        m.train(training)
+        z = torch.rand(16, LAT)
+        r = m.sample_noise(16, generator=torch.Generator().manual_seed(5))
+        torch.testing.assert_close(m._head(m.norm(m._trunk(z, r)), r), m(z, r), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("kw,match", [({"gz_additive_noise_std": -0.1}, "gz_additive_noise_std"),
+                                          ({"gz_dropout": 1.0}, "gz_dropout"), ({"gz_dropout": -0.1}, "gz_dropout"),
+                                          ({"gz_norm_position": "input"}, "gz_norm_position")])
+    def test_invalid_values_rejected(self, kw, match):
+        with pytest.raises(ValueError, match=match):
+            LatentTransitionGenerator(LAT, NR, hidden_dim=H, **kw)

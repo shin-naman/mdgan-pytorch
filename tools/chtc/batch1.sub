@@ -1,0 +1,57 @@
+# Batch 1: five reproduction probes on G_z, 3 seeds x 50k iterations each = 15 jobs. Sigma units,
+# otherwise configs/pe_paper.json; one Config field per arm, paper behaviour at its default:
+#   noise05    gz_additive_noise_std 0.5   input z + N(0, 0.5^2) instead of [z, r]     (mentor item 1b)
+#   wd01       gz_weight_decay 0.1         AdamW decoupled decay on G_z only           (mentor regulariser)
+#   drop02     gz_dropout 0.2              dropout after G_z's hidden layers, training (mentor dropout)
+#   m128       block_len 128               2.56 ns windows; also doubles the training region to the first
+#                                          2.56 ns of each trajectory (paper: 1.28 ns); 63 blocks per 80 ns
+#   bnhidden   gz_norm_position hidden     tail Affine(H->H) -> BatchNorm(H) -> Affine(H->n_z)  (the figure)
+# Evaluate with: python tools/step0_rollouts.py arm-eval ... (checkpoints 20k-50k)
+# Submit from the repository root in /home:  condor_submit tools/chtc/batch1.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+executable                = tools/chtc/run_train.sh
+arguments                 = $(ARM)_c$(Cluster)_seed$(SEED) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=batch1_$(ARM).json"
+
+should_transfer_files     = YES
+transfer_input_files      = src, configs/batch1_$(ARM).json, data/cache/PE.npz
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+transfer_checkpoint_files = run_$(ARM)_c$(Cluster)_seed$(SEED)
+transfer_output_files     = run_$(ARM)_c$(Cluster)_seed$(SEED)
+
+request_gpus              = 1
+# The container's PyTorch (2.5.1, CUDA 12.4) has GPU code for compute capability 5.0-9.0 only;
+# newer GPUs fail at the first CUDA call ('no kernel image is available'). 9.0 = H100, 8.9 = L40.
+gpus_minimum_capability   = 7.0
+gpus_maximum_capability   = 9.0
++WantGPULab               = true
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 5GB
+
+log                       = logs/$(ARM)_c$(Cluster)_seed$(SEED).log
+output                    = logs/$(ARM)_c$(Cluster)_seed$(SEED).out
+error                     = logs/$(ARM)_c$(Cluster)_seed$(SEED).err
+
+queue ARM, SEED from (
+  noise05, 0
+  noise05, 1
+  noise05, 2
+  wd01, 0
+  wd01, 1
+  wd01, 2
+  drop02, 0
+  drop02, 1
+  drop02, 2
+  m128, 0
+  m128, 1
+  m128, 2
+  bnhidden, 0
+  bnhidden, 1
+  bnhidden, 2
+)

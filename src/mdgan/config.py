@@ -21,6 +21,7 @@ from mdgan._util import positive_int
 
 PHASE_MODES = ("single", "all")
 INIT_SCHEMES = ("pytorch", "chainer")    # see mdgan.models.init
+GZ_NORM_POSITIONS = ("output", "hidden")  # see mdgan.models.latent_transition
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,11 @@ class Config:
     negative_slope: float = 0.2
     use_running_stats: bool = False  # G_z BatchNorm: batch statistics in train and eval
     init: str = "pytorch"           # weight initialisation scheme (mdgan.models.init)
+    # Batch-1 reproduction probes on G_z (paper behaviour at these defaults; mdgan.models.latent_transition):
+    gz_additive_noise_std: float = 0.0  # > 0: input z + N(0, s^2) instead of [z, r]
+    gz_weight_decay: float = 0.0        # > 0: AdamW decoupled decay on G_z parameters only
+    gz_dropout: float = 0.0             # > 0: dropout after G_z's three hidden activations (training)
+    gz_norm_position: str = "output"    # "hidden": Affine(H->H) -> BatchNorm(H) -> Affine(H->n_z)
 
     # --- data ----------------------------------------------------------------------------
     step_skip: int = 1              # n_s (PE 1, E-VDF 3, PVDF 5, PVAC/E-VAC 7, PAAM/E-AAM 20)
@@ -72,6 +78,14 @@ class Config:
             raise ValueError(f"phase_mode must be one of {PHASE_MODES}")
         if self.init not in INIT_SCHEMES:
             raise ValueError(f"init must be one of {INIT_SCHEMES}")
+        if not self.gz_additive_noise_std >= 0.0:
+            raise ValueError("gz_additive_noise_std must be >= 0")
+        if not self.gz_weight_decay >= 0.0:
+            raise ValueError("gz_weight_decay must be >= 0")
+        if not 0.0 <= self.gz_dropout < 1.0:
+            raise ValueError("gz_dropout must be in [0, 1)")
+        if self.gz_norm_position not in GZ_NORM_POSITIONS:
+            raise ValueError(f"gz_norm_position must be one of {GZ_NORM_POSITIONS}")
         if not self.lr > 0:
             raise ValueError("lr must be positive")
         if len(self.betas) != 2 or not all(0.0 <= b < 1.0 for b in self.betas):

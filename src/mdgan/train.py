@@ -69,6 +69,17 @@ ROLLBACK_SEED_STRIDE = 1000
 METRIC_NAMES = ("wasserstein", "gradient_penalty", "grad_norm", "generator_loss", "fake_step_std")
 
 
+def make_generator_optimizer(gz, gy, config):
+    """Adam on G_z + G_Y (the paper), or with config.gz_weight_decay > 0, AdamW with decoupled
+    decay on every G_z parameter and none on G_Y (two parameter groups). The critic's optimizer is
+    never affected."""
+    if config.gz_weight_decay > 0:
+        return torch.optim.AdamW([{"params": list(gz.parameters()), "weight_decay": config.gz_weight_decay},
+                                  {"params": list(gy.parameters()), "weight_decay": 0.0}],
+                                 lr=config.lr, betas=config.betas)
+    return torch.optim.Adam([*gz.parameters(), *gy.parameters()], lr=config.lr, betas=config.betas)
+
+
 class DivergenceError(RuntimeError):
     """Training produced non-finite losses after repeated rollbacks to the same checkpoint."""
 
@@ -165,7 +176,7 @@ class Trainer:
 
         torch.manual_seed(config.seed)
         self.gz, self.gy, self.dg = (m.to(self.device) for m in build_models(config))
-        self.opt_g = torch.optim.Adam([*self.gz.parameters(), *self.gy.parameters()], lr=config.lr, betas=config.betas)
+        self.opt_g = make_generator_optimizer(self.gz, self.gy, config)
         self.opt_d = torch.optim.Adam(self.dg.parameters(), lr=config.lr, betas=config.betas)
 
         if resume:

@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 from pathlib import Path
 
 import matplotlib
@@ -57,6 +58,12 @@ def _num(x) -> float:
         return float("nan")
 
 
+def arm_of(run_name: str) -> str:
+    """run_<arm>_c<cluster>_seed<N> -> <arm>; run_c<cluster>_seed<N> (no prefix) -> "baseline"."""
+    m = re.fullmatch(r"run_(?:(.+?)_)?c\d+_seed\d+", run_name)
+    return (m.group(1) or "baseline") if m else run_name
+
+
 def join(run_dirs: list[str], diag_csv: str, window: int = 100) -> list[dict]:
     diag = {}
     with open(diag_csv) as fh:
@@ -69,7 +76,7 @@ def join(run_dirs: list[str], diag_csv: str, window: int = 100) -> list[dict]:
         ds = json.loads((d / "dataset.json").read_text())
         sigma, wstd = float(ds["sigma_nm"]), float(ds["window_std_nm"])
         metrics = _jsonl(d / "metrics.jsonl")
-        arm = "scale_off" if ds.get("scale_inputs") is False else "baseline"
+        arm = arm_of(d.name)
         run_rows = []
         for e in _jsonl(d / "evaluations.jsonl"):
             it = e["iteration"]
@@ -191,18 +198,34 @@ def analyse(rows: list[dict]) -> dict:
                                                                                col(rows, z, i)))
         stats["partial"][name] = {"rho": pt, "ci95": [lo, hi]}
     stats["lead_lag_W_vs_D"] = lead_lag(rows)
+    stats["per_arm"] = {}
+    for arm in sorted({r["arm"] for r in rows}, key=lambda a: (a != "baseline", a)):
+        rr = [r for r in rows if r["arm"] == arm]
+        stats["per_arm"][arm] = {
+            "runs": len({r["run"] for r in rr}), "n": len(rr),
+            "median_D_ratio": float(np.nanmedian(col(rr, TARGET))), "frac_D_above": float(np.mean(col(rr, TARGET) > 1)),
+            "median_z@50": float(np.nanmedian(col(rr, "z@50"))), "median_rho_sum": float(np.nanmedian(col(rr, "rho_sum_1_30"))),
+            "median_step_std_rel": float(np.nanmedian(col(rr, "step_std_rel")))}
     return stats
 
 
 # ============================================================================ figures
 
+_ARM_STYLE = [("Blues", "o"), ("Oranges", "s"), ("Greens", "^"), ("Purples", "D"), ("Reds", "v"),
+              ("Greys", "P"), ("YlOrBr", "X"), ("BuGn", "*")]
+
+
 def _colors(rows):
-    runs = sorted({r["run"] for r in rows})
-    base = [r for r in runs if "scaleoff" not in r]
-    off = [r for r in runs if "scaleoff" in r]
-    cmap = {r: plt.cm.Blues(0.45 + 0.5 * i / max(1, len(base) - 1)) for i, r in enumerate(base)}
-    cmap.update({r: plt.cm.Oranges(0.5 + 0.4 * i / max(1, len(off) - 1)) for i, r in enumerate(off)})
-    return runs, cmap
+    """Runs sorted by arm; each arm a colour family (seeds as shades) and a marker."""
+    arms = sorted({r["arm"] for r in rows}, key=lambda a: (a != "baseline", a))
+    runs, cmap, mark = [], {}, {}
+    for (cm, marker), arm in zip(_ARM_STYLE * (len(arms) // len(_ARM_STYLE) + 1), arms, strict=False):
+        arm_runs = sorted({r["run"] for r in rows if r["arm"] == arm})
+        for i, run in enumerate(arm_runs):
+            cmap[run] = plt.get_cmap(cm)(0.5 + 0.4 * i / max(1, len(arm_runs) - 1))
+            mark[run] = marker
+        runs += arm_runs
+    return runs, cmap, mark
 
 
 def scatter_matrix(rows, out: Path) -> None:
@@ -213,7 +236,7 @@ def scatter_matrix(rows, out: Path) -> None:
         v = col(rr, k)
         return np.log10(v) if k in labels else v
 
-    runs, cmap = _colors(rows)
+    runs, cmap, mark = _colors(rows)
     n = len(keys)
     fig, axes = plt.subplots(n, n, figsize=(13, 13))
     for i, ky in enumerate(keys):
@@ -225,8 +248,7 @@ def scatter_matrix(rows, out: Path) -> None:
             else:
                 for run in runs:
                     rr = [r for r in rows if r["run"] == run]
-                    ax.scatter(values(rr, kx), values(rr, ky), s=6, color=cmap[run],
-                               marker="s" if "scaleoff" in run else "o")
+                    ax.scatter(values(rr, kx), values(rr, ky), s=6, color=cmap[run], marker=mark[run])
                 rho = spearman(col(rows, kx), col(rows, ky))
                 ax.text(0.03, 0.88, f"ρ={rho:+.2f}" if np.isfinite(rho) else "ρ=—", transform=ax.transAxes,
                         fontsize=7, bbox={"fc": "white", "ec": "none", "alpha": 0.7, "pad": 0.5})
@@ -239,9 +261,9 @@ def scatter_matrix(rows, out: Path) -> None:
                 ax.set_xlabel(labels.get(kx, kx), fontsize=7.5)
             if j == 0:
                 ax.set_ylabel(labels.get(ky, ky), fontsize=7.5)
-    handles = [plt.Line2D([], [], marker="s" if "scaleoff" in r else "o", ls="", color=cmap[r], label=r) for r in runs]
-    fig.suptitle("Phase 1: every checkpoint (circles: baseline, sigma units; squares: scale_inputs=False); "
-                 "ρ = Spearman", y=0.995, fontsize=10)
+    handles = [plt.Line2D([], [], marker=mark[r], ls="", color=cmap[r], label=r) for r in runs]
+    fig.suptitle("Phase 1: every checkpoint (one colour family and marker per arm); ρ = Spearman",
+                 y=0.995, fontsize=10)
     fig.legend(handles=handles, loc="upper center", ncol=4, fontsize=7, frameon=False, bbox_to_anchor=(0.5, 0.975))
     fig.subplots_adjust(top=0.93, hspace=0.08, wspace=0.08)
     for ext in ("png", "pdf"):
@@ -252,13 +274,13 @@ def scatter_matrix(rows, out: Path) -> None:
 def timeseries(rows, out: Path) -> None:
     panels = [(TARGET, "D_gen / D_MD", True), ("z@50", "z@50", False), ("rho_sum_1_30", "Σρ (lags 1-30)", False),
               ("W_rel", "W / run median", False), ("step_std_rel", "step std / MD step", False)]
-    runs, cmap = _colors(rows)
+    runs, cmap, mark = _colors(rows)
     fig, axes = plt.subplots(len(panels), 1, figsize=(8, 10), sharex=True)
     for ax, (k, label, logy) in zip(axes, panels, strict=True):
         for run in runs:
             rr = sorted((r for r in rows if r["run"] == run), key=lambda r: r["iteration"])
             ax.plot(col(rr, "iteration") / 1000, col(rr, k), color=cmap[run], lw=1.0,
-                    marker="s" if "scaleoff" in run else "o", ms=2.5, label=run if k == TARGET else None)
+                    marker=mark[run], ms=2.5, label=run if k == TARGET else None)
         if logy:
             ax.set_yscale("log")
             ax.axhline(1, color="black", lw=0.8)
@@ -280,6 +302,13 @@ def timeseries(rows, out: Path) -> None:
 
 def report(stats: dict) -> None:
     print(f"{stats['n_checkpoints']} checkpoints from {len(stats['runs'])} runs\n")
+    if "per_arm" in stats:
+        print(f"{'arm':<16} {'runs':>4} {'ckpts':>5} {'med D_gen/D_MD':>15} {'D>MD':>6} {'med z@50':>9} {'med Σρ':>7} "
+              f"{'med step std':>13}")
+        for arm, a in stats["per_arm"].items():
+            print(f"{arm:<16} {a['runs']:>4} {a['n']:>5} {a['median_D_ratio']:>15.2f} {a['frac_D_above']*100:>5.0f}% "
+                  f"{a['median_z@50']:>+9.3f} {a['median_rho_sum']:>+7.2f} {a['median_step_std_rel']:>13.2f}")
+        print()
     print("Spearman with D_gen/D_MD: pooled [95 % CI, stratified bootstrap]   per run")
     for p, s in stats["spearman"].items():
         per = "  ".join(f"{v:+.2f}" for v in s["per_run"].values())

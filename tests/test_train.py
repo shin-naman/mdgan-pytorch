@@ -22,7 +22,7 @@ from mdgan.data.preprocess import SystemData
 from mdgan.evaluate import reference_msd
 from mdgan.train import (
     CHECKPOINT_EXIT_CODE, LATEST, MAX_CONSECUTIVE_ROLLBACKS, ROLLBACK_SEED_STRIDE, DivergenceError, Trainer, _frozen,
-    build_config, load_system, main, snapshot_name,
+    build_config, load_system, main, make_generator_optimizer, snapshot_name,
 )
 
 DT = 10.0
@@ -327,6 +327,55 @@ class TestAblation:
         c = tiny(scale_inputs=False)
         with pytest.raises(ValueError, match="scale_inputs"):
             Trainer(c, WindowDataset(brownian(), 8, 1), tmp_path / "run")    # dataset scaled
+
+
+# =============================================================================
+class TestBatch1Probes:
+    PROBES = [{"gz_additive_noise_std": 0.5}, {"gz_weight_decay": 0.1}, {"gz_dropout": 0.2},
+              {"block_len": 16}, {"gz_norm_position": "hidden"}]
+
+    def test_default_generator_optimizer_is_the_paper_adam(self):
+        from mdgan.models import build_models
+        gz, gy, _ = build_models(tiny())
+        opt = make_generator_optimizer(gz, gy, tiny())
+        assert type(opt) is torch.optim.Adam and len(opt.param_groups) == 1
+
+    def test_weight_decay_is_decoupled_and_on_gz_only(self):
+        from mdgan.models import build_models
+        c = tiny(gz_weight_decay=0.1)
+        gz, gy, _ = build_models(c)
+        opt = make_generator_optimizer(gz, gy, c)
+        assert type(opt) is torch.optim.AdamW
+        assert [g["weight_decay"] for g in opt.param_groups] == [0.1, 0.0]
+        assert [id(p) for p in opt.param_groups[0]["params"]] == [id(p) for p in gz.parameters()]
+        assert [id(p) for p in opt.param_groups[1]["params"]] == [id(p) for p in gy.parameters()]
+        before = {k: v.clone() for k, v in {**{f"gz.{n}": p for n, p in gz.named_parameters()},
+                                            **{f"gy.{n}": p for n, p in gy.named_parameters()}}.items()}
+        for p in [*gz.parameters(), *gy.parameters()]:
+            p.grad = torch.zeros_like(p)                                 # zero gradient: only the decay acts
+        opt.step()
+        for n, p in gz.named_parameters():
+            torch.testing.assert_close(p, before[f"gz.{n}"] * (1 - c.lr * 0.1), rtol=1e-6, atol=0)
+        for n, p in gy.named_parameters():
+            torch.testing.assert_close(p, before[f"gy.{n}"], rtol=0, atol=0)
+
+    def test_weight_decay_leaves_the_critic_alone(self, tmp_path):
+        t = trainer(tmp_path / "run", tiny(gz_weight_decay=0.1))
+        assert type(t.opt_d) is torch.optim.Adam and t.opt_d.param_groups[0]["weight_decay"] == 0
+
+    @pytest.mark.parametrize("probe", PROBES, ids=lambda p: next(iter(p)))
+    def test_probe_trains_and_resumes_bit_exactly(self, tmp_path, probe):
+        c = tiny(**probe)
+        straight = tmp_path / "straight"
+        trainer(straight, c, reference=reference_msd(brownian())).run()   # evaluates; training is unaffected
+        short = tmp_path / "short"
+        trainer(short, tiny(**{**probe, "n_iterations": 3})).run()
+        trainer(short, c, resume=True).run()
+        assert_same_weights(weights(straight / LATEST), weights(short / LATEST))
+        ck = load_checkpoint(straight / LATEST)
+        assert all(getattr(ck.config, k) == v for k, v in probe.items())
+        evals = jsonl(straight / "evaluations.jsonl")
+        assert [e["iteration"] for e in evals] == [3, 6] and all(np.isfinite(e["err_percent"]) for e in evals)
 
 
 # =============================================================================

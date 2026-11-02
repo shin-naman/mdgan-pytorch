@@ -15,7 +15,10 @@ def build_models(config) -> tuple[LatentTransitionGenerator, TrajectoryGenerator
     scheme config.init ("pytorch" leaves PyTorch's defaults; see mdgan.models.init)."""
     gz = LatentTransitionGenerator(config.latent_dim, config.noise_dim, hidden_dim=config.hidden_dim,
                                    negative_slope=config.negative_slope,
-                                   use_running_stats=config.use_running_stats)
+                                   use_running_stats=config.use_running_stats,
+                                   gz_additive_noise_std=config.gz_additive_noise_std,
+                                   gz_dropout=config.gz_dropout,
+                                   gz_norm_position=config.gz_norm_position)
     gy = TrajectoryGenerator(config.latent_dim, config.noise_dim, block_len=config.block_len,
                              n_channels=config.n_channels, hidden_dim=config.hidden_dim,
                              negative_slope=config.negative_slope)
