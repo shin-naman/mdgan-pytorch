@@ -72,11 +72,13 @@ class WindowDataset:
     """The training set: scaled 2M-step coarse displacement windows and sigma."""
 
     def __init__(self, system: SystemData, block_len: int = 64, step_skip: int = 1,
-                 phase_mode: str = "single", scale_inputs: bool = True):
+                 phase_mode: str = "single", scale_inputs: bool = True, window_offset_max_steps: int = 0):
         positive_int("block_len", block_len)
         positive_int("step_skip", step_skip)
         if phase_mode not in PHASE_MODES:
             raise ValueError(f"phase_mode must be one of {PHASE_MODES}")
+        if int(window_offset_max_steps) != window_offset_max_steps or window_offset_max_steps < 0:
+            raise ValueError("window_offset_max_steps must be a non-negative integer")
 
         self.system_name = system.name
         self.block_len = block_len                  # M
@@ -86,18 +88,25 @@ class WindowDataset:
         self.dt_ps = system.dt_ps * step_skip       # coarse sampling interval
         self.n_channels = system.displacements.shape[2]
 
-        # --- 1. Training region: the first 2M*n_s fine steps (+ n_s-1 for "all") ---
+        # Window offsets (Config.window_offset_max_steps; 0 = the paper's fixed windows). With a
+        # maximum K > 0, every draw starts its window at a fresh offset o ~ U{0..K} coarse steps into
+        # the trajectory, from the training generator; the region grows to (2M + K) coarse steps.
+        # sigma is still computed from the offset-0 windows only, so it does not depend on K.
+        self.window_offset_max_steps = int(window_offset_max_steps)
+        span = self.window_len + self.window_offset_max_steps        # coarse steps a draw may touch
+
+        # --- 1. Training region: the first (2M + K)*n_s fine steps (+ n_s-1 for "all") ---
         phases = range(step_skip) if phase_mode == "all" else range(1)
-        self.region_steps = self.window_len * step_skip + (step_skip - 1 if phase_mode == "all" else 0)
+        self.region_steps = span * step_skip + (step_skip - 1 if phase_mode == "all" else 0)
         if self.region_steps > system.n_steps:
             raise ValueError(
                 f"training region needs {self.region_steps} fine steps but trajectories have {system.n_steps}"
             )
         region = np.array(system.displacements[:, :self.region_steps], dtype=np.float64)   # copy
 
-        # --- 2. One window per trajectory per phase ---
-        windows = [coarsen(region, step_skip, p)[:, :self.window_len] for p in phases]   # each (N, 2M, C)
-        windows = np.concatenate(windows, axis=0)                                         # (W, 2M, C)
+        # --- 2. One window per trajectory per phase (the offset-0 windows) ---
+        series = np.concatenate([coarsen(region, step_skip, p)[:, :span] for p in phases], axis=0)   # (W, 2M+K, C)
+        windows = series[:, :self.window_len]                                                         # (W, 2M, C)
         assert windows.shape[1] == self.window_len
 
         # --- 3. Scale by one scalar sigma computed from these windows only ---
@@ -108,6 +117,8 @@ class WindowDataset:
         self.scale_inputs = bool(scale_inputs)
         self.sigma_nm = self.window_std_nm if self.scale_inputs else 1.0
         self._windows = torch.from_numpy((windows / self.sigma_nm).astype(np.float32))    # (W, 2M, C)
+        self._series = (torch.from_numpy((series / self.sigma_nm).astype(np.float32))      # (W, 2M+K, C)
+                        if self.window_offset_max_steps > 0 else None)
 
         self.n_windows = int(self._windows.shape[0])
         self.n_trajectories = system.n_trajectories
@@ -122,10 +133,17 @@ class WindowDataset:
 
     def sample(self, batch: int, generator: torch.Generator | None = None,
                device=None) -> torch.Tensor:
-        """`batch` windows drawn WITH replacement (W may be < batch): (B, 2M, C) float32."""
+        """`batch` windows drawn WITH replacement (W may be < batch): (B, 2M, C) float32.
+        With window offsets, each window then starts at its own offset ~ U{0..K}, drawn after the
+        indices from the same generator; with K = 0 nothing extra is drawn (the paper's sampling)."""
         positive_int("batch", batch)
         idx = torch.randint(0, self.n_windows, (batch,), generator=generator)
-        out = self._windows[idx]
+        if self._series is None:
+            out = self._windows[idx]
+        else:
+            off = torch.randint(0, self.window_offset_max_steps + 1, (batch,), generator=generator)
+            pos = off[:, None] + torch.arange(self.window_len)[None, :]                     # (B, 2M)
+            out = self._series[idx[:, None], pos]
         return out.to(device) if device is not None else out
 
     @property
@@ -145,6 +163,9 @@ class WindowDataset:
             "window_std_nm": self.window_std_nm,
             "sigma_nm": self.sigma_nm,
             "source_md5": self.source_md5,
+            # present only when > 0: runs without offsets keep their metadata exactly (resume compares
+            # it for equality), and a run with offsets cannot be resumed with a different maximum
+            **({"window_offset_max_steps": self.window_offset_max_steps} if self.window_offset_max_steps else {}),
         }
 
     def __len__(self) -> int:

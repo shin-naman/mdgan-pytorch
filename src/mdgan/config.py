@@ -45,6 +45,7 @@ class Config:
     step_skip: int = 1              # n_s (PE 1, E-VDF 3, PVDF 5, PVAC/E-VAC 7, PAAM/E-AAM 20)
     phase_mode: str = "single"
     scale_inputs: bool = True       # divide by sigma; False is the unscaled ablation
+    window_offset_max_steps: int = 0  # > 0: each training window starts at a fresh offset in [0, K] steps
 
     # --- training (WGAN-GP) ---------------------------------------------------------------
     batch_size: int = 64
@@ -78,6 +79,8 @@ class Config:
             raise ValueError(f"phase_mode must be one of {PHASE_MODES}")
         if self.init not in INIT_SCHEMES:
             raise ValueError(f"init must be one of {INIT_SCHEMES}")
+        if int(self.window_offset_max_steps) != self.window_offset_max_steps or self.window_offset_max_steps < 0:
+            raise ValueError("window_offset_max_steps must be a non-negative integer")
         if not self.gz_additive_noise_std >= 0.0:
             raise ValueError("gz_additive_noise_std must be >= 0")
         if not self.gz_weight_decay >= 0.0:

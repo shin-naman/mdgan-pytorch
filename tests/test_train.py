@@ -43,7 +43,7 @@ def brownian(seed=0, n_traj=6, n_steps=200):
 
 
 def windows(system, c: Config) -> WindowDataset:
-    return WindowDataset(system, c.block_len, c.step_skip, c.phase_mode, c.scale_inputs)
+    return WindowDataset(system, c.block_len, c.step_skip, c.phase_mode, c.scale_inputs, c.window_offset_max_steps)
 
 
 def trainer(path, c=None, system=None, **kw) -> Trainer:
@@ -332,7 +332,7 @@ class TestAblation:
 # =============================================================================
 class TestBatch1Probes:
     PROBES = [{"gz_additive_noise_std": 0.5}, {"gz_weight_decay": 0.1}, {"gz_dropout": 0.2},
-              {"block_len": 16}, {"gz_norm_position": "hidden"}]
+              {"block_len": 16}, {"gz_norm_position": "hidden"}, {"window_offset_max_steps": 5}]
 
     def test_default_generator_optimizer_is_the_paper_adam(self):
         from mdgan.models import build_models
@@ -358,6 +358,19 @@ class TestBatch1Probes:
             torch.testing.assert_close(p, before[f"gz.{n}"] * (1 - c.lr * 0.1), rtol=1e-6, atol=0)
         for n, p in gy.named_parameters():
             torch.testing.assert_close(p, before[f"gy.{n}"], rtol=0, atol=0)
+
+    def test_resume_refuses_a_different_window_offset_maximum(self, tmp_path):
+        """Caught by the first resume check (config equal to the checkpoint's except n_iterations); the
+        dataset metadata records the maximum too, as a second line of defence (tests/test_dataset.py)."""
+        out = tmp_path / "run"
+        trainer(out, tiny(window_offset_max_steps=5, n_iterations=3)).run()
+        for k in (0, 7):
+            with pytest.raises(ValueError, match=r"config differs from the checkpoint.*'window_offset_max_steps': \(5, " + str(k)):
+                trainer(out, tiny(window_offset_max_steps=k), resume=True)
+
+    def test_dataset_and_config_must_agree_on_offsets(self, tmp_path):
+        with pytest.raises(ValueError, match="window_offset_max_steps"):
+            Trainer(tiny(window_offset_max_steps=5), WindowDataset(brownian(), 8, 1), tmp_path / "run")
 
     def test_weight_decay_leaves_the_critic_alone(self, tmp_path):
         t = trainer(tmp_path / "run", tiny(gz_weight_decay=0.1))

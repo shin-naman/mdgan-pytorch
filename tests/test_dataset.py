@@ -250,3 +250,83 @@ def test_real_pe_training_set(pe):
     assert 0.15 < ds.sigma_nm < 0.20            # measured ~0.17 nm per-axis step std
     b = ds.sample(64, generator=torch.Generator().manual_seed(0))
     assert b.shape == (64, 128, 3)
+
+
+# =============================================================================
+# Window offsets (Config.window_offset_max_steps)
+
+K = 7
+
+
+def test_offset_zero_is_the_paper_dataset_bit_for_bit():
+    a = WindowDataset(make_system(), block_len=M, step_skip=1)
+    b = WindowDataset(make_system(), block_len=M, step_skip=1, window_offset_max_steps=0)
+    assert torch.equal(a.windows, b.windows) and a.metadata == b.metadata
+    assert "window_offset_max_steps" not in a.metadata                    # old runs' metadata unchanged
+    ga, gb = torch.Generator().manual_seed(3), torch.Generator().manual_seed(3)
+    assert torch.equal(a.sample(32, ga), b.sample(32, gb))
+    assert torch.equal(ga.get_state(), gb.get_state())                   # nothing extra drawn
+
+
+def test_sigma_and_offset_zero_windows_unchanged_by_offsets():
+    a = WindowDataset(make_system(), block_len=M, step_skip=1)
+    b = WindowDataset(make_system(), block_len=M, step_skip=1, window_offset_max_steps=K)
+    assert b.sigma_nm == a.sigma_nm and b.window_std_nm == a.window_std_nm
+    assert torch.equal(a.windows, b.windows)
+
+
+def test_offset_region_and_metadata():
+    ds = WindowDataset(make_system(), block_len=M, step_skip=1, window_offset_max_steps=K)
+    assert ds.region_steps == 2 * M + K and ds.metadata["window_offset_max_steps"] == K
+    ds = WindowDataset(make_system(), block_len=M, step_skip=NS, phase_mode="all", window_offset_max_steps=K)
+    assert ds.region_steps == (2 * M + K) * NS + NS - 1
+
+
+def test_sampled_windows_are_trajectory_slices_at_the_drawn_offsets():
+    """Re-derive every sampled window from the indices and offsets the same generator draws."""
+    sys_ = make_system()
+    ds = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=K)
+    out = ds.sample(64, torch.Generator().manual_seed(9))
+    g = torch.Generator().manual_seed(9)
+    idx = torch.randint(0, ds.n_windows, (64,), generator=g)
+    off = torch.randint(0, K + 1, (64,), generator=g)
+    d = sys_.displacements.astype(np.float64)
+    for b in range(64):
+        i, o = int(idx[b]), int(off[b])
+        expected = (d[i, o:o + 2 * M] / ds.sigma_nm).astype(np.float32)
+        np.testing.assert_array_equal(out[b].numpy(), expected)
+
+
+def test_offsets_cover_zero_to_max_uniformly():
+    """Recover each sampled window's offset from the window itself (match against the trajectory)."""
+    sys_ = make_system()
+    ds = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=K)
+    out = ds.sample(1600, torch.Generator().manual_seed(1)).numpy()
+    d = (sys_.displacements.astype(np.float64) / ds.sigma_nm).astype(np.float32)
+    cand = np.stack([d[:, o:o + 2 * M] for o in range(K + 1)], axis=1)          # (W, K+1, 2M, C)
+    found = []
+    for w in out:
+        hits = np.argwhere((cand == w).all(axis=(2, 3)))
+        assert len(hits) >= 1
+        found.append(int(hits[0, 1]))
+    counts = np.bincount(found, minlength=K + 1)
+    assert min(found) == 0 and max(found) == K and counts.min() > 0.6 * 1600 / (K + 1)
+
+
+def test_offset_sampling_reproducible_and_leaves_global_rng():
+    ds = WindowDataset(make_system(), block_len=M, step_skip=1, window_offset_max_steps=K)
+    before = torch.get_rng_state().clone()
+    a, b = ds.sample(16, torch.Generator().manual_seed(2)), ds.sample(16, torch.Generator().manual_seed(2))
+    assert torch.equal(a, b) and torch.equal(before, torch.get_rng_state())
+
+
+@pytest.mark.parametrize("bad", [-1, 2.5])
+def test_offset_maximum_must_be_a_non_negative_integer(bad):
+    with pytest.raises(ValueError, match="window_offset_max_steps"):
+        WindowDataset(make_system(), block_len=M, step_skip=1, window_offset_max_steps=bad)
+
+
+def test_offset_region_too_long_rejected():
+    with pytest.raises(ValueError, match="training region"):
+        WindowDataset(make_system(n_steps=2 * M + K - 1), block_len=M, step_skip=1, window_offset_max_steps=K)
+

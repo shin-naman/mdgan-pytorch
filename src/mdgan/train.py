@@ -145,7 +145,8 @@ def _git_state() -> dict:
 
 def _check_dataset_matches_config(config: Config, dataset: WindowDataset) -> None:
     pairs = {"block_len": dataset.block_len, "step_skip": dataset.step_skip, "phase_mode": dataset.phase_mode,
-             "scale_inputs": dataset.scale_inputs, "n_channels": dataset.n_channels}
+             "scale_inputs": dataset.scale_inputs, "n_channels": dataset.n_channels,
+             "window_offset_max_steps": dataset.window_offset_max_steps}
     bad = {k: (v, getattr(config, k)) for k, v in pairs.items() if v != getattr(config, k)}
     if bad:
         raise ValueError(f"dataset does not match the config (dataset, config): {bad}")
@@ -431,7 +432,8 @@ def main(argv=None) -> int:
         config = build_config(args.config, args.set)
 
     system = load_system(args.data, args.cache)
-    dataset = WindowDataset(system, config.block_len, config.step_skip, config.phase_mode, config.scale_inputs)
+    dataset = WindowDataset(system, config.block_len, config.step_skip, config.phase_mode, config.scale_inputs,
+                            config.window_offset_max_steps)
     reference = None if args.no_eval else reference_msd(system)
     trainer = Trainer(config, dataset, args.out, device=args.device, reference=reference,
                       log_every=args.log_every, resume=resume, progress=True)

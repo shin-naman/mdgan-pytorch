@@ -56,6 +56,8 @@ import torch
 from torch import nn
 
 PLATEAU_STEPS = (1, 2, 5, 10, 20, 25, 50, 100)
+# Batch-2 pass criteria, per checkpoint: all four must hold
+PASS_RHO_SUM, PASS_DC_DIM, PASS_ACF_DIM, PASS_SHARE78 = 0.3, 0.15, 0.15, 0.2
 EVAL_BLOCK_STEPS = 64           # arm-eval: block statistics on fixed 0.64 ns blocks for every arm
 LATENT_TRANSITIONS = 125        # arm-eval: latent metrics from a fixed-length path (lag 100 exists for any M)
 RATIO_NS = (5, 10, 20, 40, 78)
@@ -187,6 +189,21 @@ def latent_metrics(z: np.ndarray) -> dict:
             "acf100_max_dim": float(np.nanmax(acf100)), "acf100_argmax_dim": int(np.nanargmax(acf100))}
 
 
+def share78(a: float, b: float, t_ns: float = 78.0) -> float:
+    """Ballistic share of the fitted MSD at 78 ns, b t^2 / (a t + b t^2), from the 5-78 ns fit
+    MSD = a t + b t^2 (phase0_compare.fit_ballistic); 1 when a <= 0 (the fit puts everything in the
+    quadratic term). Equals drift78 / (1 + drift78) wherever drift78 is defined, so share78 > 0.2 is
+    the same rule as drift78 > 0.25."""
+    if a <= 0:
+        return 1.0
+    return float(b * t_ns ** 2 / (a * t_ns + b * t_ns ** 2))
+
+
+def checkpoint_passes(r: dict) -> bool:
+    return (r["rho_sum_1_30"] <= PASS_RHO_SUM and r["dc_share_max_dim"] < PASS_DC_DIM
+            and r["acf100_max_dim"] < PASS_ACF_DIM and r["share78"] < PASS_SHARE78)
+
+
 def trajectory_metrics(d_model: torch.Tensor, sigma_nm: float, cfg, ref: np.ndarray, dt_ref: float, md_block: dict,
                        block_steps: int | None = None) -> dict:
     from mdgan.data.msd import diffusion_coefficient, err, msd_ensemble
@@ -201,6 +218,7 @@ def trajectory_metrics(d_model: torch.Tensor, sigma_nm: float, cfg, ref: np.ndar
     st = diag_runs._block_stats(d_model[:, :n_steps].numpy() * sigma_nm, block_steps or cfg.block_len)
     out = {"err_percent": float(err(msd, dt_gen, ref, dt_ref, *cfg.err_window_ps)), "D_ratio": float(d_gen / d_md),
            "drift78": float(b * 78.0 / a) if a > 0 else float("nan"),
+           "share78": share78(a, b), "v2_nm2_per_ns2": float(b),
            "var_over_md": st["var"] / md_block["var"], "rho_sum_1_30": st["corr_sum"], "rho@1": st["corr"].get(1),
            "rho_sum_1_3": float(sum(st["corr"].get(k, 0.0) for k in (1, 2, 3))),
            "rho_sum_4_30": float(sum(v for k, v in st["corr"].items() if k >= 4))}
@@ -335,11 +353,20 @@ def _arm(run_name: str) -> str:
     return (m.group(1) or "baseline") if m else run_name
 
 
+def _iterations_for(run_dir: Path, explicit: list[int] | None) -> list[int]:
+    """Checkpoints to evaluate in one run: an explicit list, or by default 20-50k plus, for runs
+    configured to 100k or more, 70-100k (the late window their verdict is read on)."""
+    if explicit is not None:
+        return explicit
+    n_it = json.loads((run_dir / "config.json").read_text())["n_iterations"]
+    return [20000, 30000, 40000, 50000] + ([70000, 80000, 90000, 100000] if n_it >= 100_000 else [])
+
+
 def cmd_arm_eval(args) -> list[dict]:
     """As-trained evaluation of each run's checkpoints at --iterations (default 20k-50k)."""
     from mdgan.checkpoint import load_checkpoint
     results, md = [], None
-    snaps = [Path(r) / f"snap_{it:06d}.pt" for r in sorted(args.snapshots) for it in args.iterations]
+    snaps = [Path(r) / f"snap_{it:06d}.pt" for r in sorted(args.snapshots) for it in _iterations_for(Path(r), args.iterations)]
     missing = [str(p) for p in snaps if not p.exists()]
     if missing:
         raise SystemExit("missing snapshots:\n  " + "\n  ".join(missing))
@@ -363,7 +390,7 @@ def cmd_arm_eval(args) -> list[dict]:
                                        cfg.burn_in, mean_operation=cfg.mean_operation,
                                        generator=torch.Generator().manual_seed(cfg.seed))
         row = {"snapshot": str(snap), "run": snap.parent.name, "arm": arm, "iteration": ck.iteration,
-               "block_len": cfg.block_len, "rollout_blocks": n_blocks}
+               "n_iterations": cfg.n_iterations, "seed": cfg.seed, "block_len": cfg.block_len, "rollout_blocks": n_blocks}
         row.update(trajectory_metrics(d, ck.sigma_nm, cfg, ref, dt_ref, md_block, EVAL_BLOCK_STEPS))
         ref_steps = int(round(cfg.estimation_time_ps / (dt_ref * cfg.step_skip)))
         if d.shape[1] > ref_steps:
@@ -379,6 +406,7 @@ def cmd_arm_eval(args) -> list[dict]:
         zpath = latent_path(gz, z0, cfg.burn_in + LATENT_TRANSITIONS - 1, torch.Generator().manual_seed(cfg.seed))
         row.update(latent_metrics(zpath[cfg.burn_in:]))
         row.update(plateau_curve(gz, z0))
+        row["pass"] = checkpoint_passes(row)
         results.append(row)
         print(_fmt_a(row), flush=True)
     return results
@@ -386,13 +414,13 @@ def cmd_arm_eval(args) -> list[dict]:
 
 def _fmt_a(r: dict) -> str:
     it = f"{r['iteration'] // 1000}k" if r["iteration"] >= 1000 else str(r["iteration"])
-    s = (f"{r['run']} @{it}{' [' + r['arm'].split('+', 1)[1] + ']' if '+' in r['arm'] else ''}: env100 {r['env100']:.3f}  "
-         f"Σρ {r['rho_sum_1_30']:+.2f} "
-         f"(1-3 {r['rho_sum_1_3']:+.2f} | 4-30 {r['rho_sum_4_30']:+.2f})  var/MD {r['var_over_md']:.2f}  "
-         f"D {r['D_ratio']:.2f}x  err {r['err_percent']:.1f}%  ratio " + "/".join(f"{r[f'ratio@{t}']:.2f}" for t in RATIO_NS)
-         + f"  drift78 {r['drift78']:+.3f}  plateau25 {r['plateau'][25]:.2f}  plateau50 {r['plateau'][50]:.2f}  "
-         f"period {r['period_blocks']:.2f}  cycle {r['cycle_share'] * 100:.0f}%  "
-         f"DC {r['dc_share']:.3f} (max dim {r['dc_share_max_dim']:.2f})  |ACF100| max dim {r['acf100_max_dim']:.2f}")
+    tag = f" [{r['arm'].split('+', 1)[1]}]" if "+" in r["arm"] else ""
+    s = (f"{r['run']} @{it}{tag}: {'PASS' if r['pass'] else 'fail'}  Σρ {r['rho_sum_1_30']:+.2f} "
+         f"(1-3 {r['rho_sum_1_3']:+.2f} | 4-30 {r['rho_sum_4_30']:+.2f})  env100 {r['env100']:.3f}  "
+         f"DC dim {r['dc_share_max_dim']:.2f}  |ACF100| dim {r['acf100_max_dim']:.2f}  "
+         f"drift78 {r['drift78']:+.3f}  share78 {r['share78']:.2f}  v2 {r['v2_nm2_per_ns2']:+.4f}  "
+         f"var/MD {r['var_over_md']:.2f}  D {r['D_ratio']:.2f}x  err {r['err_percent']:.1f}%  "
+         f"period {r['period_blocks']:.2f}  cycle {r['cycle_share'] * 100:.0f}%")
     if "horizon_ns" in r:
         s += (f"\n   horizon {r['horizon_ns']:.0f} ns: Σρ first 80 ns {r['rho_sum_first']:+.2f} | last 80 ns "
               f"{r['rho_sum_last']:+.2f}  alpha_end {r['alpha_end']:.2f}  ballistic share at end {r['ballistic_share_end']:.2f}")
@@ -403,39 +431,62 @@ def _fmt_a(r: dict) -> str:
     return s
 
 
+def _late_window(n_iterations: int, step: int = 10_000) -> list[int]:
+    return [n_iterations - k * step for k in (3, 2, 1, 0)]
+
+
 def summarize_arms(results: list[dict]) -> None:
     arms = sorted({r["arm"] for r in results}, key=lambda a: (a != "baseline", a))
-    print(f"\n{'arm':<26} {'n':>3} {'med env100':>10} {'med Σρ':>7} {'Σρ 1-3':>7} {'Σρ 4-30':>8} {'med DC':>7} "
-          f"{'DC dim':>7} {'ACF100 dim':>10} {'D > MD':>7} {'med D_rel':>9} {'ballistic':>10} {'(a<=0)':>6} "
-          f"{'med pl50':>8} {'med pl25':>8}  periods seen")
+    print(f"\n{'arm':<26} {'n':>3} {'Σρ':>6} {'1-3':>6} {'4-30':>6} {'env100':>6} {'DC dim':>6} {'ACF dim':>7} "
+          f"{'drift78':>8} {'share78':>7} {'v2':>8} {'var/MD':>6} {'D':>5} {'err%':>6} {'D>MD':>5} {'pass':>5}  periods")
     for arm in arms:
         rr = [r for r in results if r["arm"] == arm]
-        def col(k, rr=rr):
-            return np.array([x[k] for x in rr], float)
 
-        d78 = col("drift78")
+        def med(k, rr=rr):
+            return float(np.nanmedian([x[k] for x in rr]))
+
         periods = sorted({round(x["period_blocks"], 1) for x in rr})
-        print(f"{arm:<26} {len(rr):>3} {np.median(col('env100')):>10.3f} {np.median(col('rho_sum_1_30')):>+7.2f} "
-              f"{np.median(col('rho_sum_1_3')):>+7.2f} {np.median(col('rho_sum_4_30')):>+8.2f} "
-              f"{np.median(col('dc_share')):>7.3f} {np.median(col('dc_share_max_dim')):>7.2f} "
-              f"{np.median(col('acf100_max_dim')):>10.2f} "
-              f"{np.mean(col('D_ratio') > 1) * 100:>6.0f}% {np.median(col('D_ratio')) - 1:>+9.2f} "
-              f"{np.mean(d78 > 0.25) * 100:>9.0f}% {int(np.sum(~np.isfinite(d78))):>6} "
-              f"{np.median([x['plateau'][50] for x in rr]):>8.2f} {np.median([x['plateau'][25] for x in rr]):>8.2f}  "
-              + ", ".join(f"{p:g}" for p in periods))
-    print("ballistic = share with drift78 > 0.25, as in phase0_compare; (a<=0) = checkpoints whose ballistic fit has a "
-          "non-positive linear term (drift78 undefined, counted as not ballistic above)")
-    print("DC = share of latent variance in each chain's time-mean (no memory ~ 1/T = 0.008 for T = 125); DC dim and "
-          "ACF100 dim = the largest single-dimension value (medians over checkpoints)")
-    hz = [r for r in results if "horizon_ns" in r]
-    if hz:
-        print(f"\nlong rollouts ({hz[0]['horizon_ns']:.0f} ns): median over checkpoints per arm")
-        for arm in arms:
-            rr = [r for r in hz if r["arm"] == arm]
-            if rr:
-                med = lambda k, rr=rr: np.nanmedian([x[k] for x in rr])  # noqa: E731
-                print(f"  {arm:<26} Σρ first 80 ns {med('rho_sum_first'):+.2f} | last 80 ns {med('rho_sum_last'):+.2f}  "
-                      f"alpha_end {med('alpha_end'):.2f}  ballistic share at end {med('ballistic_share_end'):.2f}")
+        print(f"{arm:<26} {len(rr):>3} {med('rho_sum_1_30'):>+6.2f} {med('rho_sum_1_3'):>+6.2f} {med('rho_sum_4_30'):>+6.2f} "
+              f"{med('env100'):>6.3f} {med('dc_share_max_dim'):>6.2f} {med('acf100_max_dim'):>7.2f} {med('drift78'):>+8.3f} "
+              f"{med('share78'):>7.2f} {med('v2_nm2_per_ns2'):>+8.4f} {med('var_over_md'):>6.2f} {med('D_ratio'):>5.2f} "
+              f"{med('err_percent'):>6.1f} {np.mean([x['D_ratio'] > 1 for x in rr]) * 100:>4.0f}% "
+              f"{np.mean([x['pass'] for x in rr]) * 100:>4.0f}%  " + ", ".join(f"{p:g}" for p in periods))
+    print(f"medians over all evaluated checkpoints; pass = Σρ <= {PASS_RHO_SUM}, DC dim < {PASS_DC_DIM}, "
+          f"|ACF100| dim < {PASS_ACF_DIM}, share78 < {PASS_SHARE78}")
+
+    print("\nverdicts (each run judged on its last four checkpoints: 20-50k for 50k runs, 70-100k for 100k runs;"
+          " a seed passes with >= 3 of 4; arm pass = all seeds, promising = majority, closed = otherwise)")
+    for arm in arms:
+        rr = [r for r in results if r["arm"] == arm]
+        seeds, lines = [], []
+        for run in sorted({r["run"] for r in rr}):
+            mine = {r["iteration"]: r for r in rr if r["run"] == run}
+            n_it = next(iter(mine.values()))["n_iterations"]
+            late = _late_window(n_it)
+            have = [it for it in late if it in mine]
+            ok = sum(mine[it]["pass"] for it in have)
+            line = f"    {run:<32} {n_it // 1000}k run: late {late[0] // 1000}-{late[-1] // 1000}k {ok}/{len(have)} pass"
+            if n_it > 50_000:
+                early = [it for it in _late_window(50_000) if it in mine]
+                if early:
+                    line += f"   (20-50k: {sum(mine[it]['pass'] for it in early)}/{len(early)})"
+            if len(have) < 4:
+                line += "   INCOMPLETE: late checkpoints missing from this evaluation"
+                seeds.append(None)
+            else:
+                seeds.append(ok >= 3)
+            lines.append(line)
+        decided = [x for x in seeds if x is not None]
+        if len(decided) < len(seeds) or not decided:
+            verdict = "incomplete"
+        elif all(decided):
+            verdict = "PASS"
+        elif sum(decided) > len(decided) / 2:
+            verdict = "promising"
+        else:
+            verdict = "closed"
+        print(f"  {arm}: {verdict} ({sum(1 for x in decided if x)}/{len(seeds)} seeds pass)")
+        print("\n".join(lines))
 
 
 def cmd_chunked(args) -> list[dict]:
@@ -634,8 +685,9 @@ def main(argv=None) -> None:
     ap.add_argument("--stats-of", type=int, default=0, help="bn-batch: index of the snapshot for pre-BN depth statistics")
     ap.add_argument("--check-reproduction", action="store_true", help="bn-batch: unmodified rollout of the first snapshot "
                                                                        "vs its evaluations.jsonl entry")
-    ap.add_argument("--iterations", type=lambda t: [int(x) for x in t.split(",")], default=[20000, 30000, 40000, 50000],
-                    help="arm-eval: checkpoints to evaluate in each run directory")
+    ap.add_argument("--iterations", type=lambda t: [int(x) for x in t.split(",")], default=None,
+                    help="arm-eval: checkpoints to evaluate in each run directory (default: 20-50k, plus 70-100k "
+                         "for runs configured to 100k)")
     ap.add_argument("--strip-running-stats", action="store_true",
                     help="arm-eval: evaluate running-stats checkpoints with batch statistics (as in 0b); arm label +batchstats")
     ap.add_argument("--rollout-blocks", type=int, default=None,

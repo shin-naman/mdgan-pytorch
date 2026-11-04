@@ -14,6 +14,7 @@
   "step_skip": 1,
   "phase_mode": "single",
   "scale_inputs": true,
+  "window_offset_max_steps": 0,
   "batch_size": 64,
   "n_iterations": 300000,
   "n_critic": 5,
