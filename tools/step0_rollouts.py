@@ -159,15 +159,32 @@ def plateau_curve(gz, z0, seeds=(11, 12), group: int | None = None, steps=PLATEA
 
 # ============================================================================ metrics
 
+def dc_shares(z: np.ndarray) -> tuple[float, np.ndarray]:
+    """Share of latent variance held by each chain's time-mean (the zero-frequency part that
+    latent_cycle.spectrum removes before computing power). Pooled over dimensions, and per dimension.
+    An invariant (a per-chain constant offset) puts its variance here; a process with no memory gives
+    about 1/T."""
+    zc = z - z.mean(axis=(0, 1), keepdims=True)
+    chain_mean_var = zc.mean(axis=0).var(axis=0)                  # (D,) variance across chains of time-means
+    total_var = zc.var(axis=(0, 1))                               # (D,)
+    return float(chain_mean_var.sum() / total_var.sum()), chain_mean_var / total_var
+
+
 def latent_metrics(z: np.ndarray) -> dict:
-    """z: (T, N, n_z) decoded latents."""
+    """z: (T, N, n_z) latents. The pooled envelope can miss an invariant that lives in a few of the
+    dimensions (it is averaged with the rest), and the spectrum removes each chain's mean, so the DC
+    share and the per-dimension maximum |ACF| at lag 100 are reported alongside."""
     per, pooled = latent_cycle.autocorrelation(z)
     f, p = latent_cycle.spectrum(z)
     cyc = latent_cycle.find_cycle(f, p, pooled, z.shape[0])
     hi = min(105, len(pooled) - 2)
+    dc, dc_dim = dc_shares(z)
+    acf100 = np.abs(per[:, 100]) if per.shape[1] > 101 else np.full(per.shape[0], np.nan)
     return {"period_blocks": cyc["period_blocks"], "cycle_share": cyc["cycle_fraction_of_total_variance"],
             "env100": float(np.nanmax(np.abs(pooled[95:hi + 1]))) if hi >= 95 else float("nan"),
-            "z@50": float(pooled[50]), "z@100": float(pooled[100]) if len(pooled) > 101 else float("nan")}
+            "z@50": float(pooled[50]), "z@100": float(pooled[100]) if len(pooled) > 101 else float("nan"),
+            "dc_share": dc, "dc_share_max_dim": float(dc_dim.max()), "dc_share_argmax_dim": int(dc_dim.argmax()),
+            "acf100_max_dim": float(np.nanmax(acf100)), "acf100_argmax_dim": int(np.nanargmax(acf100))}
 
 
 def trajectory_metrics(d_model: torch.Tensor, sigma_nm: float, cfg, ref: np.ndarray, dt_ref: float, md_block: dict,
@@ -181,7 +198,7 @@ def trajectory_metrics(d_model: torch.Tensor, sigma_nm: float, cfg, ref: np.ndar
     d_gen, _ = diffusion_coefficient(msd, dt_gen, *cfg.diffusion_fit_ps)
     d_md, _ = diffusion_coefficient(ref, dt_ref, *cfg.diffusion_fit_ps)
     a, b = fit_ballistic(msd, dt_gen)
-    st = diag_runs._block_stats(d_model.numpy() * sigma_nm, block_steps or cfg.block_len)
+    st = diag_runs._block_stats(d_model[:, :n_steps].numpy() * sigma_nm, block_steps or cfg.block_len)
     out = {"err_percent": float(err(msd, dt_gen, ref, dt_ref, *cfg.err_window_ps)), "D_ratio": float(d_gen / d_md),
            "drift78": float(b * 78.0 / a) if a > 0 else float("nan"),
            "var_over_md": st["var"] / md_block["var"], "rho_sum_1_30": st["corr_sum"], "rho@1": st["corr"].get(1),
@@ -190,6 +207,43 @@ def trajectory_metrics(d_model: torch.Tensor, sigma_nm: float, cfg, ref: np.ndar
     for t in RATIO_NS:
         out[f"ratio@{t}"] = float(msd[int(round(t * 1000 / dt_gen))] / ref[int(round(t * 1000 / dt_ref))])
     return out
+
+
+def ballistic_share(msd: np.ndarray, dt_ps: float, t_min_ns: float = 5.0) -> float:
+    """Fit MSD = a t + b t^2 on [t_min, end] with a, b >= 0 and return b T^2 / (a T + b T^2) at the end T:
+    the share of the fitted MSD there that is ballistic (0 = diffusive, 1 = ballistic). Unlike b T / a,
+    it stays defined when the unconstrained fit would give a <= 0, which is when the drift is strongest."""
+    t = np.arange(len(msd)) * dt_ps / 1000
+    m = t >= t_min_ns
+    x, y = t[m], np.asarray(msd, dtype=np.float64)[m]
+    (a, b), *_ = np.linalg.lstsq(np.column_stack([x, x ** 2]), y, rcond=None)
+    if a < 0:                                    # two-parameter non-negative least squares, by its two faces
+        a, b = 0.0, max(float((x ** 2 @ y) / (x ** 4).sum()), 0.0)
+    elif b < 0:
+        a, b = max(float((x @ y) / (x @ x)), 0.0), 0.0
+    T = x[-1]
+    total = a * T + b * T ** 2
+    return float(b * T ** 2 / total) if total > 0 else float("nan")
+
+
+def horizon_metrics(d_model: torch.Tensor, sigma_nm: float, dt_ps: float, ref_steps: int, block_steps: int) -> dict:
+    """For a rollout longer than the reference window (ref_steps), quantities that need no MD:
+    Σρ (lags 1-30, block_steps blocks) over the first and the last ref_steps; the generated MSD's local
+    exponent at 3/4 of the horizon (normal diffusion = 1; persistent drift > 1); and the ballistic share at
+    the end of the horizon from MSD = a t + b t^2 fitted over 5 ns to the end (ballistic_share)."""
+    from mdgan.data.msd import msd_ensemble
+    diag_runs = _load_tool("diag_runs")
+    n = d_model.shape[1]
+    d = d_model.numpy() * sigma_nm
+    early = diag_runs._block_stats(d[:, :ref_steps], block_steps)["corr_sum"]
+    late = diag_runs._block_stats(d[:, n - ref_steps:], block_steps)["corr_sum"]
+    msd = msd_ensemble(d_model) * sigma_nm ** 2
+    t_end_ns = (len(msd) - 1) * dt_ps / 1000
+    k = int(0.75 * (len(msd) - 1))
+    lo, hi = int(k / 1.3), min(int(k * 1.3), len(msd) - 1)
+    alpha_end = float(np.log(msd[hi] / msd[lo]) / np.log(hi / lo))
+    return {"horizon_ns": t_end_ns, "rho_sum_first": early, "rho_sum_last": late, "alpha_end": alpha_end,
+            "ballistic_share_end": ballistic_share(msd, dt_ps)}
 
 
 def pre_bn_summary(stored: dict, pre: dict) -> dict:
@@ -296,12 +350,24 @@ def cmd_arm_eval(args) -> list[dict]:
             md = _md(args.data, cfg, EVAL_BLOCK_STEPS)
         ref, dt_ref, md_block = md
         gz, gy = ck.gz.to(args.device), ck.gy.to(args.device)
-        d, _, _ = rollout_with_latents(gz, gy, args.chains or cfg.estimation_chains, cfg.estimation_blocks(dt_ref),
+        arm = _arm(snap.parent.name)
+        if args.strip_running_stats:
+            if not getattr(ck.config, "use_running_stats", False):
+                raise SystemExit(f"--strip-running-stats given, but {snap.parent.name} was not trained with running stats")
+            strip_running_stats(gz)
+            arm += "+batchstats"
+        n_blocks = args.rollout_blocks or cfg.estimation_blocks(dt_ref)
+        if args.rollout_blocks:
+            arm += f"+{n_blocks}blk"
+        d, _, _ = rollout_with_latents(gz, gy, args.chains or cfg.estimation_chains, n_blocks,
                                        cfg.burn_in, mean_operation=cfg.mean_operation,
                                        generator=torch.Generator().manual_seed(cfg.seed))
-        row = {"snapshot": str(snap), "run": snap.parent.name, "arm": _arm(snap.parent.name), "iteration": ck.iteration,
-               "block_len": cfg.block_len}
+        row = {"snapshot": str(snap), "run": snap.parent.name, "arm": arm, "iteration": ck.iteration,
+               "block_len": cfg.block_len, "rollout_blocks": n_blocks}
         row.update(trajectory_metrics(d, ck.sigma_nm, cfg, ref, dt_ref, md_block, EVAL_BLOCK_STEPS))
+        ref_steps = int(round(cfg.estimation_time_ps / (dt_ref * cfg.step_skip)))
+        if d.shape[1] > ref_steps:
+            row.update(horizon_metrics(d, ck.sigma_nm, dt_ref * cfg.step_skip, ref_steps, EVAL_BLOCK_STEPS))
         del d
         if args.check_reproduction and i == 0:
             rec = _evaluation_record(snap, ck.iteration)
@@ -319,11 +385,17 @@ def cmd_arm_eval(args) -> list[dict]:
 
 
 def _fmt_a(r: dict) -> str:
-    s = (f"{r['run']} @{r['iteration'] // 1000}k: env100 {r['env100']:.3f}  Σρ {r['rho_sum_1_30']:+.2f} "
+    it = f"{r['iteration'] // 1000}k" if r["iteration"] >= 1000 else str(r["iteration"])
+    s = (f"{r['run']} @{it}{' [' + r['arm'].split('+', 1)[1] + ']' if '+' in r['arm'] else ''}: env100 {r['env100']:.3f}  "
+         f"Σρ {r['rho_sum_1_30']:+.2f} "
          f"(1-3 {r['rho_sum_1_3']:+.2f} | 4-30 {r['rho_sum_4_30']:+.2f})  var/MD {r['var_over_md']:.2f}  "
          f"D {r['D_ratio']:.2f}x  err {r['err_percent']:.1f}%  ratio " + "/".join(f"{r[f'ratio@{t}']:.2f}" for t in RATIO_NS)
          + f"  drift78 {r['drift78']:+.3f}  plateau25 {r['plateau'][25]:.2f}  plateau50 {r['plateau'][50]:.2f}  "
-         f"period {r['period_blocks']:.2f}  cycle {r['cycle_share'] * 100:.0f}%")
+         f"period {r['period_blocks']:.2f}  cycle {r['cycle_share'] * 100:.0f}%  "
+         f"DC {r['dc_share']:.3f} (max dim {r['dc_share_max_dim']:.2f})  |ACF100| max dim {r['acf100_max_dim']:.2f}")
+    if "horizon_ns" in r:
+        s += (f"\n   horizon {r['horizon_ns']:.0f} ns: Σρ first 80 ns {r['rho_sum_first']:+.2f} | last 80 ns "
+              f"{r['rho_sum_last']:+.2f}  alpha_end {r['alpha_end']:.2f}  ballistic share at end {r['ballistic_share_end']:.2f}")
     if "reproduction" in r:
         p = r["reproduction"]
         s += (f"\n   reproduction: tool err {p['tool_err']:.2f}% / D {p['tool_D_ratio']:.3f}x vs logged "
@@ -333,8 +405,9 @@ def _fmt_a(r: dict) -> str:
 
 def summarize_arms(results: list[dict]) -> None:
     arms = sorted({r["arm"] for r in results}, key=lambda a: (a != "baseline", a))
-    print(f"\n{'arm':<14} {'n':>3} {'med env100':>10} {'med Σρ':>7} {'Σρ 1-3':>7} {'Σρ 4-30':>8} {'D > MD':>7} "
-          f"{'med D_rel':>9} {'ballistic':>10} {'(a<=0)':>6} {'med pl50':>8} {'med pl25':>8}  periods seen")
+    print(f"\n{'arm':<26} {'n':>3} {'med env100':>10} {'med Σρ':>7} {'Σρ 1-3':>7} {'Σρ 4-30':>8} {'med DC':>7} "
+          f"{'DC dim':>7} {'ACF100 dim':>10} {'D > MD':>7} {'med D_rel':>9} {'ballistic':>10} {'(a<=0)':>6} "
+          f"{'med pl50':>8} {'med pl25':>8}  periods seen")
     for arm in arms:
         rr = [r for r in results if r["arm"] == arm]
         def col(k, rr=rr):
@@ -342,14 +415,27 @@ def summarize_arms(results: list[dict]) -> None:
 
         d78 = col("drift78")
         periods = sorted({round(x["period_blocks"], 1) for x in rr})
-        print(f"{arm:<14} {len(rr):>3} {np.median(col('env100')):>10.3f} {np.median(col('rho_sum_1_30')):>+7.2f} "
+        print(f"{arm:<26} {len(rr):>3} {np.median(col('env100')):>10.3f} {np.median(col('rho_sum_1_30')):>+7.2f} "
               f"{np.median(col('rho_sum_1_3')):>+7.2f} {np.median(col('rho_sum_4_30')):>+8.2f} "
+              f"{np.median(col('dc_share')):>7.3f} {np.median(col('dc_share_max_dim')):>7.2f} "
+              f"{np.median(col('acf100_max_dim')):>10.2f} "
               f"{np.mean(col('D_ratio') > 1) * 100:>6.0f}% {np.median(col('D_ratio')) - 1:>+9.2f} "
               f"{np.mean(d78 > 0.25) * 100:>9.0f}% {int(np.sum(~np.isfinite(d78))):>6} "
               f"{np.median([x['plateau'][50] for x in rr]):>8.2f} {np.median([x['plateau'][25] for x in rr]):>8.2f}  "
               + ", ".join(f"{p:g}" for p in periods))
     print("ballistic = share with drift78 > 0.25, as in phase0_compare; (a<=0) = checkpoints whose ballistic fit has a "
           "non-positive linear term (drift78 undefined, counted as not ballistic above)")
+    print("DC = share of latent variance in each chain's time-mean (no memory ~ 1/T = 0.008 for T = 125); DC dim and "
+          "ACF100 dim = the largest single-dimension value (medians over checkpoints)")
+    hz = [r for r in results if "horizon_ns" in r]
+    if hz:
+        print(f"\nlong rollouts ({hz[0]['horizon_ns']:.0f} ns): median over checkpoints per arm")
+        for arm in arms:
+            rr = [r for r in hz if r["arm"] == arm]
+            if rr:
+                med = lambda k, rr=rr: np.nanmedian([x[k] for x in rr])  # noqa: E731
+                print(f"  {arm:<26} Σρ first 80 ns {med('rho_sum_first'):+.2f} | last 80 ns {med('rho_sum_last'):+.2f}  "
+                      f"alpha_end {med('alpha_end'):.2f}  ballistic share at end {med('ballistic_share_end'):.2f}")
 
 
 def cmd_chunked(args) -> list[dict]:
@@ -498,7 +584,40 @@ def self_test() -> None:
         gz_v.eval()
         assert 0 < plateau_curve(gz_v, torch.rand(64, c.latent_dim))["plateau"][50] < 2
     print("control 5: all batch-1 variants roll out exactly as rollout.rollout; pre-BN capture has the norm's width")
+
+    # 6. an invariant in one latent dimension: the pooled envelope misses it, DC and per-dimension ACF find it
+    _control_invariant_detection()
+    print("control 6: an invariant in 1 of 32 dimensions is missed by the pooled envelope and found by DC share "
+          "and per-dimension |ACF100|; pure noise triggers neither")
+
+    # 7. long-horizon metrics: Brownian chains vs the same chains with a per-chain velocity in the second half
+    rng = torch.Generator().manual_seed(4)
+    d = torch.randn(512, 2000, 3, generator=rng)
+    flat = horizon_metrics(d, 1.0, 10.0, 1000, 10)
+    v = torch.randn(512, 1, 3, generator=rng) * 0.3
+    d_drift = d.clone()
+    d_drift[:, 1000:] += v
+    drift = horizon_metrics(d_drift, 1.0, 10.0, 1000, 10)
+    assert abs(flat["alpha_end"] - 1) < 0.1 and flat["ballistic_share_end"] < 0.1, flat
+    assert abs(flat["rho_sum_first"]) < 0.3 and abs(flat["rho_sum_last"]) < 0.3, flat
+    assert drift["rho_sum_last"] > drift["rho_sum_first"] + 2 and drift["alpha_end"] > 1.3, drift
+    assert drift["ballistic_share_end"] > 0.5, drift                     # defined (not nan) and large
+    print(f"control 7: Brownian alpha_end {flat['alpha_end']:.2f}, ballistic share {flat['ballistic_share_end']:.2f}; "
+          f"late drift Σρ {drift['rho_sum_first']:+.2f} -> {drift['rho_sum_last']:+.2f}, alpha_end "
+          f"{drift['alpha_end']:.2f}, ballistic share {drift['ballistic_share_end']:.2f}")
     print("all positive controls passed")
+
+
+def _control_invariant_detection() -> None:
+    rng = np.random.default_rng(5)
+    white = rng.normal(size=(125, 1024, 32))
+    inv = white.copy()
+    inv[:, :, 3] = rng.normal(size=(1, 1024)) + 0.3 * rng.normal(size=(125, 1024))   # per-chain constant + noise
+    w, i = latent_metrics(white), latent_metrics(inv)
+    assert w["dc_share_max_dim"] < 0.05 and w["acf100_max_dim"] < 0.1 and w["env100"] < 0.1, w
+    assert i["env100"] < 0.1, f"the pooled envelope was expected to miss the invariant: {i['env100']}"
+    assert i["dc_share_max_dim"] > 0.8 and i["dc_share_argmax_dim"] == 3, i
+    assert i["acf100_max_dim"] > 0.8 and i["acf100_argmax_dim"] == 3, i
 
 
 def main(argv=None) -> None:
@@ -517,6 +636,11 @@ def main(argv=None) -> None:
                                                                        "vs its evaluations.jsonl entry")
     ap.add_argument("--iterations", type=lambda t: [int(x) for x in t.split(",")], default=[20000, 30000, 40000, 50000],
                     help="arm-eval: checkpoints to evaluate in each run directory")
+    ap.add_argument("--strip-running-stats", action="store_true",
+                    help="arm-eval: evaluate running-stats checkpoints with batch statistics (as in 0b); arm label +batchstats")
+    ap.add_argument("--rollout-blocks", type=int, default=None,
+                    help="arm-eval: decode this many blocks instead of the config's (e.g. 125 for a 160 ns M=128 rollout); "
+                         "MD comparisons use the first 80 ns, MD-free horizon metrics use all of it")
     ap.add_argument("--out", default="runs/step0")
     args = ap.parse_args(argv)
     if args.self_test:
