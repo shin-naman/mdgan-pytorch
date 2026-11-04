@@ -1,17 +1,13 @@
-# Batch 2: 24 jobs. Sigma units, otherwise configs/pe_paper.json.
-#   New runs (18), named <arm>_c<Cluster>_seed<N>:
+# Batch 2, new runs: 18 jobs, named <arm>_c<Cluster>_seed<N>. Sigma units, otherwise configs/pe_paper.json:
 #     m128            seeds 3-5, 100k   block_len 128 (2.56 ns windows)
 #     m256            seeds 0-2,  50k   block_len 256 (5.12 ns windows; 32 blocks per 80 ns)
 #     m128_offsets    seeds 0-2,  50k   block_len 128, window offsets in [0, 500] steps (region 7.56 ns)
 #     m128_wd01       seeds 0-2,  50k   block_len 128, gz_weight_decay 0.1
 #     bnhidden_wd01   seeds 0-2,  50k   gz_norm_position hidden, gz_weight_decay 0.1
 #     running_stats   seeds 3-5, 100k   use_running_stats (= configs/ablation_running_stats.json)
-#   Resumes (6): batch-1 runs m128 and wd01 (cluster 7675778) seeds 0-2, 50k -> 100k. Each job takes
-#   its run directory in under its original name and --auto-resume continues from latest.pt; the
-#   configs differ from batch1_<arm>.json only in n_iterations. Logs get a _resume_c<Cluster> suffix
-#   so the batch-1 logs of those runs are kept.
-# Submit from the repository root in /home, with the batch-1 run directories present:
-#   condor_submit tools/chtc/batch2.sub
+# The 6 resumes are tools/chtc/batch2_resume.sub (a queue ... from list must be a submit file's last
+# statement, so the two job types cannot share one file).
+# Submit from the repository root in /home:  condor_submit tools/chtc/batch2.sub
 
 universe                  = container
 container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
@@ -60,23 +56,4 @@ queue ARM, SEED from (
   running_stats, 3
   running_stats, 4
   running_stats, 5
-)
-
-# ---- resumes of batch-1 runs (50k -> 100k) --------------------------------------------------------
-arguments                 = $(RUN) $(SEED)
-environment               = "MAX_HOURS=11 CONFIG=resume_$(ARM).json"
-transfer_input_files      = src, configs/resume_$(ARM).json, data/cache/PE.npz, run_$(RUN)
-transfer_checkpoint_files = run_$(RUN)
-transfer_output_files     = run_$(RUN)
-log                       = logs/$(RUN)_resume_c$(Cluster).log
-output                    = logs/$(RUN)_resume_c$(Cluster).out
-error                     = logs/$(RUN)_resume_c$(Cluster).err
-
-queue ARM, RUN, SEED from (
-  m128, m128_c7675778_seed0, 0
-  m128, m128_c7675778_seed1, 1
-  m128, m128_c7675778_seed2, 2
-  wd01, wd01_c7675778_seed0, 0
-  wd01, wd01_c7675778_seed1, 1
-  wd01, wd01_c7675778_seed2, 2
 )
