@@ -365,11 +365,26 @@ def _run_length(run_dir: Path) -> int:
     return int(json.loads((Path(run_dir) / "config.json").read_text())["n_iterations"])
 
 
+def _run_record(run_dir: Path) -> dict:
+    """From events.jsonl and metrics.jsonl: rollback count, the divergence stop (train.py records a
+    'diverged' event before raising), and W by logged iteration."""
+    def rows(name):
+        f = Path(run_dir) / name
+        return [json.loads(x) for x in f.read_text().splitlines() if x.strip()] if f.exists() else []
+    events = rows("events.jsonl")
+    stop = next((e for e in events if e.get("event") == "diverged"), None)
+    return {"rollbacks": sum(e.get("event") == "rollback" for e in events),
+            "diverged_at": stop["failed_at_iteration"] if stop else None,
+            "W": {m["iteration"]: m.get("wasserstein") for m in rows("metrics.jsonl")}}
+
+
 def _iterations_for(run_dir: Path, explicit: list[int] | None) -> list[int]:
     """Checkpoints to evaluate in one run: an explicit list, or by default 20-50k plus, for runs that
     reached 100k or more (highest snapshot), 70-100k (the late window their verdict is read on)."""
     if explicit is not None:
         return explicit
+    if _run_record(run_dir)["diverged_at"] is not None:          # a stopped run: every checkpoint saved before the stop
+        return sorted(int(f.stem.split("_")[1]) for f in Path(run_dir).glob("snap_*.pt"))
     return [20000, 30000, 40000, 50000] + ([70000, 80000, 90000, 100000] if _run_length(run_dir) >= 100_000 else [])
 
 
@@ -400,7 +415,9 @@ def cmd_arm_eval(args) -> list[dict]:
         d, _, _ = rollout_with_latents(gz, gy, args.chains or cfg.estimation_chains, n_blocks,
                                        cfg.burn_in, mean_operation=cfg.mean_operation,
                                        generator=torch.Generator().manual_seed(cfg.seed))
+        rec = _run_record(snap.parent)
         row = {"snapshot": str(snap), "run": snap.parent.name, "arm": arm, "iteration": ck.iteration,
+               "rollbacks": rec["rollbacks"], "diverged_at": rec["diverged_at"], "W": rec["W"].get(ck.iteration),
                "n_iterations": cfg.n_iterations, "run_length": _run_length(snap.parent), "seed": cfg.seed,
                "block_len": cfg.block_len, "rollout_blocks": n_blocks}
         row.update(trajectory_metrics(d, ck.sigma_nm, cfg, ref, dt_ref, md_block, EVAL_BLOCK_STEPS))
@@ -432,7 +449,9 @@ def _fmt_a(r: dict) -> str:
          f"DC dim {r['dc_share_max_dim']:.2f}  |ACF100| dim {r['acf100_max_dim']:.2f}  "
          f"drift78 {r['drift78']:+.3f}  share78 {r['share78']:.2f}  v2 {r['v2_nm2_per_ns2']:+.4f}  "
          f"var/MD {r['var_over_md']:.2f}  D {r['D_ratio']:.2f}x  err {r['err_percent']:.1f}%  "
-         f"period {r['period_blocks']:.2f}  cycle {r['cycle_share'] * 100:.0f}%")
+         f"period {r['period_blocks']:.2f}  cycle {r['cycle_share'] * 100:.0f}%"
+         + (f"  W {r['W']:.2f}" if r.get("W") is not None else "") + f"  rollbacks {r.get('rollbacks', 0)}"
+         + (f"  [run DIVERGED at {r['diverged_at']}]" if r.get("diverged_at") is not None else ""))
     if "horizon_ns" in r:
         s += (f"\n   horizon {r['horizon_ns']:.0f} ns: Σρ first 80 ns {r['rho_sum_first']:+.2f} | last 80 ns "
               f"{r['rho_sum_last']:+.2f}  alpha_end {r['alpha_end']:.2f}  ballistic share at end {r['ballistic_share_end']:.2f}")
@@ -473,6 +492,14 @@ def summarize_arms(results: list[dict]) -> None:
         seeds, lines = [], []
         for run in sorted({r["run"] for r in rr}):
             mine = {r["iteration"]: r for r in rr if r["run"] == run}
+            stop = next((x["diverged_at"] for x in mine.values() if x.get("diverged_at") is not None), None)
+            if stop is not None:                                   # a divergence is a result: report it, count as not passing
+                n_rb = max(x.get("rollbacks", 0) for x in mine.values())
+                lines.append(f"    {run:<32} DIVERGED at iteration {stop} after {n_rb} rollbacks; "
+                             f"{sum(x['pass'] for x in mine.values())}/{len(mine)} of its saved checkpoints pass "
+                             f"({min(mine) // 1000}-{max(mine) // 1000}k)")
+                seeds.append(False)
+                continue
             first = next(iter(mine.values()))
             n_it = first.get("run_length", first["n_iterations"])
             late = _late_window(n_it)
@@ -690,7 +717,41 @@ def self_test() -> None:
     # 8. a resumed run (config says 50k, snapshots to 100k) is judged on 70-100k, also after merging files
     _control_resumed_run_window()
     print("control 8: a resumed run counts as 100k (highest snapshot), and merged rows are judged on 70-100k")
+
+    # 9. a diverged run: every saved checkpoint evaluated, the stop reported, the seed counted as not passing
+    _control_diverged_run()
+    print("control 9: a diverged run is evaluated on all its saved checkpoints and reported as DIVERGED")
     print("all positive controls passed")
+
+
+def _control_diverged_run() -> None:
+    import contextlib
+    import io
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        r = Path(d) / "run_adam_default_c1_seed0"
+        r.mkdir()
+        (r / "config.json").write_text(json.dumps({"n_iterations": 50000}))
+        for it in (10000, 20000, 30000):
+            (r / f"snap_{it:06d}.pt").touch()
+        ev = [{"iteration": 30000, "event": "rollback", "failed_at_iteration": 31417, "to_iteration": 30000, "new_seed": 1000}] * 3
+        ev.append({"iteration": 30000, "event": "diverged", "failed_at_iteration": 31417, "rollbacks": 3})
+        (r / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in ev))
+        (r / "metrics.jsonl").write_text(json.dumps({"iteration": 30000, "wasserstein": 4.2}) + "\n")
+        rec = _run_record(r)
+        assert rec["rollbacks"] == 3 and rec["diverged_at"] == 31417 and rec["W"][30000] == 4.2, rec
+        assert _iterations_for(r, None) == [10000, 20000, 30000]
+        base = dict(rho_sum_1_3=0.0, rho_sum_4_30=0.1, env100=0.01, dc_share_max_dim=0.02, acf100_max_dim=0.03,
+                    drift78=0.05, share78=0.05, v2_nm2_per_ns2=0.0, var_over_md=0.6, D_ratio=1.0, err_percent=10.0,
+                    period_blocks=2.0, cycle_share=0.1, rho_sum_1_30=0.1, arm="adam_default", run=r.name,
+                    n_iterations=50000, run_length=30000, rollbacks=3, diverged_at=31417, pass_=None)
+        rows = [{**base, "iteration": it, "pass": True} for it in (10000, 20000, 30000)]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            summarize_arms(rows)
+        out = buf.getvalue()
+        assert "DIVERGED at iteration 31417 after 3 rollbacks; 3/3 of its saved checkpoints pass (10-30k)" in out, out
+        assert "adam_default: closed (0/1 seeds pass)" in out, out
 
 
 def _control_resumed_run_window() -> None:

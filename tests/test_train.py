@@ -289,7 +289,10 @@ class TestRollback:
         with pytest.raises(DivergenceError):
             t.run()
         assert MAX_CONSECUTIVE_ROLLBACKS == 3                            # the decided value (decisions.md)
-        assert [e["event"] for e in jsonl(out / "events.jsonl")].count("rollback") == 3
+        events = jsonl(out / "events.jsonl")
+        assert [e["event"] for e in events].count("rollback") == 3
+        assert events[-1]["event"] == "diverged"                         # the stop itself is recorded
+        assert events[-1]["failed_at_iteration"] == 4 and events[-1]["rollbacks"] == 3
 
     def test_rollbacks_to_different_checkpoints_do_not_accumulate(self, tmp_path, monkeypatch):
         """Two rollbacks to iteration 0 and two to iteration 3: four in total, never more than

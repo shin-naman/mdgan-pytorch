@@ -1,0 +1,50 @@
+# Batch 3: optimiser and critic-ratio readings of the paper, 3 seeds x 50k = 9 jobs. Sigma units, M = 64,
+# otherwise configs/pe_paper.json; each arm changes only the fields named:
+#   adam_default   lr 1e-3, betas (0.9, 0.999) [eps 1e-8 is PyTorch's default]: Adam as in Kingma & Ba, both optimisers
+#   lr1e3          lr 1e-3, betas (0, 0.9): the learning rate alone
+#   ncritic1       n_critic 1: one critic step per generator step
+# A divergence (3 consecutive rollbacks, recorded as a 'diverged' event) is a result: the job exits non-zero
+# and its run directory keeps every checkpoint saved before the stop. Do not resubmit it with a new seed.
+# Submit from the repository root in /home:  condor_submit tools/chtc/batch3.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+executable                = tools/chtc/run_train.sh
+should_transfer_files     = YES
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+
+request_gpus              = 1
+# The container's PyTorch (2.5.1, CUDA 12.4) has GPU code for compute capability 5.0-9.0 only;
+# newer GPUs fail at the first CUDA call ('no kernel image is available'). 9.0 = H100, 8.9 = L40.
+gpus_minimum_capability   = 7.0
+gpus_maximum_capability   = 9.0
+# gpu2008: its GPU fails every job at the first CUDA call (busy or unavailable), Nov 2026
+requirements              = (Machine != "gpu2008.chtc.wisc.edu")
++WantGPULab               = true
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 5GB
+
+# ---- new runs -------------------------------------------------------------------------------------
+arguments                 = $(ARM)_c$(Cluster)_seed$(SEED) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=batch3_$(ARM).json"
+transfer_input_files      = src, configs/batch3_$(ARM).json, data/cache/PE.npz
+transfer_checkpoint_files = run_$(ARM)_c$(Cluster)_seed$(SEED)
+transfer_output_files     = run_$(ARM)_c$(Cluster)_seed$(SEED)
+log                       = logs/$(ARM)_c$(Cluster)_seed$(SEED).log
+output                    = logs/$(ARM)_c$(Cluster)_seed$(SEED).out
+error                     = logs/$(ARM)_c$(Cluster)_seed$(SEED).err
+
+queue ARM, SEED from (
+  adam_default, 0
+  adam_default, 1
+  adam_default, 2
+  lr1e3, 0
+  lr1e3, 1
+  lr1e3, 2
+  ncritic1, 0
+  ncritic1, 1
+  ncritic1, 2
+)

@@ -324,6 +324,8 @@ class Trainer:
     def _rollback(self) -> None:
         self._rollbacks_since_checkpoint += 1
         if self._rollbacks_since_checkpoint > MAX_CONSECUTIVE_ROLLBACKS:
+            # recorded so a stopped run's directory says by itself that, where, and after how many rollbacks it stopped
+            self._event("diverged", failed_at_iteration=self.iteration + 1, rollbacks=len(self.rollbacks))
             raise DivergenceError(f"non-finite losses after {MAX_CONSECUTIVE_ROLLBACKS} consecutive rollbacks "
                                   f"to the checkpoint at iteration {self.iteration}")
         failed_at = self.iteration + 1
