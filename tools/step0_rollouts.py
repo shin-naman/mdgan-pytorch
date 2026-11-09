@@ -27,6 +27,9 @@ Metrics
                1: z_0 forgotten; 0: the noise does nothing. Reported at k = 1, 2, 5, 10, 20, 50, 100.
                plateau_aa(k) is the noise_checks.py check-3a variant (denominator: A vs permuted A).
 
+summarize    merge arm-eval JSON files (later files win for a repeated run/checkpoint) and print the
+             per-arm table and verdicts again, with run lengths taken from the run directories:
+                 python tools/step0_rollouts.py summarize runs/a/arm-eval.json runs/b/arm-eval.json --out runs/ab
 arm-eval     as-trained evaluation of run directories at checkpoints --iterations (default 20k-50k):
              the mirrored rollout as evaluation does it (no stripping), block statistics on fixed
              64-step (0.64 ns) blocks for every arm with Σρ split into lags 1-3 and 4-30, latent
@@ -353,13 +356,21 @@ def _arm(run_name: str) -> str:
     return (m.group(1) or "baseline") if m else run_name
 
 
+def _run_length(run_dir: Path) -> int:
+    """How far a run actually got: its highest snapshot. config.json and the snapshots' stored configs
+    keep the n_iterations the run STARTED with, which a resume (e.g. 50k -> 100k) does not rewrite."""
+    its = [int(f.stem.split("_")[1]) for f in Path(run_dir).glob("snap_*.pt")]
+    if its:
+        return max(its)
+    return int(json.loads((Path(run_dir) / "config.json").read_text())["n_iterations"])
+
+
 def _iterations_for(run_dir: Path, explicit: list[int] | None) -> list[int]:
-    """Checkpoints to evaluate in one run: an explicit list, or by default 20-50k plus, for runs
-    configured to 100k or more, 70-100k (the late window their verdict is read on)."""
+    """Checkpoints to evaluate in one run: an explicit list, or by default 20-50k plus, for runs that
+    reached 100k or more (highest snapshot), 70-100k (the late window their verdict is read on)."""
     if explicit is not None:
         return explicit
-    n_it = json.loads((run_dir / "config.json").read_text())["n_iterations"]
-    return [20000, 30000, 40000, 50000] + ([70000, 80000, 90000, 100000] if n_it >= 100_000 else [])
+    return [20000, 30000, 40000, 50000] + ([70000, 80000, 90000, 100000] if _run_length(run_dir) >= 100_000 else [])
 
 
 def cmd_arm_eval(args) -> list[dict]:
@@ -390,10 +401,11 @@ def cmd_arm_eval(args) -> list[dict]:
                                        cfg.burn_in, mean_operation=cfg.mean_operation,
                                        generator=torch.Generator().manual_seed(cfg.seed))
         row = {"snapshot": str(snap), "run": snap.parent.name, "arm": arm, "iteration": ck.iteration,
-               "n_iterations": cfg.n_iterations, "seed": cfg.seed, "block_len": cfg.block_len, "rollout_blocks": n_blocks}
+               "n_iterations": cfg.n_iterations, "run_length": _run_length(snap.parent), "seed": cfg.seed,
+               "block_len": cfg.block_len, "rollout_blocks": n_blocks}
         row.update(trajectory_metrics(d, ck.sigma_nm, cfg, ref, dt_ref, md_block, EVAL_BLOCK_STEPS))
         ref_steps = int(round(cfg.estimation_time_ps / (dt_ref * cfg.step_skip)))
-        if d.shape[1] > ref_steps:
+        if args.rollout_blocks and d.shape[1] > ref_steps:      # only for an explicitly longer rollout
             row.update(horizon_metrics(d, ck.sigma_nm, dt_ref * cfg.step_skip, ref_steps, EVAL_BLOCK_STEPS))
         del d
         if args.check_reproduction and i == 0:
@@ -461,7 +473,8 @@ def summarize_arms(results: list[dict]) -> None:
         seeds, lines = [], []
         for run in sorted({r["run"] for r in rr}):
             mine = {r["iteration"]: r for r in rr if r["run"] == run}
-            n_it = next(iter(mine.values()))["n_iterations"]
+            first = next(iter(mine.values()))
+            n_it = first.get("run_length", first["n_iterations"])
             late = _late_window(n_it)
             have = [it for it in late if it in mine]
             ok = sum(mine[it]["pass"] for it in have)
@@ -487,6 +500,24 @@ def summarize_arms(results: list[dict]) -> None:
             verdict = "closed"
         print(f"  {arm}: {verdict} ({sum(1 for x in decided if x)}/{len(seeds)} seeds pass)")
         print("\n".join(lines))
+
+
+def merge_results(paths: list[str]) -> list[dict]:
+    """Rows from several arm-eval JSON files; for a repeated (run, arm, iteration) the later file wins.
+    run_length is recomputed from each run directory's snapshots, so rows written before a resume
+    finished are judged on the run as it now stands."""
+    merged: dict = {}
+    for path in paths:
+        for r in json.loads(Path(path).read_text()):
+            merged[(r["run"], r["arm"], r["iteration"])] = r
+    rows = list(merged.values())
+    for r in rows:
+        run_dir = Path(r["snapshot"]).parent
+        if run_dir.is_dir():
+            r["run_length"] = _run_length(run_dir)
+        if "pass" not in r:
+            r["pass"] = checkpoint_passes(r)
+    return sorted(rows, key=lambda r: (r["arm"], r["run"], r["iteration"]))
 
 
 def cmd_chunked(args) -> list[dict]:
@@ -656,7 +687,41 @@ def self_test() -> None:
     print(f"control 7: Brownian alpha_end {flat['alpha_end']:.2f}, ballistic share {flat['ballistic_share_end']:.2f}; "
           f"late drift Σρ {drift['rho_sum_first']:+.2f} -> {drift['rho_sum_last']:+.2f}, alpha_end "
           f"{drift['alpha_end']:.2f}, ballistic share {drift['ballistic_share_end']:.2f}")
+    # 8. a resumed run (config says 50k, snapshots to 100k) is judged on 70-100k, also after merging files
+    _control_resumed_run_window()
+    print("control 8: a resumed run counts as 100k (highest snapshot), and merged rows are judged on 70-100k")
     print("all positive controls passed")
+
+
+def _control_resumed_run_window() -> None:
+    import contextlib
+    import io
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        r = Path(d) / "run_m128_c1_seed0"
+        r.mkdir()
+        (r / "config.json").write_text(json.dumps({"n_iterations": 50000}))
+        for it in range(10000, 100001, 10000):
+            (r / f"snap_{it:06d}.pt").touch()
+        assert _run_length(r) == 100000, _run_length(r)
+        assert _iterations_for(r, None) == [20000, 30000, 40000, 50000, 70000, 80000, 90000, 100000]
+        base = dict(rho_sum_1_3=0.0, rho_sum_4_30=0.1, env100=0.01, dc_share_max_dim=0.02, acf100_max_dim=0.03,
+                    drift78=0.05, share78=0.05, v2_nm2_per_ns2=0.0, var_over_md=0.6, D_ratio=1.0, err_percent=10.0,
+                    period_blocks=2.0, cycle_share=0.1, arm="m128", run=r.name)
+        early = [{**base, "rho_sum_1_30": 2.0, "iteration": it, "n_iterations": 50000, "snapshot": str(r / f"snap_{it:06d}.pt")}
+                 for it in (20000, 30000, 40000, 50000)]                       # evaluated before the resume: fail
+        late = [{**base, "rho_sum_1_30": 0.1, "iteration": it, "n_iterations": 100000, "snapshot": str(r / f"snap_{it:06d}.pt")}
+                for it in (70000, 80000, 90000, 100000)]                       # evaluated after: pass
+        a, b = Path(d) / "a.json", Path(d) / "b.json"
+        a.write_text(json.dumps(early))
+        b.write_text(json.dumps(late))
+        rows = merge_results([str(a), str(b)])
+        assert all(x["run_length"] == 100000 for x in rows), rows
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            summarize_arms(rows)
+        out = buf.getvalue()
+        assert "100k run: late 70-100k 4/4 pass" in out and "(20-50k: 0/4)" in out and "m128: PASS" in out, out
 
 
 def _control_invariant_detection() -> None:
@@ -673,7 +738,7 @@ def _control_invariant_detection() -> None:
 
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("command", nargs="?", choices=["bn-batch", "chunked", "arm-eval"])
+    ap.add_argument("command", nargs="?", choices=["bn-batch", "chunked", "arm-eval", "summarize"])
     ap.add_argument("snapshots", nargs="*")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--data", help="PE cache (.npz); required for bn-batch")
@@ -698,6 +763,16 @@ def main(argv=None) -> None:
     if args.self_test:
         self_test()
     if args.command is None:
+        return
+    if args.command == "summarize":
+        if not args.snapshots:
+            ap.error("summarize needs one or more arm-eval JSON files")
+        rows = merge_results(args.snapshots)
+        summarize_arms(rows)
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "arm-eval.json").write_text(json.dumps(rows, indent=2, default=str))
+        print(f"\n{len(rows)} rows from {len(args.snapshots)} files; wrote {out / 'arm-eval.json'}")
         return
     if args.command in ("bn-batch", "arm-eval") and not args.data:
         ap.error(f"{args.command} needs --data")
