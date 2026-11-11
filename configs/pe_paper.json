@@ -15,6 +15,7 @@
   "phase_mode": "single",
   "scale_inputs": true,
   "window_offset_max_steps": 0,
+  "critic_input": "increments",
   "batch_size": 64,
   "n_iterations": 300000,
   "n_critic": 5,
@@ -29,6 +30,7 @@
   "mean_operation": true,
   "seed": 0,
   "checkpoint_every": 10000,
+  "full_checkpoint_iterations": [],
   "estimation_chains": 8192,
   "estimation_time_ps": 80000.0,
   "err_window_ps": [

@@ -1,0 +1,51 @@
+# Batch 4: 2 arms x 3 seeds x 50k = 6 jobs. Each keeps full checkpoints (critic, optimisers, RNG) at
+# 20k, 30k, 40k, 50k as full_XXXXXX.pt, for later measurement of the training signal.
+#   positions     critic_input "positions": the critic sees cumsum(window) over all 2M steps (no reset at the
+#                 block boundary, no extra normalisation), real and fake alike, in the critic and the generator
+#                 step; the gradient penalty is on the position windows. Everything else as pe_paper.json.
+#                 PREDICTION: share78 and the ballistic fraction fall; DC share max dim falls if the drift
+#                 signal reaches G_z.
+#   lambda_sigma  scale_inputs False, gp_lambda = 10 * sigma = 1.6963421772562393 (sigma = window_std_nm of
+#                 the PE training windows, 0.16963421772562393 nm). Otherwise the earlier scale-off arm
+#                 (configs/ablation_scale_off.json). QUESTION: did scale-off change the units or the penalty
+#                 strength?
+# Submit from the repository root in /home:  condor_submit tools/chtc/batch4.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+executable                = tools/chtc/run_train.sh
+should_transfer_files     = YES
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+
+request_gpus              = 1
+# The container's PyTorch (2.5.1, CUDA 12.4) has GPU code for compute capability 5.0-9.0 only;
+# newer GPUs fail at the first CUDA call ('no kernel image is available'). 9.0 = H100, 8.9 = L40.
+gpus_minimum_capability   = 7.0
+gpus_maximum_capability   = 9.0
+# gpu2008: its GPU fails every job at the first CUDA call (busy or unavailable), Nov 2026
+requirements              = (Machine != "gpu2008.chtc.wisc.edu")
++WantGPULab               = true
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 5GB
+
+# ---- new runs -------------------------------------------------------------------------------------
+arguments                 = $(ARM)_c$(Cluster)_seed$(SEED) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=batch4_$(ARM).json"
+transfer_input_files      = src, configs/batch4_$(ARM).json, data/cache/PE.npz
+transfer_checkpoint_files = run_$(ARM)_c$(Cluster)_seed$(SEED)
+transfer_output_files     = run_$(ARM)_c$(Cluster)_seed$(SEED)
+log                       = logs/$(ARM)_c$(Cluster)_seed$(SEED).log
+output                    = logs/$(ARM)_c$(Cluster)_seed$(SEED).out
+error                     = logs/$(ARM)_c$(Cluster)_seed$(SEED).err
+
+queue ARM, SEED from (
+  positions, 0
+  positions, 1
+  positions, 2
+  lambda_sigma, 0
+  lambda_sigma, 1
+  lambda_sigma, 2
+)

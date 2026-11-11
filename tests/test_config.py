@@ -22,7 +22,7 @@ class TestDefaults:
         assert (c.latent_dim, c.noise_dim, c.block_len, c.n_channels, c.hidden_dim) == (32, 32, 64, 3, 2048)
         assert c.negative_slope == 0.2 and c.use_running_stats is False and c.init == "pytorch"
         assert (c.gz_additive_noise_std, c.gz_weight_decay, c.gz_dropout, c.gz_norm_position) == (0.0, 0.0, 0.0, "output")
-        assert c.window_offset_max_steps == 0
+        assert c.window_offset_max_steps == 0 and c.critic_input == "increments" and c.full_checkpoint_iterations == ()
         assert (c.step_skip, c.phase_mode, c.scale_inputs) == (1, "single", True)
         assert (c.batch_size, c.n_iterations, c.n_critic) == (64, 300_000, 5)
         assert (c.lr, c.betas, c.gp_lambda) == (1e-4, (0.0, 0.9), 10.0)
@@ -55,7 +55,7 @@ class TestValidation:
         dict(step_skip=2.0), dict(pair_window=0), dict(estimation_chains=0),
         dict(burn_in=-1), dict(seed=-1), dict(phase_mode="some"),
         dict(lr=0.0), dict(betas=(0.0, 1.0)), dict(betas=(0.5,)), dict(gp_lambda=-1.0),
-        dict(negative_slope=-0.1), dict(init="xavier"), dict(gz_additive_noise_std=-0.1), dict(gz_weight_decay=-1.0), dict(gz_dropout=1.0), dict(gz_norm_position="input"), dict(window_offset_max_steps=-1), dict(window_offset_max_steps=2.5), dict(err_window_ps=(78_000.0, 200.0)),
+        dict(negative_slope=-0.1), dict(init="xavier"), dict(gz_additive_noise_std=-0.1), dict(gz_weight_decay=-1.0), dict(gz_dropout=1.0), dict(gz_norm_position="input"), dict(window_offset_max_steps=-1), dict(critic_input="velocities"), dict(full_checkpoint_iterations=(5000,)), dict(full_checkpoint_iterations=(0,)), dict(window_offset_max_steps=2.5), dict(err_window_ps=(78_000.0, 200.0)),
         dict(diffusion_fit_ps=(0.0, 10.0)), dict(estimation_time_ps=0.0),
         dict(estimation_time_ps=10_000.0), dict(err_window_ps=(200.0, 90_000.0)),
         dict(diffusion_fit_ps=(10_000.0, 85_000.0)),
@@ -70,6 +70,11 @@ class TestValidation:
 
 # =============================================================================
 class TestSerialization:
+    def test_full_checkpoint_iterations_round_trip_as_a_tuple(self):
+        c = Config(full_checkpoint_iterations=(20000, 30000, 40000, 50000))
+        back = Config.from_dict(json.loads(json.dumps(c.to_dict())))
+        assert back == c and back.full_checkpoint_iterations == (20000, 30000, 40000, 50000)
+
     def test_round_trip_through_json(self):
         c = Config(latent_dim=7, step_skip=20, betas=(0.5, 0.99), mean_operation=False)
         d = json.loads(json.dumps(c.to_dict()))

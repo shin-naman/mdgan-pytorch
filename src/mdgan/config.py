@@ -22,6 +22,7 @@ from mdgan._util import positive_int
 PHASE_MODES = ("single", "all")
 INIT_SCHEMES = ("pytorch", "chainer")    # see mdgan.models.init
 GZ_NORM_POSITIONS = ("output", "hidden")  # see mdgan.models.latent_transition
+CRITIC_INPUTS = ("increments", "positions")  # see mdgan.train.critic_view
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,7 @@ class Config:
     phase_mode: str = "single"
     scale_inputs: bool = True       # divide by sigma; False is the unscaled ablation
     window_offset_max_steps: int = 0  # > 0: each training window starts at a fresh offset in [0, K] steps
+    critic_input: str = "increments"  # "positions": the critic sees cumsum(window) over all 2M steps
 
     # --- training (WGAN-GP) ---------------------------------------------------------------
     batch_size: int = 64
@@ -61,6 +63,7 @@ class Config:
 
     # --- checkpoints and estimation ------------------------------------------------------
     checkpoint_every: int = 10_000
+    full_checkpoint_iterations: tuple[int, ...] = ()  # keep a copy of the full state (critic, optimisers, RNG) here
     estimation_chains: int = 8192
     estimation_time_ps: float = 80_000.0
     err_window_ps: tuple[float, float] = (200.0, 78_000.0)
@@ -87,6 +90,10 @@ class Config:
             raise ValueError("gz_weight_decay must be >= 0")
         if not 0.0 <= self.gz_dropout < 1.0:
             raise ValueError("gz_dropout must be in [0, 1)")
+        if any(int(i) != i or i <= 0 or i % self.checkpoint_every for i in self.full_checkpoint_iterations):
+            raise ValueError("full_checkpoint_iterations must be positive multiples of checkpoint_every")
+        if self.critic_input not in CRITIC_INPUTS:
+            raise ValueError(f"critic_input must be one of {CRITIC_INPUTS}")
         if self.gz_norm_position not in GZ_NORM_POSITIONS:
             raise ValueError(f"gz_norm_position must be one of {GZ_NORM_POSITIONS}")
         if not self.lr > 0:
@@ -138,5 +145,5 @@ class Config:
         unknown = set(d) - known
         if unknown:
             raise ValueError(f"unknown Config keys: {sorted(unknown)}")
-        tuple_fields = {"betas", "err_window_ps", "diffusion_fit_ps"}
+        tuple_fields = {"betas", "err_window_ps", "diffusion_fit_ps", "full_checkpoint_iterations"}
         return cls(**{k: tuple(v) if k in tuple_fields else v for k, v in d.items()})

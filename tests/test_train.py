@@ -22,7 +22,7 @@ from mdgan.data.preprocess import SystemData
 from mdgan.evaluate import reference_msd
 from mdgan.train import (
     CHECKPOINT_EXIT_CODE, LATEST, MAX_CONSECUTIVE_ROLLBACKS, ROLLBACK_SEED_STRIDE, DivergenceError, Trainer, _frozen,
-    build_config, load_system, main, make_generator_optimizer, snapshot_name,
+    build_config, critic_view, full_checkpoint_name, load_system, main, make_generator_optimizer, snapshot_name,
 )
 
 DT = 10.0
@@ -335,7 +335,8 @@ class TestAblation:
 # =============================================================================
 class TestBatch1Probes:
     PROBES = [{"gz_additive_noise_std": 0.5}, {"gz_weight_decay": 0.1}, {"gz_dropout": 0.2},
-              {"block_len": 16}, {"gz_norm_position": "hidden"}, {"window_offset_max_steps": 5}]
+              {"block_len": 16}, {"gz_norm_position": "hidden"}, {"window_offset_max_steps": 5},
+              {"critic_input": "positions"}]
 
     def test_default_generator_optimizer_is_the_paper_adam(self):
         from mdgan.models import build_models
@@ -392,6 +393,118 @@ class TestBatch1Probes:
         assert all(getattr(ck.config, k) == v for k, v in probe.items())
         evals = jsonl(straight / "evaluations.jsonl")
         assert [e["iteration"] for e in evals] == [3, 6] and all(np.isfinite(e["err_percent"]) for e in evals)
+
+
+# =============================================================================
+class TestFullCheckpoints:
+    """Config.full_checkpoint_iterations: the complete training state kept at chosen iterations."""
+
+    def test_none_by_default(self, tmp_path):
+        trainer(tmp_path / "run").run()
+        assert not list((tmp_path / "run").glob("full_*.pt"))
+
+    def test_kept_only_at_the_listed_iterations_and_complete(self, tmp_path):
+        out = tmp_path / "run"
+        trainer(out, tiny(full_checkpoint_iterations=(3,))).run()
+        assert sorted(p.name for p in out.glob("full_*.pt")) == [full_checkpoint_name(3)]
+        assert not list(out.glob("*.tmp"))
+        ck = load_checkpoint(out / full_checkpoint_name(3))
+        assert ck.kind == "full" and ck.iteration == 3 and ck.dg is not None
+        assert set(ck.optimizer_states) == {"generator", "critic"} and ck.generator_state is not None
+
+    def test_equals_the_state_a_run_stopped_there_would_hold(self, tmp_path):
+        """full_000003.pt from a 6-iteration run == latest.pt of the same run stopped at 3: models, optimiser
+        states and the training generator, so a resume from it continues exactly."""
+        trainer(tmp_path / "long", tiny(full_checkpoint_iterations=(3,))).run()
+        trainer(tmp_path / "short", tiny(full_checkpoint_iterations=(3,), n_iterations=3)).run()
+        kept, stopped = load_checkpoint(tmp_path / "long" / full_checkpoint_name(3)), load_checkpoint(tmp_path / "short" / LATEST)
+        assert_same_weights(weights(tmp_path / "long" / full_checkpoint_name(3)), weights(tmp_path / "short" / LATEST))
+        assert torch.equal(kept.generator_state, stopped.generator_state)
+        for name in ("generator", "critic"):
+            a, b = kept.optimizer_states[name]["state"], stopped.optimizer_states[name]["state"]
+            assert a.keys() == b.keys() and all(torch.equal(a[k][f], b[k][f]) for k in a for f in a[k])
+
+
+# =============================================================================
+class TestCriticInput:
+    """Config.critic_input: what the critic sees of a window (train.critic_view)."""
+
+    def test_increments_view_is_the_same_tensor(self):
+        x = torch.randn(4, 16, 3)
+        assert critic_view(x, "increments") is x                      # the default adds no operation at all
+
+    def test_positions_of_constant_increments_grow_linearly(self):
+        m = TINY["block_len"]
+        x = torch.full((2, 2 * m, 3), 0.5)
+        v = critic_view(x, "positions")
+        expected = 0.5 * torch.arange(1, 2 * m + 1, dtype=torch.float32)[None, :, None].expand(2, 2 * m, 3)
+        torch.testing.assert_close(v, expected, rtol=0, atol=1e-6)
+        assert v[0, m, 0].item() == pytest.approx(0.5 * (m + 1))       # no reset at the block boundary
+
+    def test_unknown_view_rejected(self):
+        with pytest.raises(ValueError, match="critic_input"):
+            critic_view(torch.zeros(1, 2, 3), "velocities")
+        with pytest.raises(ValueError, match="critic_input"):
+            tiny(critic_input="velocities")
+
+    def test_positions_reach_both_terms_of_training(self, tmp_path, monkeypatch):
+        """Every critic call gets cumsum(real) and cumsum(fake); the generator call gets cumsum(fake)."""
+        import mdgan.train as train_module
+        t = trainer(tmp_path / "run", tiny(critic_input="positions", n_iterations=1))
+        sampled, fakes, critic_in, gen_in = [], [], [], []
+        sample, make, crit, gen = t.dataset.sample, train_module.make_fake_window, train_module.critic_loss, train_module.generator_loss
+
+        def rec_sample(*a, **kw):
+            out = sample(*a, **kw)
+            sampled.append(out.detach().clone())
+            return out
+
+        def rec_make(*a, **kw):
+            out = make(*a, **kw)
+            fakes.append(out.detach().clone())
+            return out
+
+        def rec_crit(critic, real, fake, *a, **kw):
+            critic_in.append((real.detach().clone(), fake.detach().clone()))
+            return crit(critic, real, fake, *a, **kw)
+
+        def rec_gen(critic, fake):
+            gen_in.append(fake.detach().clone())
+            return gen(critic, fake)
+
+        monkeypatch.setattr(t.dataset, "sample", rec_sample)
+        monkeypatch.setattr(train_module, "make_fake_window", rec_make)
+        monkeypatch.setattr(train_module, "critic_loss", rec_crit)
+        monkeypatch.setattr(train_module, "generator_loss", rec_gen)
+        t.run()
+        n = TINY["n_critic"]
+        assert len(critic_in) == n and len(sampled) == n and len(gen_in) == 1 and len(fakes) == n + 1
+        for i in range(n):
+            torch.testing.assert_close(critic_in[i][0], torch.cumsum(sampled[i], dim=1), rtol=0, atol=0)
+            torch.testing.assert_close(critic_in[i][1], torch.cumsum(fakes[i], dim=1), rtol=0, atol=0)
+        torch.testing.assert_close(gen_in[0], torch.cumsum(fakes[n], dim=1), rtol=0, atol=0)
+
+    def test_gradient_penalty_is_measured_on_the_position_input(self):
+        """With D(x) = sum(x), the input gradient is all ones: norm sqrt(2M C) on positions. Had the penalty
+        been taken with respect to the increments, the norm would be sqrt(C * sum k^2)."""
+        from mdgan.losses import critic_loss
+
+        class SumCritic(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = torch.nn.Parameter(torch.ones(1))
+
+            def forward(self, x):
+                return (x * self.w).sum(dim=(1, 2))
+
+        m, c = TINY["block_len"], 3
+        real, fake = torch.randn(8, 2 * m, c), torch.randn(8, 2 * m, c)
+        _, info = critic_loss(SumCritic(), critic_view(real, "positions"), critic_view(fake, "positions"), 10.0,
+                              generator=torch.Generator().manual_seed(0))
+        on_positions = (2 * m * c) ** 0.5
+        on_increments = (c * sum(k * k for k in range(1, 2 * m + 1))) ** 0.5
+        assert float(info["grad_norm"]) == pytest.approx(on_positions, rel=1e-5)
+        assert abs(float(info["grad_norm"]) - on_increments) > 1.0
 
 
 # =============================================================================

@@ -45,7 +45,9 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import platform
+import shutil
 import subprocess
 import time
 from contextlib import contextmanager
@@ -69,6 +71,22 @@ ROLLBACK_SEED_STRIDE = 1000
 METRIC_NAMES = ("wasserstein", "gradient_penalty", "grad_norm", "generator_loss", "fake_step_std")
 
 
+def critic_view(window: torch.Tensor, critic_input: str) -> torch.Tensor:
+    """What the critic sees of a (B, 2M, C) window (Config.critic_input).
+
+    "increments" (the paper as read): the step displacements themselves; returned unchanged (the same
+    tensor), so the default training step is bit-identical to before this option existed.
+    "positions": cumulative positions, cumsum over all 2M steps, with no reset at the block boundary
+    and no further normalisation. Applied after the mean operation (fake windows arrive centred from
+    make_fake_window) to real and fake alike, in the critic step and the generator step; the gradient
+    penalty is then built from, and differentiated with respect to, the position windows."""
+    if critic_input == "increments":
+        return window
+    if critic_input == "positions":
+        return torch.cumsum(window, dim=1)
+    raise ValueError(f"unknown critic_input {critic_input!r}")
+
+
 def make_generator_optimizer(gz, gy, config):
     """Adam on G_z + G_Y (the paper), or with config.gz_weight_decay > 0, AdamW with decoupled
     decay on every G_z parameter and none on G_Y (two parameter groups). The critic's optimizer is
@@ -86,6 +104,10 @@ class DivergenceError(RuntimeError):
 
 def snapshot_name(iteration: int) -> str:
     return f"snap_{iteration:06d}.pt"
+
+
+def full_checkpoint_name(iteration: int) -> str:
+    return f"full_{iteration:06d}.pt"
 
 
 @contextmanager
@@ -247,7 +269,9 @@ class Trainer:
         real = self.dataset.sample(self.config.batch_size, generator=self.gen, device=self.device)
         with torch.no_grad():
             fake = self._fake()
-        loss, info = critic_loss(self.dg, real, fake, self.config.gp_lambda, generator=self.gen)
+        view = self.config.critic_input
+        loss, info = critic_loss(self.dg, critic_view(real, view), critic_view(fake, view), self.config.gp_lambda,
+                                 generator=self.gen)
         self.opt_d.zero_grad(set_to_none=True)
         loss.backward()
         self.opt_d.step()
@@ -256,7 +280,7 @@ class Trainer:
     def _generator_step(self) -> dict:
         with _frozen(self.dg):
             fake = self._fake()
-            loss = generator_loss(self.dg, fake)
+            loss = generator_loss(self.dg, critic_view(fake, self.config.critic_input))
             self.opt_g.zero_grad(set_to_none=True)
             loss.backward()
             self.opt_g.step()
@@ -306,6 +330,12 @@ class Trainer:
 
     def _checkpoint(self) -> None:
         self._save_latest()
+        if self.iteration in self.config.full_checkpoint_iterations:
+            # the full training state (critic, optimisers, RNG) at this iteration, kept: an atomic copy of the
+            # latest.pt just written, so it is exactly what a resume from here would load
+            tmp = self.out / (full_checkpoint_name(self.iteration) + ".tmp")
+            shutil.copyfile(self.out / LATEST, tmp)
+            os.replace(tmp, self.out / full_checkpoint_name(self.iteration))
         save_snapshot(self.out / snapshot_name(self.iteration), config=self.config, gz=self.gz, gy=self.gy,
                       iteration=self.iteration, sigma_nm=self.dataset.sigma_nm, dataset=self.dataset.metadata)
         self._rollbacks_since_checkpoint = 0
