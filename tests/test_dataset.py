@@ -258,6 +258,16 @@ def test_real_pe_training_set(pe):
 K = 7
 
 
+def test_position_rms_ratio_is_the_pooled_ratio_of_the_offset_zero_windows():
+    sys_ = make_system()
+    w = sys_.displacements[:, :2 * M].astype(np.float64)
+    expected = np.sqrt((np.cumsum(w, axis=1) ** 2).mean()) / np.sqrt((w ** 2).mean())
+    for kw in ({}, {"scale_inputs": False}, {"window_offset_max_steps": K}):
+        ds = WindowDataset(sys_, block_len=M, step_skip=1, **kw)
+        assert ds.position_rms_ratio == pytest.approx(expected, rel=1e-12), kw     # scale-free; offset-0 windows
+        assert "position_rms_ratio" not in ds.metadata
+
+
 def test_offset_zero_is_the_paper_dataset_bit_for_bit():
     a = WindowDataset(make_system(), block_len=M, step_skip=1)
     b = WindowDataset(make_system(), block_len=M, step_skip=1, window_offset_max_steps=0)

@@ -202,9 +202,56 @@ def share78(a: float, b: float, t_ns: float = 78.0) -> float:
     return float(b * t_ns ** 2 / (a * t_ns + b * t_ns ** 2))
 
 
-def checkpoint_passes(r: dict) -> bool:
-    return (r["rho_sum_1_30"] <= PASS_RHO_SUM and r["dc_share_max_dim"] < PASS_DC_DIM
-            and r["acf100_max_dim"] < PASS_ACF_DIM and r["share78"] < PASS_SHARE78)
+def checkpoint_passes(r: dict, var_range: tuple | None = None, max_err: float | None = None) -> bool:
+    """The four drift criteria; with var_range = (lo, hi), also lo <= var/MD <= hi (a model that barely moves
+    cannot pass). var_range None reproduces every table made before the range existed."""
+    ok = (r["rho_sum_1_30"] <= PASS_RHO_SUM and r["dc_share_max_dim"] < PASS_DC_DIM
+          and r["acf100_max_dim"] < PASS_ACF_DIM and r["share78"] < PASS_SHARE78)
+    if var_range is not None:
+        ok = ok and var_range[0] <= r["var_over_md"] <= var_range[1]
+    if max_err is not None:
+        ok = ok and r["err_percent"] <= max_err
+    return bool(ok)
+
+
+def latent_passes(r: dict) -> bool:
+    """The two latent criteria on their own: no dimension holds an invariant (DC share) or a long memory
+    (|ACF| at lag 100). Independent of the physics columns and of the variance and error options."""
+    return bool(r["dc_share_max_dim"] < PASS_DC_DIM and r["acf100_max_dim"] < PASS_ACF_DIM)
+
+
+def rule_text(var_range: tuple | None = None, max_err: float | None = None) -> str:
+    return (f"pass = Σρ <= {PASS_RHO_SUM}, DC dim < {PASS_DC_DIM}, |ACF100| dim < {PASS_ACF_DIM}, share78 < {PASS_SHARE78}"
+            + (f", var/MD in [{var_range[0]:g}, {var_range[1]:g}]" if var_range else ", no variance range")
+            + (f", err <= {max_err:g}%" if max_err is not None else ", no error limit"))
+
+
+def failed_criteria(r: dict, var_range: tuple | None = None,
+                    max_err: float | None = None) -> list[tuple[str, float, float, bool]]:
+    """(criterion, value, threshold, within 20 % of the threshold) for every criterion the row fails."""
+    out = []
+    for name, v, thr, bad in (("Σρ", r["rho_sum_1_30"], PASS_RHO_SUM, r["rho_sum_1_30"] > PASS_RHO_SUM),
+                              ("DC dim", r["dc_share_max_dim"], PASS_DC_DIM, r["dc_share_max_dim"] >= PASS_DC_DIM),
+                              ("ACF dim", r["acf100_max_dim"], PASS_ACF_DIM, r["acf100_max_dim"] >= PASS_ACF_DIM),
+                              ("share78", r["share78"], PASS_SHARE78, r["share78"] >= PASS_SHARE78)):
+        if bad:
+            out.append((name, v, thr, v <= 1.2 * thr))
+    if var_range is not None:
+        lo, hi = var_range
+        v = r["var_over_md"]
+        if v < lo:
+            out.append(("var/MD", v, lo, v >= 0.8 * lo))
+        elif v > hi:
+            out.append(("var/MD", v, hi, v <= 1.2 * hi))
+    if max_err is not None and r["err_percent"] > max_err:
+        out.append(("err%", r["err_percent"], max_err, r["err_percent"] <= 1.2 * max_err))
+    return out
+
+
+def is_borderline(r: dict, var_range: tuple | None = None, max_err: float | None = None) -> bool:
+    """Fails exactly one criterion, and that one within 20 % of its threshold."""
+    f = failed_criteria(r, var_range, max_err)
+    return len(f) == 1 and f[0][3]
 
 
 def trajectory_metrics(d_model: torch.Tensor, sigma_nm: float, cfg, ref: np.ndarray, dt_ref: float, md_block: dict,
@@ -388,6 +435,51 @@ def _iterations_for(run_dir: Path, explicit: list[int] | None) -> list[int]:
     return [20000, 30000, 40000, 50000] + ([70000, 80000, 90000, 100000] if _run_length(run_dir) >= 100_000 else [])
 
 
+def draw_seeds(rollout_seed: int, config_seed: int) -> dict:
+    """Every random draw of one complete evaluation. The config seed reproduces the original evaluation exactly
+    (rollout and latent path on config.seed, plateau z0 on 0, plateau noise on 11 and 12); any other rollout
+    seed s re-draws all of them, from seeds 10 s + k that no other rollout seed shares."""
+    if rollout_seed == config_seed:
+        return {"rollout": config_seed, "latent": config_seed, "z0": 0, "plateau": (11, 12)}
+    b = 10 * rollout_seed
+    return {"rollout": b + 1, "latent": b + 2, "z0": b + 3, "plateau": (b + 4, b + 5)}
+
+
+def chain_indices(out: Path, n_store: int, n_chains: int, seed: int = 20261111) -> np.ndarray:
+    """A fixed subset of chain indices, saved once as chain_indices.npy and reused for every rollout written
+    to this output directory, so stored chains are comparable across seeds and checkpoints."""
+    f = Path(out) / "chain_indices.npy"
+    if f.exists():
+        idx = np.load(f)
+        if len(idx) != n_store or idx.max() >= n_chains:
+            raise SystemExit(f"{f} holds {len(idx)} indices up to {idx.max()}; this evaluation asks for {n_store} "
+                             f"of {n_chains} chains. Use a fresh --out or the same --store-chains and --chains.")
+        return idx
+    idx = np.sort(np.random.default_rng(seed).choice(n_chains, size=n_store, replace=False))
+    f.parent.mkdir(parents=True, exist_ok=True)
+    np.save(f, idx)
+    return idx
+
+
+def store_chains(out: Path, idx: np.ndarray, d_model: np.ndarray, latents: np.ndarray, sigma_nm: float,
+                 block_len: int, meta: dict) -> Path:
+    """For the stored chains: latents (n_blocks, k, n_z) and model-block displacement sums (k, n_blocks, C) in nm,
+    chain-aligned (row j of both is chain idx[j]), float32, with meta."""
+    k, nb = len(idx), latents.shape[0]
+    sums = d_model[idx, : nb * block_len].reshape(k, nb, block_len, -1).sum(axis=2) * sigma_nm
+    f = Path(out) / "chains" / f"{meta['run']}_it{meta['iteration']:06d}_rs{meta['rollout_seed']}.npz"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(f, latents=latents[:, idx].astype(np.float32), block_sums_nm=sums.astype(np.float32),
+             chain_indices=idx, **{k_: np.asarray(v) for k_, v in meta.items()})
+    return f
+
+
+def _parse_rollout_seeds(text: str | None) -> list:
+    if not text:
+        return ["config"]
+    return [t if t == "config" else int(t) for t in text.split(",")]
+
+
 def cmd_arm_eval(args) -> list[dict]:
     """As-trained evaluation of each run's checkpoints at --iterations (default 20k-50k)."""
     from mdgan.checkpoint import load_checkpoint
@@ -412,39 +504,57 @@ def cmd_arm_eval(args) -> list[dict]:
         n_blocks = args.rollout_blocks or cfg.estimation_blocks(dt_ref)
         if args.rollout_blocks:
             arm += f"+{n_blocks}blk"
-        d, _, _ = rollout_with_latents(gz, gy, args.chains or cfg.estimation_chains, n_blocks,
-                                       cfg.burn_in, mean_operation=cfg.mean_operation,
-                                       generator=torch.Generator().manual_seed(cfg.seed))
-        rec = _run_record(snap.parent)
-        row = {"snapshot": str(snap), "run": snap.parent.name, "arm": arm, "iteration": ck.iteration,
-               "rollbacks": rec["rollbacks"], "diverged_at": rec["diverged_at"], "W": rec["W"].get(ck.iteration),
-               "n_iterations": cfg.n_iterations, "run_length": _run_length(snap.parent), "seed": cfg.seed,
-               "block_len": cfg.block_len, "rollout_blocks": n_blocks}
-        row.update(trajectory_metrics(d, ck.sigma_nm, cfg, ref, dt_ref, md_block, EVAL_BLOCK_STEPS))
-        ref_steps = int(round(cfg.estimation_time_ps / (dt_ref * cfg.step_skip)))
-        if args.rollout_blocks and d.shape[1] > ref_steps:      # only for an explicitly longer rollout
-            row.update(horizon_metrics(d, ck.sigma_nm, dt_ref * cfg.step_skip, ref_steps, EVAL_BLOCK_STEPS))
-        del d
-        if args.check_reproduction and i == 0:
-            rec = _evaluation_record(snap, ck.iteration)
-            row["reproduction"] = {"tool_err": row["err_percent"], "tool_D_ratio": row["D_ratio"],
-                                   "logged_err": rec["err_percent"] if rec else None,
-                                   "logged_D_ratio": 1 + rec["D_rel_error"] if rec else None}
-        gz.eval()
-        z0 = torch.rand(args.plateau_chains, cfg.latent_dim, generator=torch.Generator().manual_seed(0)).to(args.device)
-        zpath = latent_path(gz, z0, cfg.burn_in + LATENT_TRANSITIONS - 1, torch.Generator().manual_seed(cfg.seed))
-        row.update(latent_metrics(zpath[cfg.burn_in:]))
-        row.update(plateau_curve(gz, z0))
-        row["pass"] = checkpoint_passes(row)
-        results.append(row)
-        print(_fmt_a(row), flush=True)
+        for rs in _parse_rollout_seeds(args.rollout_seeds):
+            rows = _evaluate_one(args, i, snap, ck, cfg, gz, gy, arm, n_blocks, ref, dt_ref, md_block,
+                                 cfg.seed if rs == "config" else rs)
+            results.extend(rows)
     return results
+
+
+def _evaluate_one(args, i, snap, ck, cfg, gz, gy, arm, n_blocks, ref, dt_ref, md_block, rollout_seed) -> list[dict]:
+    seeds = draw_seeds(rollout_seed, cfg.seed)
+    n_chains = args.chains or cfg.estimation_chains
+    d, lat, _ = rollout_with_latents(gz, gy, n_chains, n_blocks, cfg.burn_in, mean_operation=cfg.mean_operation,
+                                     generator=torch.Generator().manual_seed(seeds["rollout"]))
+    rec = _run_record(snap.parent)
+    row = {"snapshot": str(snap), "run": snap.parent.name, "arm": arm, "iteration": ck.iteration,
+           "rollout_seed": rollout_seed, "draw": "config" if rollout_seed == cfg.seed else "new",
+           "rollbacks": rec["rollbacks"], "diverged_at": rec["diverged_at"], "W": rec["W"].get(ck.iteration),
+           "n_iterations": cfg.n_iterations, "run_length": _run_length(snap.parent), "seed": cfg.seed,
+           "block_len": cfg.block_len, "rollout_blocks": n_blocks}
+    row.update(trajectory_metrics(d, ck.sigma_nm, cfg, ref, dt_ref, md_block, EVAL_BLOCK_STEPS))
+    ref_steps = int(round(cfg.estimation_time_ps / (dt_ref * cfg.step_skip)))
+    if args.rollout_blocks and d.shape[1] > ref_steps:      # only for an explicitly longer rollout
+        row.update(horizon_metrics(d, ck.sigma_nm, dt_ref * cfg.step_skip, ref_steps, EVAL_BLOCK_STEPS))
+    if args.store_chains:
+        idx = chain_indices(Path(args.out), args.store_chains, n_chains)
+        row["chains_file"] = str(store_chains(Path(args.out), idx, d.numpy(), lat.numpy(), ck.sigma_nm, cfg.block_len,
+                                              {"run": snap.parent.name, "iteration": ck.iteration,
+                                               "rollout_seed": rollout_seed, "block_len": cfg.block_len,
+                                               "sigma_nm": ck.sigma_nm, "arm": arm}))
+    del d, lat
+    if args.check_reproduction and i == 0 and rollout_seed == cfg.seed:
+        rec = _evaluation_record(snap, ck.iteration)
+        row["reproduction"] = {"tool_err": row["err_percent"], "tool_D_ratio": row["D_ratio"],
+                               "logged_err": rec["err_percent"] if rec else None,
+                               "logged_D_ratio": 1 + rec["D_rel_error"] if rec else None}
+    gz.eval()
+    z0 = torch.rand(args.plateau_chains, cfg.latent_dim,
+                    generator=torch.Generator().manual_seed(seeds["z0"])).to(args.device)
+    zpath = latent_path(gz, z0, cfg.burn_in + LATENT_TRANSITIONS - 1, torch.Generator().manual_seed(seeds["latent"]))
+    row.update(latent_metrics(zpath[cfg.burn_in:]))
+    row.update(plateau_curve(gz, z0, seeds=seeds["plateau"]))
+    row["pass"] = checkpoint_passes(row, args.var_range, args.max_err)
+    row["latent_pass"] = latent_passes(row)
+    print(_fmt_a(row), flush=True)
+    return [row]
 
 
 def _fmt_a(r: dict) -> str:
     it = f"{r['iteration'] // 1000}k" if r["iteration"] >= 1000 else str(r["iteration"])
     tag = f" [{r['arm'].split('+', 1)[1]}]" if "+" in r["arm"] else ""
-    s = (f"{r['run']} @{it}{tag}: {'PASS' if r['pass'] else 'fail'}  Σρ {r['rho_sum_1_30']:+.2f} "
+    s = (f"{r['run']} @{it}{tag}: {'PASS' if r['pass'] else 'fail'} (latent {'PASS' if latent_passes(r) else 'fail'})  "
+         f"Σρ {r['rho_sum_1_30']:+.2f} "
          f"(1-3 {r['rho_sum_1_3']:+.2f} | 4-30 {r['rho_sum_4_30']:+.2f})  env100 {r['env100']:.3f}  "
          f"DC dim {r['dc_share_max_dim']:.2f}  |ACF100| dim {r['acf100_max_dim']:.2f}  "
          f"drift78 {r['drift78']:+.3f}  share78 {r['share78']:.2f}  v2 {r['v2_nm2_per_ns2']:+.4f}  "
@@ -466,10 +576,20 @@ def _late_window(n_iterations: int, step: int = 10_000) -> list[int]:
     return [n_iterations - k * step for k in (3, 2, 1, 0)]
 
 
-def summarize_arms(results: list[dict]) -> None:
+def summarize_arms(results: list[dict], var_range: tuple | None = None, max_err: float | None = None) -> None:
+    """Tables and verdicts. Every row's pass flag is recomputed under var_range, so one JSON file can be read
+    with and without the variance range. Medians and verdicts use one row per checkpoint, the config-seed draw
+    (or the lowest rollout seed if that one is absent); extra rollout seeds appear in the repeatability section."""
+    for r in results:
+        r["pass"] = checkpoint_passes(r, var_range, max_err)
+        r["latent_pass"] = latent_passes(r)
+    primary: dict = {}
+    for r in sorted(results, key=lambda x: (x.get("draw", "config") != "config", str(x.get("rollout_seed", "")))):
+        primary.setdefault((r["run"], r["arm"], r["iteration"]), r)
+    results = list(primary.values())
     arms = sorted({r["arm"] for r in results}, key=lambda a: (a != "baseline", a))
     print(f"\n{'arm':<26} {'n':>3} {'Σρ':>6} {'1-3':>6} {'4-30':>6} {'env100':>6} {'DC dim':>6} {'ACF dim':>7} "
-          f"{'drift78':>8} {'share78':>7} {'v2':>8} {'var/MD':>6} {'D':>5} {'err%':>6} {'D>MD':>5} {'pass':>5}  periods")
+          f"{'drift78':>8} {'share78':>7} {'v2':>8} {'var/MD':>6} {'D':>5} {'err%':>6} {'D>MD':>5} {'pass':>5} {'latent':>6}  periods")
     for arm in arms:
         rr = [r for r in results if r["arm"] == arm]
 
@@ -481,11 +601,13 @@ def summarize_arms(results: list[dict]) -> None:
               f"{med('env100'):>6.3f} {med('dc_share_max_dim'):>6.2f} {med('acf100_max_dim'):>7.2f} {med('drift78'):>+8.3f} "
               f"{med('share78'):>7.2f} {med('v2_nm2_per_ns2'):>+8.4f} {med('var_over_md'):>6.2f} {med('D_ratio'):>5.2f} "
               f"{med('err_percent'):>6.1f} {np.mean([x['D_ratio'] > 1 for x in rr]) * 100:>4.0f}% "
-              f"{np.mean([x['pass'] for x in rr]) * 100:>4.0f}%  " + ", ".join(f"{p:g}" for p in periods))
-    print(f"medians over all evaluated checkpoints; pass = Σρ <= {PASS_RHO_SUM}, DC dim < {PASS_DC_DIM}, "
-          f"|ACF100| dim < {PASS_ACF_DIM}, share78 < {PASS_SHARE78}")
+              f"{np.mean([x['pass'] for x in rr]) * 100:>4.0f}% {np.mean([x['latent_pass'] for x in rr]) * 100:>5.0f}%  "
+              + ", ".join(f"{p:g}" for p in periods))
+    rule = rule_text(var_range, max_err)
+    print(f"medians over all evaluated checkpoints; {rule}")
 
-    print("\nverdicts (each run judged on its last four checkpoints: 20-50k for 50k runs, 70-100k for 100k runs;"
+    print(f"\nverdicts under: {rule}")
+    print("(each run judged on its last four checkpoints: 20-50k for 50k runs, 70-100k for 100k runs;"
           " a seed passes with >= 3 of 4; arm pass = all seeds, promising = majority, closed = otherwise)")
     for arm in arms:
         rr = [r for r in results if r["arm"] == arm]
@@ -505,7 +627,8 @@ def summarize_arms(results: list[dict]) -> None:
             late = _late_window(n_it)
             have = [it for it in late if it in mine]
             ok = sum(mine[it]["pass"] for it in have)
-            line = f"    {run:<32} {n_it // 1000}k run: late {late[0] // 1000}-{late[-1] // 1000}k {ok}/{len(have)} pass"
+            line = (f"    {run:<32} {n_it // 1000}k run: late {late[0] // 1000}-{late[-1] // 1000}k {ok}/{len(have)} pass"
+                    f" (latent {sum(mine[it]['latent_pass'] for it in have)}/{len(have)})")
             if n_it > 50_000:
                 early = [it for it in _late_window(50_000) if it in mine]
                 if early:
@@ -529,6 +652,38 @@ def summarize_arms(results: list[dict]) -> None:
         print("\n".join(lines))
 
 
+def report_repeatability(rows: list[dict], var_range: tuple | None = None, max_err: float | None = None) -> None:
+    """For checkpoints evaluated under several rollout seeds: the pass flag and the deciding columns per seed."""
+    by_ckpt: dict = {}
+    for r in rows:
+        by_ckpt.setdefault((r["run"], r["arm"], r["iteration"]), []).append(r)
+    multi = {k: v for k, v in by_ckpt.items() if len({x.get("rollout_seed") for x in v}) > 1}
+    if not multi:
+        return
+    print("\nrepeatability (one line per rollout seed; config = the original evaluation draw)")
+    for (run, _arm, it), rr in sorted(multi.items()):
+        flags = [checkpoint_passes(x, var_range, max_err) for x in rr]
+        verdict = "all PASS" if all(flags) else "all fail" if not any(flags) else "SPLIT"
+        print(f"  {run} @{it // 1000}k: {verdict}")
+        for x in sorted(rr, key=lambda x: (x.get("draw") != "config", str(x.get("rollout_seed")))):
+            tag = "config" if x.get("draw", "config") == "config" else str(x.get("rollout_seed"))
+            print(f"    seed {tag:<6} {'PASS' if checkpoint_passes(x, var_range, max_err) else 'fail':<4} "
+                  f"(latent {'PASS' if latent_passes(x) else 'fail'})  Σρ {x['rho_sum_1_30']:+.2f}  "
+                  f"DC dim {x['dc_share_max_dim']:.2f}  ACF dim {x['acf100_max_dim']:.2f}  share78 {x['share78']:.2f}  "
+                  f"var/MD {x['var_over_md']:.2f}  D {x['D_ratio']:.2f}x  err {x['err_percent']:.1f}%")
+
+
+def report_borderline(rows: list[dict], var_range: tuple | None = None, max_err: float | None = None) -> None:
+    """Checkpoints failing exactly one criterion, within 20 % of its threshold (candidates for extra rollout seeds)."""
+    hits = [r for r in rows if r.get("draw", "config") == "config" and is_borderline(r, var_range, max_err)]
+    if not hits:
+        return
+    print("\nborderline (fails one criterion, within 20 % of its threshold):")
+    for r in sorted(hits, key=lambda r: (r["run"], r["iteration"])):
+        name, v, thr, _ = failed_criteria(r, var_range, max_err)[0]
+        print(f"  {r['run']} @{r['iteration'] // 1000}k: {name} {v:.3f} vs threshold {thr:g}")
+
+
 def merge_results(paths: list[str]) -> list[dict]:
     """Rows from several arm-eval JSON files; for a repeated (run, arm, iteration) the later file wins.
     run_length is recomputed from each run directory's snapshots, so rows written before a resume
@@ -536,15 +691,14 @@ def merge_results(paths: list[str]) -> list[dict]:
     merged: dict = {}
     for path in paths:
         for r in json.loads(Path(path).read_text()):
-            merged[(r["run"], r["arm"], r["iteration"])] = r
+            merged[(r["run"], r["arm"], r["iteration"], r.get("rollout_seed", r.get("seed")))] = r
     rows = list(merged.values())
     for r in rows:
         run_dir = Path(r["snapshot"]).parent
         if run_dir.is_dir():
             r["run_length"] = _run_length(run_dir)
-        if "pass" not in r:
-            r["pass"] = checkpoint_passes(r)
-    return sorted(rows, key=lambda r: (r["arm"], r["run"], r["iteration"]))
+        r.setdefault("draw", "config")
+    return sorted(rows, key=lambda r: (r["arm"], r["run"], r["iteration"], str(r.get("rollout_seed", ""))))
 
 
 def cmd_chunked(args) -> list[dict]:
@@ -721,7 +875,113 @@ def self_test() -> None:
     # 9. a diverged run: every saved checkpoint evaluated, the stop reported, the seed counted as not passing
     _control_diverged_run()
     print("control 9: a diverged run is evaluated on all its saved checkpoints and reported as DIVERGED")
+
+    _control_variance_range()
+    print("control 10: the false passes (adam_default s0 @40k, two collapsed running_stats rows) pass without the "
+          "variance range and fail with it; a genuine pass passes both ways")
+    _control_draw_seeds()
+    print("control 11: the config seed reproduces the original draws; new rollout seeds use disjoint ones")
+    _control_chain_storage()
+    print("control 12: chain indices are fixed and reused; stored latents and block sums are chain-aligned and exact")
+    _control_merge_repeatability()
+    print("control 13: merged rows keep every rollout seed; verdicts use the config draw; splits and borderline rows are reported")
+    _control_err_and_latent()
+    print("control 14: --max-err fails a row on error alone (and flags it borderline within 20 %); latent_pass is "
+          "independent of the physics columns")
     print("all positive controls passed")
+
+
+def _row(rho, dc, acf, share, var, **kw) -> dict:
+    return {"rho_sum_1_30": rho, "dc_share_max_dim": dc, "acf100_max_dim": acf, "share78": share, "var_over_md": var, **kw}
+
+
+def _control_variance_range() -> None:
+    false_passes = {"adam_default s0 @40k": _row(-0.08, 0.02, 0.01, -0.03, 0.12),
+                    "running_stats c7810278 s4 @20k (as trained)": _row(-0.00, 0.02, 0.02, -0.00, 0.10),
+                    "running_stats c7810278 s5 @20k (as trained)": _row(-0.00, 0.02, 0.01, 0.00, 0.11)}
+    genuine = _row(-0.17, 0.02, 0.02, 0.09, 0.65)                       # m128 c7675778 s2 @40k
+    for name, r in false_passes.items():
+        assert checkpoint_passes(r), f"{name} should pass without the range (the earlier tables)"
+        assert not checkpoint_passes(r, (0.4, 1.5)), f"{name} should fail with the range"
+    assert checkpoint_passes(genuine) and checkpoint_passes(genuine, (0.4, 1.5))
+    assert not checkpoint_passes(_row(0.0, 0.0, 0.0, 0.0, 1.6), (0.4, 1.5))   # the upper bound too
+
+
+def _control_draw_seeds() -> None:
+    assert draw_seeds(3, 3) == {"rollout": 3, "latent": 3, "z0": 0, "plateau": (11, 12)}
+    used = [3, 0, 11, 12]
+    for s in (1001, 1002):
+        d = draw_seeds(s, 3)
+        mine = [d["rollout"], d["latent"], d["z0"], *d["plateau"]]
+        assert len(set(mine)) == 5 and not set(mine) & set(used), (s, mine, used)
+        used += mine
+
+
+def _control_chain_storage() -> None:
+    import tempfile
+    rng = np.random.default_rng(1)
+    n, nb, m, c, nz = 50, 6, 4, 3, 5
+    d = rng.normal(size=(n, nb * m, c)).astype(np.float32)
+    lat = rng.normal(size=(nb, n, nz)).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        idx = chain_indices(Path(tmp), 8, n)
+        assert np.array_equal(idx, chain_indices(Path(tmp), 8, n)) and len(set(idx.tolist())) == 8
+        try:
+            chain_indices(Path(tmp), 9, n)
+            raise AssertionError("a different chain count should be refused")
+        except SystemExit:
+            pass
+        f = store_chains(Path(tmp), idx, d, lat, 0.17, m, {"run": "run_x", "iteration": 40000, "rollout_seed": 1001,
+                                                            "block_len": m, "sigma_nm": 0.17, "arm": "x"})
+        z = np.load(f)
+        assert z["latents"].shape == (nb, 8, nz) and z["block_sums_nm"].shape == (8, nb, c)
+        j, k = 3, 2                                                     # chain idx[j], block k
+        assert np.allclose(z["block_sums_nm"][j, k], d[idx[j], k * m:(k + 1) * m].sum(0) * 0.17, atol=1e-6)
+        assert np.array_equal(z["latents"][:, j], lat[:, idx[j]]) and np.array_equal(z["chain_indices"], idx)
+
+
+def _control_merge_repeatability() -> None:
+    import contextlib
+    import io
+    import tempfile
+    base = dict(rho_sum_1_3=0.0, rho_sum_4_30=0.0, env100=0.01, drift78=0.0, v2_nm2_per_ns2=0.0, D_ratio=1.0,
+                err_percent=10.0, period_blocks=2.0, cycle_share=0.1, arm="m128", run="run_m128_c1_seed5",
+                n_iterations=100000, rollbacks=0, diverged_at=None, seed=5)
+    with tempfile.TemporaryDirectory() as tmp:
+        snap = str(Path(tmp) / "run_m128_c1_seed5" / "snap_080000.pt")
+        good, bad = _row(0.1, 0.02, 0.02, 0.05, 0.6), _row(0.9, 0.02, 0.02, 0.05, 0.6)
+        a = [{**base, **bad, "iteration": 80000, "snapshot": snap}]                       # an old row: no rollout_seed
+        b = [{**base, **good, "iteration": 80000, "snapshot": snap, "rollout_seed": 1001, "draw": "new"},
+             {**base, **_row(0.33, 0.02, 0.02, 0.05, 0.6), "iteration": 90000, "snapshot": snap,
+              "rollout_seed": 5, "draw": "config"}]
+        fa, fb = Path(tmp) / "a.json", Path(tmp) / "b.json"
+        fa.write_text(json.dumps(a))
+        fb.write_text(json.dumps(b))
+        rows = merge_results([str(fa), str(fb)])
+        assert len(rows) == 3, rows                                   # both seeds of @80k kept
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            summarize_arms(rows)
+            report_repeatability(rows)
+            report_borderline(rows)
+        out = buf.getvalue()
+        assert "run_m128_c1_seed5 @80k: SPLIT" in out, out
+        assert "run_m128_c1_seed5 @90k: Σρ 0.330 vs threshold 0.3" in out, out            # one criterion, within 20 %
+        import re
+        assert re.search(r"^m128\s+2\s", out, re.M), out                                  # 2 checkpoints, not 3 rows
+
+
+def _control_err_and_latent() -> None:
+    base = _row(0.1, 0.02, 0.02, 0.05, 0.6)
+    high_err, near_err, low_err = {**base, "err_percent": 55.0}, {**base, "err_percent": 45.0}, {**base, "err_percent": 30.0}
+    assert checkpoint_passes(high_err, (0.4, 1.5)) and not checkpoint_passes(high_err, (0.4, 1.5), 40.0)
+    assert checkpoint_passes(low_err, (0.4, 1.5), 40.0)
+    assert is_borderline(near_err, (0.4, 1.5), 40.0) and not is_borderline(high_err, (0.4, 1.5), 40.0)
+    assert "err <= 40%" in rule_text((0.4, 1.5), 40.0) and "no error limit" in rule_text()
+    clean_latent_bad_physics = {**_row(2.0, 0.02, 0.02, 0.9, 0.6), "err_percent": 80.0}
+    invariant = {**_row(0.1, 0.50, 0.02, 0.05, 0.6), "err_percent": 20.0}
+    assert latent_passes(clean_latent_bad_physics) and not checkpoint_passes(clean_latent_bad_physics)
+    assert not latent_passes(invariant) and not checkpoint_passes(invariant)
 
 
 def _control_diverged_run() -> None:
@@ -816,6 +1076,15 @@ def main(argv=None) -> None:
                          "for runs configured to 100k)")
     ap.add_argument("--strip-running-stats", action="store_true",
                     help="arm-eval: evaluate running-stats checkpoints with batch statistics (as in 0b); arm label +batchstats")
+    ap.add_argument("--rollout-seeds", default=None,
+                    help="arm-eval: comma list of rollout seeds, 'config' = the original evaluation draw "
+                         "(e.g. config,1001,1002); default: config only")
+    ap.add_argument("--var-range", type=lambda t: tuple(float(x) for x in t.split(",")), default=None,
+                    help="arm-eval / summarize: also require var/MD within lo,hi to pass (e.g. 0.4,1.5); off by default")
+    ap.add_argument("--max-err", type=float, default=None,
+                    help="arm-eval / summarize: also require err <= this many percent to pass (e.g. 40); off by default")
+    ap.add_argument("--store-chains", type=int, default=0,
+                    help="arm-eval: keep latents and model-block sums of this many fixed chains per rollout (in OUT/chains)")
     ap.add_argument("--rollout-blocks", type=int, default=None,
                     help="arm-eval: decode this many blocks instead of the config's (e.g. 125 for a 160 ns M=128 rollout); "
                          "MD comparisons use the first 80 ns, MD-free horizon metrics use all of it")
@@ -829,7 +1098,9 @@ def main(argv=None) -> None:
         if not args.snapshots:
             ap.error("summarize needs one or more arm-eval JSON files")
         rows = merge_results(args.snapshots)
-        summarize_arms(rows)
+        summarize_arms(rows, args.var_range, args.max_err)
+        report_repeatability(rows, args.var_range, args.max_err)
+        report_borderline(rows, args.var_range, args.max_err)
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
         (out / "arm-eval.json").write_text(json.dumps(rows, indent=2, default=str))
@@ -843,7 +1114,9 @@ def main(argv=None) -> None:
     if args.command == "bn-batch":
         summarize_b(results)
     if args.command == "arm-eval":
-        summarize_arms(results)
+        summarize_arms(results, args.var_range, args.max_err)
+        report_repeatability(results, args.var_range, args.max_err)
+        report_borderline(results, args.var_range, args.max_err)
     (out / f"{args.command}.json").write_text(json.dumps(results, indent=2, default=str))
     print(f"\nwrote {out / (args.command + '.json')}")
 

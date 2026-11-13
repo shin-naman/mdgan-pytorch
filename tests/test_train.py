@@ -376,6 +376,44 @@ class TestBatch1Probes:
         with pytest.raises(ValueError, match="window_offset_max_steps"):
             Trainer(tiny(window_offset_max_steps=5), WindowDataset(brownian(), 8, 1), tmp_path / "run")
 
+    @pytest.mark.parametrize("position", ["output", "hidden"])
+    def test_weight_decay_can_spare_batchnorm_gamma_beta(self, position):
+        """gz_weight_decay_on_norm False: no BatchNorm parameter in the decayed group; they get zero decay; every
+        other G_z parameter (biases included) is decayed; G_Y undecayed. A zero-gradient step shows it."""
+        from mdgan.models import build_models
+        c = tiny(gz_weight_decay=0.1, gz_weight_decay_on_norm=False, gz_norm_position=position)
+        gz, gy, _ = build_models(c)
+        opt = make_generator_optimizer(gz, gy, c)
+        norm = {id(p) for m in gz.modules() if isinstance(m, torch.nn.BatchNorm1d) for p in m.parameters()}
+        assert norm, "the model has BatchNorm parameters"
+        decayed = [g for g in opt.param_groups if g["weight_decay"] > 0]
+        assert len(decayed) == 1 and not {id(p) for p in decayed[0]["params"]} & norm
+        assert sorted(id(p) for g in opt.param_groups for p in g["params"]) == \
+            sorted(id(p) for p in [*gz.parameters(), *gy.parameters()])            # each parameter exactly once
+        before = {n: p.detach().clone() for n, p in gz.named_parameters()}
+        for p in [*gz.parameters(), *gy.parameters()]:
+            p.grad = torch.zeros_like(p)
+        opt.step()
+        for n, p in gz.named_parameters():
+            factor = 1.0 if id(p) in norm else 1 - c.lr * 0.1
+            torch.testing.assert_close(p.detach(), before[n] * factor, rtol=1e-6, atol=0, msg=n)
+
+    def test_weight_decay_on_norm_default_keeps_the_old_groups(self):
+        from mdgan.models import build_models
+        c = tiny(gz_weight_decay=0.1)
+        assert c.gz_weight_decay_on_norm is True
+        gz, gy, _ = build_models(c)
+        opt = make_generator_optimizer(gz, gy, c)
+        assert [[id(p) for p in g["params"]] for g in opt.param_groups] == \
+            [[id(p) for p in gz.parameters()], [id(p) for p in gy.parameters()]]
+        assert [g["weight_decay"] for g in opt.param_groups] == [0.1, 0.0]
+
+    def test_resume_refuses_a_flipped_weight_decay_on_norm(self, tmp_path):
+        out = tmp_path / "run"
+        trainer(out, tiny(gz_weight_decay=0.1, n_iterations=3)).run()
+        with pytest.raises(ValueError, match="gz_weight_decay_on_norm"):
+            trainer(out, tiny(gz_weight_decay=0.1, gz_weight_decay_on_norm=False), resume=True)
+
     def test_weight_decay_leaves_the_critic_alone(self, tmp_path):
         t = trainer(tmp_path / "run", tiny(gz_weight_decay=0.1))
         assert type(t.opt_d) is torch.optim.Adam and t.opt_d.param_groups[0]["weight_decay"] == 0
@@ -393,6 +431,27 @@ class TestBatch1Probes:
         assert all(getattr(ck.config, k) == v for k, v in probe.items())
         evals = jsonl(straight / "evaluations.jsonl")
         assert [e["iteration"] for e in evals] == [3, 6] and all(np.isfinite(e["err_percent"]) for e in evals)
+
+
+# =============================================================================
+class TestRunningStatsTraining:
+    def test_running_stats_do_not_change_training(self, tmp_path):
+        """use_running_stats only adds buffers that training-mode BatchNorm updates but never reads, and no
+        eval-mode call is reachable from a training step: every parameter and every logged W are bit-identical
+        with and without it. (Evaluation, which reads the buffers, is where the arm differs.)"""
+        trainer(tmp_path / "off", tiny(use_running_stats=False)).run()
+        trainer(tmp_path / "on", tiny(use_running_stats=True)).run()
+        off, on = load_checkpoint(tmp_path / "off" / LATEST), load_checkpoint(tmp_path / "on" / LATEST)
+        buffers = ("running_mean", "running_var", "num_batches_tracked")
+        for name in ("gz", "gy", "dg"):
+            a, b = getattr(off, name).state_dict(), getattr(on, name).state_dict()
+            params = [k for k in a if not k.endswith(buffers)]
+            assert params == [k for k in b if not k.endswith(buffers)]
+            for k in params:
+                assert torch.equal(a[k], b[k]), f"{name}.{k}"
+        w_off = [m["wasserstein"] for m in jsonl(tmp_path / "off" / "metrics.jsonl")]
+        w_on = [m["wasserstein"] for m in jsonl(tmp_path / "on" / "metrics.jsonl")]
+        assert w_off == w_on and len(w_off) > 0
 
 
 # =============================================================================
@@ -441,16 +500,53 @@ class TestCriticInput:
         torch.testing.assert_close(v, expected, rtol=0, atol=1e-6)
         assert v[0, m, 0].item() == pytest.approx(0.5 * (m + 1))       # no reset at the block boundary
 
+    def test_scaled_positions_divide_by_the_constant(self):
+        m = TINY["block_len"]
+        x = torch.full((2, 2 * m, 3), 0.5)
+        torch.testing.assert_close(critic_view(x, "positions_scaled", 2.5), critic_view(x, "positions") / 2.5,
+                                   rtol=0, atol=0)
+
+    def _scaled(self, **kw):
+        ratio = WindowDataset(brownian(), TINY["block_len"], 1).position_rms_ratio
+        return tiny(critic_input="positions_scaled", critic_position_scale=ratio, **kw), ratio
+
+    def test_scale_must_match_the_training_windows_within_1_percent(self, tmp_path):
+        c, ratio = self._scaled()
+        trainer(tmp_path / "ok", tiny(critic_input="positions_scaled", critic_position_scale=ratio * 1.009))
+        with pytest.raises(ValueError, match="1 %"):
+            trainer(tmp_path / "off", tiny(critic_input="positions_scaled", critic_position_scale=ratio * 1.02))
+
+    def test_dataset_json_records_the_ratio_and_metadata_does_not(self, tmp_path):
+        c, ratio = self._scaled(n_iterations=3)
+        trainer(tmp_path / "run", c).run()
+        written = json.loads((tmp_path / "run" / "dataset.json").read_text())
+        assert written["position_rms_ratio"] == pytest.approx(ratio, rel=1e-12)
+        assert "position_rms_ratio" not in WindowDataset(brownian(), TINY["block_len"], 1).metadata
+
+    def test_positions_scaled_trains_and_resumes_bit_exactly(self, tmp_path):
+        c, _ = self._scaled()
+        short, _ = self._scaled(n_iterations=3)
+        trainer(tmp_path / "straight", c).run()
+        trainer(tmp_path / "short", short).run()
+        trainer(tmp_path / "short", c, resume=True).run()
+        assert_same_weights(weights(tmp_path / "straight" / LATEST), weights(tmp_path / "short" / LATEST))
+
     def test_unknown_view_rejected(self):
         with pytest.raises(ValueError, match="critic_input"):
             critic_view(torch.zeros(1, 2, 3), "velocities")
         with pytest.raises(ValueError, match="critic_input"):
             tiny(critic_input="velocities")
 
-    def test_positions_reach_both_terms_of_training(self, tmp_path, monkeypatch):
-        """Every critic call gets cumsum(real) and cumsum(fake); the generator call gets cumsum(fake)."""
+    @pytest.mark.parametrize("view", ["positions", "positions_scaled"])
+    def test_positions_reach_both_terms_of_training(self, tmp_path, monkeypatch, view):
+        """Every critic call gets cumsum(real) and cumsum(fake) (divided by the scale for positions_scaled);
+        the generator call gets the same of its fake."""
         import mdgan.train as train_module
-        t = trainer(tmp_path / "run", tiny(critic_input="positions", n_iterations=1))
+        if view == "positions":
+            c, div = tiny(critic_input="positions", n_iterations=1), 1.0
+        else:
+            c, div = self._scaled(n_iterations=1)
+        t = trainer(tmp_path / "run", c)
         sampled, fakes, critic_in, gen_in = [], [], [], []
         sample, make, crit, gen = t.dataset.sample, train_module.make_fake_window, train_module.critic_loss, train_module.generator_loss
 
@@ -480,9 +576,9 @@ class TestCriticInput:
         n = TINY["n_critic"]
         assert len(critic_in) == n and len(sampled) == n and len(gen_in) == 1 and len(fakes) == n + 1
         for i in range(n):
-            torch.testing.assert_close(critic_in[i][0], torch.cumsum(sampled[i], dim=1), rtol=0, atol=0)
-            torch.testing.assert_close(critic_in[i][1], torch.cumsum(fakes[i], dim=1), rtol=0, atol=0)
-        torch.testing.assert_close(gen_in[0], torch.cumsum(fakes[n], dim=1), rtol=0, atol=0)
+            torch.testing.assert_close(critic_in[i][0], torch.cumsum(sampled[i], dim=1) / div, rtol=0, atol=0)
+            torch.testing.assert_close(critic_in[i][1], torch.cumsum(fakes[i], dim=1) / div, rtol=0, atol=0)
+        torch.testing.assert_close(gen_in[0], torch.cumsum(fakes[n], dim=1) / div, rtol=0, atol=0)
 
     def test_gradient_penalty_is_measured_on_the_position_input(self):
         """With D(x) = sum(x), the input gradient is all ones: norm sqrt(2M C) on positions. Had the penalty

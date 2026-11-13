@@ -113,6 +113,12 @@ class WindowDataset:
         self.window_std_nm = float(windows.std())
         if not np.isfinite(self.window_std_nm) or self.window_std_nm <= 0:
             raise ValueError("training windows have zero or non-finite spread")
+        # RMS of the cumulative positions over RMS of the increments, pooled over windows, steps and axes
+        # (scale-free, so sigma cancels). The constant the "positions_scaled" critic input divides by;
+        # written to dataset.json and checked against Config.critic_position_scale, but not part of
+        # metadata, which resume compares for equality with checkpoints that predate it.
+        w64 = windows.astype(np.float64)
+        self.position_rms_ratio = float(np.sqrt((np.cumsum(w64, axis=1) ** 2).mean()) / np.sqrt((w64 ** 2).mean()))
         # sigma is the scale actually applied: the spread, or 1 for the unscaled ablation.
         self.scale_inputs = bool(scale_inputs)
         self.sigma_nm = self.window_std_nm if self.scale_inputs else 1.0

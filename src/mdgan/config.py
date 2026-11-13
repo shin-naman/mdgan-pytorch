@@ -22,7 +22,7 @@ from mdgan._util import positive_int
 PHASE_MODES = ("single", "all")
 INIT_SCHEMES = ("pytorch", "chainer")    # see mdgan.models.init
 GZ_NORM_POSITIONS = ("output", "hidden")  # see mdgan.models.latent_transition
-CRITIC_INPUTS = ("increments", "positions")  # see mdgan.train.critic_view
+CRITIC_INPUTS = ("increments", "positions", "positions_scaled")  # see mdgan.train.critic_view
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,7 @@ class Config:
     # Batch-1 reproduction probes on G_z (paper behaviour at these defaults; mdgan.models.latent_transition):
     gz_additive_noise_std: float = 0.0  # > 0: input z + N(0, s^2) instead of [z, r]
     gz_weight_decay: float = 0.0        # > 0: AdamW decoupled decay on G_z parameters only
+    gz_weight_decay_on_norm: bool = True  # False: no decay on G_z's BatchNorm gamma/beta (biases still decayed)
     gz_dropout: float = 0.0             # > 0: dropout after G_z's three hidden activations (training)
     gz_norm_position: str = "output"    # "hidden": Affine(H->H) -> BatchNorm(H) -> Affine(H->n_z)
 
@@ -48,6 +49,7 @@ class Config:
     scale_inputs: bool = True       # divide by sigma; False is the unscaled ablation
     window_offset_max_steps: int = 0  # > 0: each training window starts at a fresh offset in [0, K] steps
     critic_input: str = "increments"  # "positions": the critic sees cumsum(window) over all 2M steps
+    critic_position_scale: float | None = None  # "positions_scaled": cumsum(window) / this (the training set's RMS ratio)
 
     # --- training (WGAN-GP) ---------------------------------------------------------------
     batch_size: int = 64
@@ -88,12 +90,19 @@ class Config:
             raise ValueError("gz_additive_noise_std must be >= 0")
         if not self.gz_weight_decay >= 0.0:
             raise ValueError("gz_weight_decay must be >= 0")
+        if not isinstance(self.gz_weight_decay_on_norm, bool):
+            raise ValueError("gz_weight_decay_on_norm must be true or false")
         if not 0.0 <= self.gz_dropout < 1.0:
             raise ValueError("gz_dropout must be in [0, 1)")
         if any(int(i) != i or i <= 0 or i % self.checkpoint_every for i in self.full_checkpoint_iterations):
             raise ValueError("full_checkpoint_iterations must be positive multiples of checkpoint_every")
         if self.critic_input not in CRITIC_INPUTS:
             raise ValueError(f"critic_input must be one of {CRITIC_INPUTS}")
+        if self.critic_input == "positions_scaled":
+            if not (isinstance(self.critic_position_scale, (int, float)) and self.critic_position_scale > 0):
+                raise ValueError("critic_input 'positions_scaled' needs critic_position_scale > 0")
+        elif self.critic_position_scale is not None:
+            raise ValueError("critic_position_scale is only used with critic_input 'positions_scaled'")
         if self.gz_norm_position not in GZ_NORM_POSITIONS:
             raise ValueError(f"gz_norm_position must be one of {GZ_NORM_POSITIONS}")
         if not self.lr > 0:

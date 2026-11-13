@@ -1,0 +1,43 @@
+# Batch 5, resumes: 3 jobs. Batch-4 positions runs (cluster 8338177) seeds 0-2, 50k -> 100k, critic on unscaled
+# positions. Each job takes its run directory in under its original name and --auto-resume continues from
+# latest.pt; configs/resume_positions.json differs from batch4_positions.json only in n_iterations, so the
+# full checkpoints stay at 20k-50k (resume refuses any other config change).
+# QUESTION: does the raw positions reading settle the way the authors' early spikes did, or stay unstable?
+# Logs get a _resume_c<Cluster> suffix. Submit from the repository root in /home, with the three batch-4
+# positions run directories present:  condor_submit tools/chtc/batch5_resume.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+executable                = tools/chtc/run_train.sh
+should_transfer_files     = YES
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+
+request_gpus              = 1
+# The container's PyTorch (2.5.1, CUDA 12.4) has GPU code for compute capability 5.0-9.0 only;
+# newer GPUs fail at the first CUDA call ('no kernel image is available'). 9.0 = H100, 8.9 = L40.
+gpus_minimum_capability   = 7.0
+gpus_maximum_capability   = 9.0
+# gpu2008: its GPU fails every job at the first CUDA call (busy or unavailable), Nov 2026
+requirements              = (Machine != "gpu2008.chtc.wisc.edu")
++WantGPULab               = true
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 5GB
+
+# ---- new runs -------------------------------------------------------------------------------------
+arguments                 = $(RUN) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=resume_positions.json"
+transfer_input_files      = src, configs/resume_positions.json, data/cache/PE.npz, run_$(RUN)
+transfer_checkpoint_files = run_$(RUN)
+transfer_output_files     = run_$(RUN)
+log                       = logs/$(RUN)_resume_c$(Cluster).log
+output                    = logs/$(RUN)_resume_c$(Cluster).out
+error                     = logs/$(RUN)_resume_c$(Cluster).err
+
+queue RUN, SEED from (
+  positions_c8338177_seed0, 0
+  positions_c8338177_seed1, 1
+  positions_c8338177_seed2, 2
+)

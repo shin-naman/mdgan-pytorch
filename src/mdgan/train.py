@@ -71,7 +71,7 @@ ROLLBACK_SEED_STRIDE = 1000
 METRIC_NAMES = ("wasserstein", "gradient_penalty", "grad_norm", "generator_loss", "fake_step_std")
 
 
-def critic_view(window: torch.Tensor, critic_input: str) -> torch.Tensor:
+def critic_view(window: torch.Tensor, critic_input: str, scale: float | None = None) -> torch.Tensor:
     """What the critic sees of a (B, 2M, C) window (Config.critic_input).
 
     "increments" (the paper as read): the step displacements themselves; returned unchanged (the same
@@ -79,20 +79,35 @@ def critic_view(window: torch.Tensor, critic_input: str) -> torch.Tensor:
     "positions": cumulative positions, cumsum over all 2M steps, with no reset at the block boundary
     and no further normalisation. Applied after the mean operation (fake windows arrive centred from
     make_fake_window) to real and fake alike, in the critic step and the generator step; the gradient
-    penalty is then built from, and differentiated with respect to, the position windows."""
+    penalty is then built from, and differentiated with respect to, the position windows.
+    "positions_scaled": the same positions divided by one fixed scalar, Config.critic_position_scale (the
+    training windows' pooled RMS ratio of positions to increments), so the critic's input has the scale of
+    the increments while keeping the growth of the positions over the window."""
     if critic_input == "increments":
         return window
-    if critic_input == "positions":
-        return torch.cumsum(window, dim=1)
-    raise ValueError(f"unknown critic_input {critic_input!r}")
+    if critic_input not in ("positions", "positions_scaled"):
+        raise ValueError(f"unknown critic_input {critic_input!r}")
+    positions = torch.cumsum(window, dim=1)
+    return positions if critic_input == "positions" else positions / scale
 
 
 def make_generator_optimizer(gz, gy, config):
-    """Adam on G_z + G_Y (the paper), or with config.gz_weight_decay > 0, AdamW with decoupled
-    decay on every G_z parameter and none on G_Y (two parameter groups). The critic's optimizer is
+    """Adam on G_z + G_Y (the paper), or with config.gz_weight_decay > 0, AdamW with decoupled decay on
+    G_z and none on G_Y. With gz_weight_decay_on_norm (the default, and the behaviour of every earlier
+    run) the decay covers every G_z parameter: two groups. With it False, G_z's BatchNorm gamma and beta
+    form their own zero-decay group (decay on gamma shrinks the latent's scale and on beta pulls its mean
+    to zero, which is what that affine exists to set); biases stay decayed. The critic's optimizer is
     never affected."""
     if config.gz_weight_decay > 0:
-        return torch.optim.AdamW([{"params": list(gz.parameters()), "weight_decay": config.gz_weight_decay},
+        if config.gz_weight_decay_on_norm:
+            return torch.optim.AdamW([{"params": list(gz.parameters()), "weight_decay": config.gz_weight_decay},
+                                      {"params": list(gy.parameters()), "weight_decay": 0.0}],
+                                     lr=config.lr, betas=config.betas)
+        norm = {id(p) for m in gz.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)
+                for p in m.parameters()}
+        return torch.optim.AdamW([{"params": [p for p in gz.parameters() if id(p) not in norm],
+                                   "weight_decay": config.gz_weight_decay},
+                                  {"params": [p for p in gz.parameters() if id(p) in norm], "weight_decay": 0.0},
                                   {"params": list(gy.parameters()), "weight_decay": 0.0}],
                                  lr=config.lr, betas=config.betas)
     return torch.optim.Adam([*gz.parameters(), *gy.parameters()], lr=config.lr, betas=config.betas)
@@ -172,6 +187,11 @@ def _check_dataset_matches_config(config: Config, dataset: WindowDataset) -> Non
     bad = {k: (v, getattr(config, k)) for k, v in pairs.items() if v != getattr(config, k)}
     if bad:
         raise ValueError(f"dataset does not match the config (dataset, config): {bad}")
+    if config.critic_input == "positions_scaled":
+        ratio = dataset.position_rms_ratio
+        if abs(config.critic_position_scale / ratio - 1) > 0.01:
+            raise ValueError(f"critic_position_scale {config.critic_position_scale} differs from these training windows' "
+                             f"position RMS ratio {ratio:.4f} by more than 1 % (recompute it for these windows)")
 
 
 class Trainer:
@@ -217,7 +237,8 @@ class Trainer:
         self.gen.manual_seed(self.config.seed)
         self.iteration = 0
         (self.out / "config.json").write_text(json.dumps(self.config.to_dict(), indent=2))
-        (self.out / "dataset.json").write_text(json.dumps(self.dataset.metadata, indent=2))
+        (self.out / "dataset.json").write_text(json.dumps(
+            {**self.dataset.metadata, "position_rms_ratio": self.dataset.position_rms_ratio}, indent=2))
         (self.out / "provenance.json").write_text(json.dumps({
             **_git_state(), "torch": torch.__version__, "python": platform.python_version(),
             "device": str(self.device), "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -269,9 +290,9 @@ class Trainer:
         real = self.dataset.sample(self.config.batch_size, generator=self.gen, device=self.device)
         with torch.no_grad():
             fake = self._fake()
-        view = self.config.critic_input
-        loss, info = critic_loss(self.dg, critic_view(real, view), critic_view(fake, view), self.config.gp_lambda,
-                                 generator=self.gen)
+        view, scale = self.config.critic_input, self.config.critic_position_scale
+        loss, info = critic_loss(self.dg, critic_view(real, view, scale), critic_view(fake, view, scale),
+                                 self.config.gp_lambda, generator=self.gen)
         self.opt_d.zero_grad(set_to_none=True)
         loss.backward()
         self.opt_d.step()
@@ -280,7 +301,7 @@ class Trainer:
     def _generator_step(self) -> dict:
         with _frozen(self.dg):
             fake = self._fake()
-            loss = generator_loss(self.dg, critic_view(fake, self.config.critic_input))
+            loss = generator_loss(self.dg, critic_view(fake, self.config.critic_input, self.config.critic_position_scale))
             self.opt_g.zero_grad(set_to_none=True)
             loss.backward()
             self.opt_g.step()
