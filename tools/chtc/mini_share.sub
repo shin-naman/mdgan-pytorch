@@ -1,0 +1,46 @@
+# Test bed 8c: fixed noise share sweep, a in {0.10, 0.25, 0.50, 0.70} x 5 seeds = 20 CPU jobs, 10k each.
+# configs/mini_share<100a>.json = mini_paper.json + latent_noise_share a (z' <- sqrt(1-a^2) z' + a eps after the
+# BatchNorm). The a = 0 control is 8b. Pass at a: no seed meets the failure definition and the median
+# D/D_analytic over 7-10k is within 20 %. Submit ONLY after 8b reproduced the failure.
+# Submit from the repository root in /home:  condor_submit tools/chtc/mini_share.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+executable                = tools/chtc/run_train.sh
+should_transfer_files     = YES
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 3GB
+arguments                 = $(ARM)_c$(Cluster)_seed$(SEED) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=mini_$(ARM).json DATA=cage_mini.npz DEVICE=cpu"
+transfer_input_files      = src, configs/mini_$(ARM).json, data/cache/cage_mini.npz
+transfer_checkpoint_files = run_$(ARM)_c$(Cluster)_seed$(SEED)
+transfer_output_files     = run_$(ARM)_c$(Cluster)_seed$(SEED)
+log                       = logs/$(ARM)_c$(Cluster)_seed$(SEED).log
+output                    = logs/$(ARM)_c$(Cluster)_seed$(SEED).out
+error                     = logs/$(ARM)_c$(Cluster)_seed$(SEED).err
+
+queue ARM, SEED from (
+  share010, 0
+  share010, 1
+  share010, 2
+  share010, 3
+  share010, 4
+  share025, 0
+  share025, 1
+  share025, 2
+  share025, 3
+  share025, 4
+  share050, 0
+  share050, 1
+  share050, 2
+  share050, 3
+  share050, 4
+  share070, 0
+  share070, 1
+  share070, 2
+  share070, 3
+  share070, 4
+)

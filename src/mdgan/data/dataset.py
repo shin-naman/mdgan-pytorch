@@ -129,6 +129,9 @@ class WindowDataset:
         self.n_windows = int(self._windows.shape[0])
         self.n_trajectories = system.n_trajectories
         self.source_md5 = list(system.meta.get("md5", []))
+        # a synthetic system's exact long-time D (mdgan.data.synthetic), carried to dataset.json; None for MD
+        d_exact = system.meta.get("D_exact_m2s")
+        self.analytic_D_m2s = float(d_exact) if d_exact is not None else None
 
     # --- access ----------------------------------------------------------------------------
 

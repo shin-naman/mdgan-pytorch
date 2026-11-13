@@ -336,7 +336,7 @@ class TestAblation:
 class TestBatch1Probes:
     PROBES = [{"gz_additive_noise_std": 0.5}, {"gz_weight_decay": 0.1}, {"gz_dropout": 0.2},
               {"block_len": 16}, {"gz_norm_position": "hidden"}, {"window_offset_max_steps": 5},
-              {"critic_input": "positions"}]
+              {"critic_input": "positions"}, {"latent_noise_share": 0.25}]
 
     def test_default_generator_optimizer_is_the_paper_adam(self):
         from mdgan.models import build_models
@@ -523,6 +523,15 @@ class TestCriticInput:
         assert written["position_rms_ratio"] == pytest.approx(ratio, rel=1e-12)
         assert "position_rms_ratio" not in WindowDataset(brownian(), TINY["block_len"], 1).metadata
 
+    def test_dataset_json_records_the_analytic_D_of_a_synthetic_system(self, tmp_path):
+        from mdgan.data.synthetic import CageWalk
+        walk = CageWalk.miniature()
+        trainer(tmp_path / "syn", tiny(n_iterations=3), system=walk.simulate(6, 200, seed=1)).run()
+        written = json.loads((tmp_path / "syn" / "dataset.json").read_text())
+        assert written["D_analytic_m2s"] == walk.diffusion_coefficient_m2s()
+        trainer(tmp_path / "md", tiny(n_iterations=3)).run()                         # an MD-like system: none
+        assert "D_analytic_m2s" not in json.loads((tmp_path / "md" / "dataset.json").read_text())
+
     def test_positions_scaled_trains_and_resumes_bit_exactly(self, tmp_path):
         c, _ = self._scaled()
         short, _ = self._scaled(n_iterations=3)
@@ -700,6 +709,26 @@ class TestCluster:
         assert [ln.split()[1] for ln in lines if ln.startswith("eval ")] == ["3", "6"]
         trainer(tmp_path / "quiet").run()
         assert capsys.readouterr().out == ""                         # library default stays silent
+
+    def test_synthetic_npz_loads_and_trains_from_the_command_line(self, tmp_path):
+        """The cage walk saved to a file passes load_system (generated data has no preprocessing version) and trains
+        through main(), as python -m mdgan.train runs it; an unknown process without a version is still refused."""
+        from mdgan.data.preprocess import SystemData
+        from mdgan.data.synthetic import CageWalk
+        path = tmp_path / "cage.npz"
+        CageWalk.miniature().simulate(6, 200, seed=1).save(path)
+        loaded = load_system(str(path))
+        assert loaded.meta["process"] == "cage_walk" and "D_exact_m2s" in loaded.meta
+        cfg = tmp_path / "c.json"
+        cfg.write_text(json.dumps(tiny(n_iterations=3).to_dict()))
+        out = tmp_path / "run"
+        assert main([str(path), "--out", str(out), "--config", str(cfg), "--log-every", "1", "--no-eval"]) == 0
+        assert json.loads((out / "dataset.json").read_text())["D_analytic_m2s"] == loaded.meta["D_exact_m2s"]
+        other = SystemData(name="x", displacements=loaded.displacements, dt_ps=10.0, box_nm=loaded.box_nm,
+                           meta={"process": "something_else"})
+        other.save(tmp_path / "other.npz")
+        with pytest.raises(ValueError, match="preprocess version"):
+            load_system(str(tmp_path / "other.npz"))
 
     def test_load_system_from_cache_and_refuse_stale_versions(self, tmp_path):
         cache, system = self._cache(tmp_path)

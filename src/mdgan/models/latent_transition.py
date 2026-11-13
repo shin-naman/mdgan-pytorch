@@ -46,7 +46,8 @@ class LatentTransitionGenerator(nn.Module):
                  use_running_stats: bool = False,
                  gz_additive_noise_std: float = 0.0,
                  gz_dropout: float = 0.0,
-                 gz_norm_position: str = "output"):
+                 gz_norm_position: str = "output",
+                 latent_noise_share: float = 0.0):
         super().__init__()
 
         positive_int("latent_dim", latent_dim)
@@ -56,6 +57,8 @@ class LatentTransitionGenerator(nn.Module):
             raise ValueError("gz_additive_noise_std must be >= 0")
         if not 0.0 <= gz_dropout < 1.0:
             raise ValueError("gz_dropout must be in [0, 1)")
+        if not 0.0 <= latent_noise_share < 1.0:
+            raise ValueError("latent_noise_share must be in [0, 1)")
         if gz_norm_position not in NORM_POSITIONS:
             raise ValueError(f"gz_norm_position must be one of {NORM_POSITIONS}")
 
@@ -65,6 +68,7 @@ class LatentTransitionGenerator(nn.Module):
         self.use_running_stats = use_running_stats
         self.gz_additive_noise_std = float(gz_additive_noise_std)
         self.gz_dropout = float(gz_dropout)
+        self.latent_noise_share = float(latent_noise_share)
         self.gz_norm_position = gz_norm_position
 
         in_features = latent_dim if self.additive else latent_dim + noise_dim
@@ -99,8 +103,10 @@ class LatentTransitionGenerator(nn.Module):
 
     @property
     def noise_width(self) -> int:
-        """Columns of the noise vector forward() expects in the current mode."""
-        return self._base_noise_width + (3 * self.hidden_dim if self._uses_masks else 0)
+        """Columns of the noise vector forward() expects in the current mode: the transition noise, then (training
+        with dropout) the masks, then (latent_noise_share > 0) n_z standard normals for the fixed noise share."""
+        return (self._base_noise_width + (3 * self.hidden_dim if self._uses_masks else 0)
+                + (self.latent_dim if self.latent_noise_share > 0 else 0))
 
     def _drop(self, h: torch.Tensor, u: torch.Tensor | None) -> torch.Tensor:
         if u is None:
@@ -121,8 +127,14 @@ class LatentTransitionGenerator(nn.Module):
         return self.output_layer(h) if self.gz_norm_position == "output" else self.tail_layer(h)
 
     def _head(self, normed: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
-        """z' from the normalised tensor."""
-        return normed if self.gz_norm_position == "output" else self.output_layer(normed)
+        """z' from the normalised tensor. With latent_noise_share a > 0 (the fixed noise share, after the
+        BatchNorm): z' <- sqrt(1 - a^2) z' + a eps, eps the last n_z columns of r (standard normal), so a fraction a^2
+        of each step's variance is fresh noise the map cannot learn away."""
+        out = normed if self.gz_norm_position == "output" else self.output_layer(normed)
+        if self.latent_noise_share > 0:
+            a = self.latent_noise_share
+            out = (1.0 - a * a) ** 0.5 * out + a * r[:, -self.latent_dim:]
+        return out
 
     # --- interface ------------------------------------------------------------------------------
     def forward(self, z: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
@@ -161,6 +173,9 @@ class LatentTransitionGenerator(nn.Module):
         if self._uses_masks:
             u = torch.rand(batch, 3 * self.hidden_dim, device=at, dtype=dtype, generator=generator)
             r = torch.cat((r, u), dim=1)
+        if self.latent_noise_share > 0:
+            eps = torch.randn(batch, self.latent_dim, device=at, dtype=dtype, generator=generator)
+            r = torch.cat((r, eps), dim=1)
         return r.to(device) if device is not None else r
 
     def unroll(self, z0: torch.Tensor, steps: int,

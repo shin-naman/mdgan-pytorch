@@ -238,7 +238,9 @@ class Trainer:
         self.iteration = 0
         (self.out / "config.json").write_text(json.dumps(self.config.to_dict(), indent=2))
         (self.out / "dataset.json").write_text(json.dumps(
-            {**self.dataset.metadata, "position_rms_ratio": self.dataset.position_rms_ratio}, indent=2))
+            {**self.dataset.metadata, "position_rms_ratio": self.dataset.position_rms_ratio,
+             **({"D_analytic_m2s": self.dataset.analytic_D_m2s} if self.dataset.analytic_D_m2s is not None else {})},
+            indent=2))
         (self.out / "provenance.json").write_text(json.dumps({
             **_git_state(), "torch": torch.__version__, "python": platform.python_version(),
             "device": str(self.device), "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -445,9 +447,12 @@ def load_system(source: str, cache: str | None = None):
     """A system from an MD_data/<system> directory (preprocessed, with optional cache) or
     directly from a preprocessed cache .npz (no .xtc files or mdtraj needed)."""
     from mdgan.data.preprocess import PREPROCESS_VERSION, SystemData, process_system
+    from mdgan.data.synthetic import SYNTHETIC_PROCESSES
     path = Path(source)
     if path.is_file():
         system = SystemData.load(path)
+        if system.meta.get("process") in SYNTHETIC_PROCESSES:      # generated, never preprocessed: no version to check
+            return system
         version = system.meta.get("preprocess_version")
         if version != PREPROCESS_VERSION:
             raise ValueError(f"{path} was written by preprocess version {version}; this code is "

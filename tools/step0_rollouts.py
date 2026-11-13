@@ -267,6 +267,7 @@ def trajectory_metrics(d_model: torch.Tensor, sigma_nm: float, cfg, ref: np.ndar
     a, b = fit_ballistic(msd, dt_gen)
     st = diag_runs._block_stats(d_model[:, :n_steps].numpy() * sigma_nm, block_steps or cfg.block_len)
     out = {"err_percent": float(err(msd, dt_gen, ref, dt_ref, *cfg.err_window_ps)), "D_ratio": float(d_gen / d_md),
+           "D_gen_m2s": float(d_gen),
            "drift78": float(b * 78.0 / a) if a > 0 else float("nan"),
            "share78": share78(a, b), "v2_nm2_per_ns2": float(b),
            "var_over_md": st["var"] / md_block["var"], "rho_sum_1_30": st["corr_sum"], "rho@1": st["corr"].get(1),
@@ -492,7 +493,9 @@ def cmd_arm_eval(args) -> list[dict]:
         ck = load_checkpoint(snap, map_location="cpu")
         cfg = ck.config
         if md is None:
-            md = _md(args.data, cfg, EVAL_BLOCK_STEPS)
+            md = _md(args.data, cfg, args.block_steps)
+            from mdgan.data.preprocess import SystemData
+            args.d_analytic = SystemData.load(args.data).meta.get("D_exact_m2s")  # synthetic systems only; read per row
         ref, dt_ref, md_block = md
         gz, gy = ck.gz.to(args.device), ck.gy.to(args.device)
         arm = _arm(snap.parent.name)
@@ -522,10 +525,13 @@ def _evaluate_one(args, i, snap, ck, cfg, gz, gy, arm, n_blocks, ref, dt_ref, md
            "rollbacks": rec["rollbacks"], "diverged_at": rec["diverged_at"], "W": rec["W"].get(ck.iteration),
            "n_iterations": cfg.n_iterations, "run_length": _run_length(snap.parent), "seed": cfg.seed,
            "block_len": cfg.block_len, "rollout_blocks": n_blocks}
-    row.update(trajectory_metrics(d, ck.sigma_nm, cfg, ref, dt_ref, md_block, EVAL_BLOCK_STEPS))
+    row.update(trajectory_metrics(d, ck.sigma_nm, cfg, ref, dt_ref, md_block, args.block_steps))
+    row["block_steps"] = args.block_steps
+    if getattr(args, "d_analytic", None):
+        row["D_ratio_analytic"] = row["D_gen_m2s"] / args.d_analytic
     ref_steps = int(round(cfg.estimation_time_ps / (dt_ref * cfg.step_skip)))
     if args.rollout_blocks and d.shape[1] > ref_steps:      # only for an explicitly longer rollout
-        row.update(horizon_metrics(d, ck.sigma_nm, dt_ref * cfg.step_skip, ref_steps, EVAL_BLOCK_STEPS))
+        row.update(horizon_metrics(d, ck.sigma_nm, dt_ref * cfg.step_skip, ref_steps, args.block_steps))
     if args.store_chains:
         idx = chain_indices(Path(args.out), args.store_chains, n_chains)
         row["chains_file"] = str(store_chains(Path(args.out), idx, d.numpy(), lat.numpy(), ck.sigma_nm, cfg.block_len,
@@ -558,7 +564,9 @@ def _fmt_a(r: dict) -> str:
          f"(1-3 {r['rho_sum_1_3']:+.2f} | 4-30 {r['rho_sum_4_30']:+.2f})  env100 {r['env100']:.3f}  "
          f"DC dim {r['dc_share_max_dim']:.2f}  |ACF100| dim {r['acf100_max_dim']:.2f}  "
          f"drift78 {r['drift78']:+.3f}  share78 {r['share78']:.2f}  v2 {r['v2_nm2_per_ns2']:+.4f}  "
-         f"var/MD {r['var_over_md']:.2f}  D {r['D_ratio']:.2f}x  err {r['err_percent']:.1f}%  "
+         f"var/MD {r['var_over_md']:.2f}  D {r['D_ratio']:.2f}x"
+         + (f" (D/D_analytic {r['D_ratio_analytic']:.2f})" if "D_ratio_analytic" in r else "")
+         + f"  err {r['err_percent']:.1f}%  "
          f"period {r['period_blocks']:.2f}  cycle {r['cycle_share'] * 100:.0f}%"
          + (f"  W {r['W']:.2f}" if r.get("W") is not None else "") + f"  rollbacks {r.get('rollbacks', 0)}"
          + (f"  [run DIVERGED at {r['diverged_at']}]" if r.get("diverged_at") is not None else ""))
@@ -1081,6 +1089,9 @@ def main(argv=None) -> None:
                          "(e.g. config,1001,1002); default: config only")
     ap.add_argument("--var-range", type=lambda t: tuple(float(x) for x in t.split(",")), default=None,
                     help="arm-eval / summarize: also require var/MD within lo,hi to pass (e.g. 0.4,1.5); off by default")
+    ap.add_argument("--block-steps", type=int, default=EVAL_BLOCK_STEPS,
+                    help="arm-eval: block length for var/MD and the Σρ columns (default 64 = 0.64 ns, as every earlier "
+                         "table; 8 for the miniature test bed)")
     ap.add_argument("--max-err", type=float, default=None,
                     help="arm-eval / summarize: also require err <= this many percent to pass (e.g. 40); off by default")
     ap.add_argument("--store-chains", type=int, default=0,

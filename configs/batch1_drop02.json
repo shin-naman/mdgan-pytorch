@@ -12,6 +12,7 @@
   "gz_weight_decay_on_norm": true,
   "gz_dropout": 0.2,
   "gz_norm_position": "output",
+  "latent_noise_share": 0.0,
   "step_skip": 1,
   "phase_mode": "single",
   "scale_inputs": true,

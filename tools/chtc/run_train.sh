@@ -4,7 +4,8 @@
 #   run_train.sh NAME SEED [extra mdgan.train arguments...]
 #
 # Expects in the job sandbox: src/ (the package), the config JSON named by $CONFIG
-# (default pe_paper.json), and PE.npz.
+# (default pe_paper.json), and the dataset named by $DATA (default PE.npz). $DEVICE selects
+# the device (default cuda; cpu for the miniature test bed).
 # Writes run_NAME/. Exit code 85 = "saved at the time limit, restart me" (HTCondor
 # checkpoint_exit_code); 0 = training finished; anything else = a real failure.
 set -euo pipefail
@@ -21,8 +22,9 @@ if [ -f "run_${NAME}/latest.pt" ]; then echo "resuming from run_${NAME}/latest.p
 
 set +e
 echo "config ${CONFIG:-pe_paper.json}"
-python -u -m mdgan.train PE.npz --out "run_${NAME}" --config "${CONFIG:-pe_paper.json}" --set "seed=${SEED}" \
-    --device cuda --auto-resume --max-hours "${MAX_HOURS:-4}" --log-every 100 "$@"
+echo "data ${DATA:-PE.npz}  device ${DEVICE:-cuda}"
+python -u -m mdgan.train "${DATA:-PE.npz}" --out "run_${NAME}" --config "${CONFIG:-pe_paper.json}" --set "seed=${SEED}" \
+    --device "${DEVICE:-cuda}" --auto-resume --max-hours "${MAX_HOURS:-4}" --log-every 100 "$@"
 status=$?
 set -e
 echo "exit ${status}  at $(date -Is)"

@@ -42,6 +42,7 @@ class Config:
     gz_weight_decay_on_norm: bool = True  # False: no decay on G_z's BatchNorm gamma/beta (biases still decayed)
     gz_dropout: float = 0.0             # > 0: dropout after G_z's three hidden activations (training)
     gz_norm_position: str = "output"    # "hidden": Affine(H->H) -> BatchNorm(H) -> Affine(H->n_z)
+    latent_noise_share: float = 0.0     # a > 0: z' <- sqrt(1 - a^2) z' + a eps after the BatchNorm (plan step 8c)
 
     # --- data ----------------------------------------------------------------------------
     step_skip: int = 1              # n_s (PE 1, E-VDF 3, PVDF 5, PVAC/E-VAC 7, PAAM/E-AAM 20)
@@ -103,6 +104,8 @@ class Config:
                 raise ValueError("critic_input 'positions_scaled' needs critic_position_scale > 0")
         elif self.critic_position_scale is not None:
             raise ValueError("critic_position_scale is only used with critic_input 'positions_scaled'")
+        if not 0.0 <= self.latent_noise_share < 1.0:
+            raise ValueError("latent_noise_share must be in [0, 1)")
         if self.gz_norm_position not in GZ_NORM_POSITIONS:
             raise ValueError(f"gz_norm_position must be one of {GZ_NORM_POSITIONS}")
         if not self.lr > 0:

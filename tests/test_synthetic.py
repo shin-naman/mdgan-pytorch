@@ -65,3 +65,45 @@ def test_reproducible_and_shaped(walk):
 def test_invalid_parameters_rejected(bad):
     with pytest.raises(ValueError, match=bad):
         CageWalk(**{bad: 0.0})
+
+
+# =============================================================================
+# The miniature test bed (plan step 8a)
+
+@pytest.fixture(scope="module")
+def mini():
+    return CageWalk.miniature()
+
+
+def test_miniature_parameters_follow_the_rule(mini):
+    assert mini.cage_rms_nm == 1.0 and mini.tau_steps == 2.0
+    assert mini.crossover_steps == pytest.approx(48.0, rel=1e-12)                 # block 6 of M = 8: inside 4-8
+    assert mini.hop_length_nm == pytest.approx(7 * mini.step_rms_nm(), rel=1e-12)  # 7-sigma hops
+    assert 32 <= mini.crossover_steps <= 64
+
+
+def test_miniature_is_subdiffusive_inside_the_critic_window(mini):
+    """Local exponent below 0.7 at blocks 1-2 (8 and 16 steps)."""
+    a = mini.local_exponent(np.array([8, 16]))
+    assert (a < 0.7).all() and 0.15 < a[0] < 0.3, a
+
+
+def test_miniature_slope_over_blocks_20_to_60_matches_kappa_h2(mini):
+    """Time-averaged MSD slope over blocks 20-60 (160-480 steps) within 5 % of the analytic kappa h^2."""
+    sim = mini.simulate(n_traj=1024, n_steps=4000, seed=11)
+    msd, _ = msd_time_averaged(sim.displacements)
+    lag = np.arange(160, 481)
+    slope = np.polyfit(lag, msd[lag], 1)[0]
+    assert slope == pytest.approx(mini.hop_rate_per_step * mini.hop_length_nm ** 2, rel=0.05)
+    assert sim.meta["D_exact_m2s"] == mini.diffusion_coefficient_m2s()
+
+
+def test_miniature_simulated_step_rms_and_hops(mini):
+    sim = mini.simulate(n_traj=256, n_steps=4000, seed=12)
+    d = sim.displacements.reshape(-1, 3).astype(np.float64)
+    assert d.std() == pytest.approx(mini.step_rms_nm(), rel=0.03)
+    # the miniature's cage rattling is large (per-axis rms ~0.9): at half the hop length (3.6 sigma of a 3D step)
+    # ~0.5 % of plain steps would count as hops; at three quarters (5.4 sigma) none do, and every hop still does
+    big = np.linalg.norm(d, axis=1) > 0.75 * mini.hop_length_nm
+    assert big.mean() == pytest.approx(mini.hop_rate_per_step, rel=0.15)
+

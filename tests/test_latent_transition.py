@@ -446,7 +446,8 @@ class TestBatch1Probes:
 
     # --- shared -------------------------------------------------------------------------------
     @pytest.mark.parametrize("kw", [{}, {"gz_additive_noise_std": 0.5}, {"gz_dropout": 0.3},
-                                    {"gz_norm_position": "hidden"},
+                                    {"gz_norm_position": "hidden"}, {"latent_noise_share": 0.5},
+                                    {"latent_noise_share": 0.5, "gz_dropout": 0.3, "gz_norm_position": "hidden"},
                                     {"gz_additive_noise_std": 0.5, "gz_dropout": 0.3, "gz_norm_position": "hidden"}])
     @pytest.mark.parametrize("training", [True, False])
     def test_trunk_norm_head_reproduce_forward(self, kw, training):
@@ -456,7 +457,47 @@ class TestBatch1Probes:
         r = m.sample_noise(16, generator=torch.Generator().manual_seed(5))
         torch.testing.assert_close(m._head(m.norm(m._trunk(z, r)), r), m(z, r), rtol=0, atol=0)
 
+    # --- fixed noise share (plan step 8c) ------------------------------------------------------
+    A = 0.6
+
+    def test_noise_share_default_draws_nothing_extra(self):
+        m = self._gz()
+        m.train()
+        assert m.latent_noise_share == 0.0 and m.noise_width == NR
+        assert m.sample_noise(4, generator=torch.Generator().manual_seed(0)).shape == (4, NR)
+
+    @pytest.mark.parametrize("position", ["output", "hidden"])
+    def test_noise_share_formula_after_the_batchnorm(self, position):
+        m = self._gz(latent_noise_share=self.A, gz_norm_position=position)
+        z = torch.rand(16, LAT)
+        r = m.sample_noise(16, generator=torch.Generator().manual_seed(6))
+        assert r.shape == (16, NR + LAT)
+        eps = r[:, NR:]
+        h = m.act(m.hidden2(m.act(m.hidden1(m.act(m.input_layer(torch.cat((z, r[:, :NR]), dim=1)))))))
+        det = m.output_norm(m.output_layer(h)) if position == "output" else m.output_layer(m.hidden_norm(m.tail_layer(h)))
+        torch.testing.assert_close(m(z, r), (1 - self.A ** 2) ** 0.5 * det + self.A * eps, rtol=0, atol=1e-6)
+
+    def test_noise_share_eps_is_standard_normal_and_last(self):
+        m = self._gz(latent_noise_share=self.A, gz_dropout=0.3)
+        m.train()
+        r = m.sample_noise(20000, generator=torch.Generator().manual_seed(8))
+        assert r.shape == (20000, NR + 3 * H + LAT)                       # noise, masks, then eps
+        eps, masks = r[:, -LAT:], r[:, NR:NR + 3 * H]
+        assert abs(eps.mean().item()) < 0.02 and abs(eps.std().item() - 1) < 0.02
+        assert masks.min() >= 0 and masks.max() < 1                        # the masks kept their columns
+
+    def test_noise_share_unroll_reproducible_and_leaves_global_rng(self):
+        m = self._gz(latent_noise_share=self.A)
+        z0 = torch.rand(8, LAT, generator=torch.Generator().manual_seed(0))
+        before = torch.get_rng_state().clone()
+        a = m.unroll(z0, 5, generator=torch.Generator().manual_seed(9))
+        b = m.unroll(z0, 5, generator=torch.Generator().manual_seed(9))
+        assert torch.equal(before, torch.get_rng_state())
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
     @pytest.mark.parametrize("kw,match", [({"gz_additive_noise_std": -0.1}, "gz_additive_noise_std"),
+                                          ({"latent_noise_share": 1.0}, "latent_noise_share"),
+                                          ({"latent_noise_share": -0.1}, "latent_noise_share"),
                                           ({"gz_dropout": 1.0}, "gz_dropout"), ({"gz_dropout": -0.1}, "gz_dropout"),
                                           ({"gz_norm_position": "input"}, "gz_norm_position")])
     def test_invalid_values_rejected(self, kw, match):

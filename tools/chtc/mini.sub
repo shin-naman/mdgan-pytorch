@@ -1,0 +1,35 @@
+# Test bed 8b: reproduce the failure at miniature scale. CPU jobs (no GPU), 5 seeds x 10k, checkpoints every 1k.
+# Miniature model (n_z 8, n_r 8, M 8, width 128) at the paper protocol (c 7, K 4, WGAN-GP lambda 10, lr 1e-4,
+# betas (0, 0.9), n_critic 5, batch 64), configs/mini_paper.json, trained on the 60 windows of the cage walk
+# (data/cache/cage_mini.npz from tools/cage_testbed.py data; first 16 steps of each of 60 trajectories).
+# Evaluate: step0_rollouts.py arm-eval ... --block-steps 8 --data data/cache/cage_mini.npz, then
+# cage_testbed.py verdict. Failure definition: >= 3 of 5 seeds show, at a checkpoint from 2k on, (period <= 10
+# blocks with >= 20 % share, or DC max dim > 0.3) and Σρ(8-step blocks) > +0.5. If not reproduced, 8c is not run.
+# Submit from the repository root in /home:  condor_submit tools/chtc/mini.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+executable                = tools/chtc/run_train.sh
+should_transfer_files     = YES
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 3GB
+arguments                 = $(ARM)_c$(Cluster)_seed$(SEED) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=mini_paper.json DATA=cage_mini.npz DEVICE=cpu"
+transfer_input_files      = src, configs/mini_paper.json, data/cache/cage_mini.npz
+transfer_checkpoint_files = run_$(ARM)_c$(Cluster)_seed$(SEED)
+transfer_output_files     = run_$(ARM)_c$(Cluster)_seed$(SEED)
+log                       = logs/$(ARM)_c$(Cluster)_seed$(SEED).log
+output                    = logs/$(ARM)_c$(Cluster)_seed$(SEED).out
+error                     = logs/$(ARM)_c$(Cluster)_seed$(SEED).err
+
+ARM = mini
+queue SEED from (
+  0
+  1
+  2
+  3
+  4
+)

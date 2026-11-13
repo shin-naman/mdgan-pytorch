@@ -23,6 +23,9 @@ import numpy as np
 from mdgan.data.preprocess import SystemData
 
 NM2_PER_PS_TO_M2_PER_S = 1e-6
+# meta["process"] values written by this module: data that was generated, not preprocessed from MD, so the
+# preprocessing-version check of a loaded .npz does not apply to it (mdgan.train.load_system)
+SYNTHETIC_PROCESSES = ("cage_walk",)
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,29 @@ class CageWalk:
         for name in ("dt_ps", "tau_steps", "cage_rms_nm", "hop_length_nm", "hop_rate_per_step"):
             if not getattr(self, name) > 0:
                 raise ValueError(f"{name} must be > 0")
+
+    @classmethod
+    def miniature(cls, crossover_steps: float = 48.0, cage_rms_nm: float = 1.0, tau_steps: float = 2.0,
+                  hop_over_step_rms: float = 7.0, dt_ps: float = 10.0) -> "CageWalk":
+        """The miniature test bed (M = 8): per-axis cage rms 1, OU relaxation 2 steps, a fixed hop length of
+        7x the per-axis step rms in a random direction, and a hop rate placing the crossover scale
+        t* = 6 s^2 / (kappa h^2) (where the cage plateau equals the hop term) at 48 steps, i.e. block 6 of
+        blocks 4-8, so the critic's 16-step window ends well before it. With these, the step rms satisfies
+        sigma^2 = 2 s^2 (1 - exp(-1/tau)) + 2 s^2 / t*, then h = 7 sigma and kappa = 6 s^2 / (h^2 t*)."""
+        sig2 = 2 * cage_rms_nm ** 2 * (1 - np.exp(-1.0 / tau_steps)) + 2 * cage_rms_nm ** 2 / crossover_steps
+        h = hop_over_step_rms * float(np.sqrt(sig2))
+        kappa = 6 * cage_rms_nm ** 2 / (h ** 2 * crossover_steps)
+        return cls(dt_ps=dt_ps, tau_steps=tau_steps, cage_rms_nm=cage_rms_nm, hop_length_nm=h, hop_rate_per_step=kappa)
+
+    @property
+    def crossover_steps(self) -> float:
+        """t* = 6 s^2 / (kappa h^2): the lag at which the hop term equals the cage plateau."""
+        return 6 * self.cage_rms_nm ** 2 / (self.hop_rate_per_step * self.hop_length_nm ** 2)
+
+    def step_rms_nm(self) -> float:
+        """Per-axis rms of one step: the OU part plus the hops' share."""
+        return float(np.sqrt(2 * self.cage_rms_nm ** 2 * (1 - np.exp(-1.0 / self.tau_steps))
+                             + self.hop_rate_per_step * self.hop_length_nm ** 2 / 3))
 
     # --- exact answers -------------------------------------------------------------------------
     def msd(self, t_steps) -> np.ndarray:
