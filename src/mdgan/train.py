@@ -185,6 +185,8 @@ def _check_dataset_matches_config(config: Config, dataset: WindowDataset) -> Non
              "scale_inputs": dataset.scale_inputs, "n_channels": dataset.n_channels,
              "window_offset_max_steps": dataset.window_offset_max_steps}
     bad = {k: (v, getattr(config, k)) for k, v in pairs.items() if v != getattr(config, k)}
+    if dataset.holdout_trajectories != tuple(sorted(config.holdout_trajectories)):      # the split, order-insensitive
+        bad["holdout_trajectories"] = (dataset.holdout_trajectories, config.holdout_trajectories)
     if bad:
         raise ValueError(f"dataset does not match the config (dataset, config): {bad}")
     if config.critic_input == "positions_scaled":
@@ -491,7 +493,7 @@ def main(argv=None) -> int:
 
     system = load_system(args.data, args.cache)
     dataset = WindowDataset(system, config.block_len, config.step_skip, config.phase_mode, config.scale_inputs,
-                            config.window_offset_max_steps)
+                            config.window_offset_max_steps, config.holdout_trajectories)
     reference = None if args.no_eval else reference_msd(system)
     trainer = Trainer(config, dataset, args.out, device=args.device, reference=reference,
                       log_every=args.log_every, resume=resume, progress=True)

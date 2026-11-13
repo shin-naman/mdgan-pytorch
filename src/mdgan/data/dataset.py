@@ -72,13 +72,23 @@ class WindowDataset:
     """The training set: scaled 2M-step coarse displacement windows and sigma."""
 
     def __init__(self, system: SystemData, block_len: int = 64, step_skip: int = 1,
-                 phase_mode: str = "single", scale_inputs: bool = True, window_offset_max_steps: int = 0):
+                 phase_mode: str = "single", scale_inputs: bool = True, window_offset_max_steps: int = 0,
+                 holdout_trajectories: tuple[int, ...] = ()):
         positive_int("block_len", block_len)
         positive_int("step_skip", step_skip)
         if phase_mode not in PHASE_MODES:
             raise ValueError(f"phase_mode must be one of {PHASE_MODES}")
         if int(window_offset_max_steps) != window_offset_max_steps or window_offset_max_steps < 0:
             raise ValueError("window_offset_max_steps must be a non-negative integer")
+        # Held-out trajectories (Config.holdout_trajectories): never enter training, sigma, the windows or the
+        # offsets; the reference MSD (built by the caller from the full system) still uses every trajectory.
+        holdout = tuple(int(i) for i in holdout_trajectories)
+        if len(set(holdout)) != len(holdout) or any(i < 0 or i >= system.n_trajectories for i in holdout):
+            raise ValueError(f"holdout_trajectories must be distinct indices in [0, {system.n_trajectories})")
+        if len(holdout) >= system.n_trajectories:
+            raise ValueError("holdout_trajectories leaves no trajectory to train on")
+        self.holdout_trajectories = tuple(sorted(holdout))
+        keep = [i for i in range(system.n_trajectories) if i not in set(holdout)]
 
         self.system_name = system.name
         self.block_len = block_len                  # M
@@ -102,7 +112,7 @@ class WindowDataset:
             raise ValueError(
                 f"training region needs {self.region_steps} fine steps but trajectories have {system.n_steps}"
             )
-        region = np.array(system.displacements[:, :self.region_steps], dtype=np.float64)   # copy
+        region = np.array(system.displacements[keep, :self.region_steps], dtype=np.float64)   # copy (training trajectories)
 
         # --- 2. One window per trajectory per phase (the offset-0 windows) ---
         series = np.concatenate([coarsen(region, step_skip, p)[:, :span] for p in phases], axis=0)   # (W, 2M+K, C)
@@ -127,7 +137,7 @@ class WindowDataset:
                         if self.window_offset_max_steps > 0 else None)
 
         self.n_windows = int(self._windows.shape[0])
-        self.n_trajectories = system.n_trajectories
+        self.n_trajectories = len(keep)                      # trajectories trained on
         self.source_md5 = list(system.meta.get("md5", []))
         # a synthetic system's exact long-time D (mdgan.data.synthetic), carried to dataset.json; None for MD
         d_exact = system.meta.get("D_exact_m2s")
@@ -175,6 +185,8 @@ class WindowDataset:
             # present only when > 0: runs without offsets keep their metadata exactly (resume compares
             # it for equality), and a run with offsets cannot be resumed with a different maximum
             **({"window_offset_max_steps": self.window_offset_max_steps} if self.window_offset_max_steps else {}),
+            # likewise present only when non-empty: the split is in dataset.json and checked on resume
+            **({"holdout_trajectories": list(self.holdout_trajectories)} if self.holdout_trajectories else {}),
         }
 
     def __len__(self) -> int:

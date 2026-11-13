@@ -43,7 +43,8 @@ def brownian(seed=0, n_traj=6, n_steps=200):
 
 
 def windows(system, c: Config) -> WindowDataset:
-    return WindowDataset(system, c.block_len, c.step_skip, c.phase_mode, c.scale_inputs, c.window_offset_max_steps)
+    return WindowDataset(system, c.block_len, c.step_skip, c.phase_mode, c.scale_inputs, c.window_offset_max_steps,
+                         c.holdout_trajectories)
 
 
 def trainer(path, c=None, system=None, **kw) -> Trainer:
@@ -336,7 +337,7 @@ class TestAblation:
 class TestBatch1Probes:
     PROBES = [{"gz_additive_noise_std": 0.5}, {"gz_weight_decay": 0.1}, {"gz_dropout": 0.2},
               {"block_len": 16}, {"gz_norm_position": "hidden"}, {"window_offset_max_steps": 5},
-              {"critic_input": "positions"}, {"latent_noise_share": 0.25}]
+              {"critic_input": "positions"}, {"latent_noise_share": 0.25}, {"holdout_trajectories": (1, 4)}]
 
     def test_default_generator_optimizer_is_the_paper_adam(self):
         from mdgan.models import build_models
@@ -362,6 +363,16 @@ class TestBatch1Probes:
             torch.testing.assert_close(p, before[f"gz.{n}"] * (1 - c.lr * 0.1), rtol=1e-6, atol=0)
         for n, p in gy.named_parameters():
             torch.testing.assert_close(p, before[f"gy.{n}"], rtol=0, atol=0)
+
+    def test_holdout_must_agree_and_cannot_change_on_resume(self, tmp_path):
+        with pytest.raises(ValueError, match="holdout_trajectories"):
+            Trainer(tiny(holdout_trajectories=(2,)), WindowDataset(brownian(), 8, 1), tmp_path / "x")
+        trainer(tmp_path / "ok", tiny(holdout_trajectories=(4, 2)), log_every=1)       # order does not matter
+        out = tmp_path / "run"
+        trainer(out, tiny(holdout_trajectories=(2,), n_iterations=3)).run()
+        for other in ((), (3,)):
+            with pytest.raises(ValueError, match="holdout_trajectories"):
+                trainer(out, tiny(holdout_trajectories=other), resume=True)
 
     def test_resume_refuses_a_different_window_offset_maximum(self, tmp_path):
         """Caught by the first resume check (config equal to the checkpoint's except n_iterations); the
@@ -724,6 +735,11 @@ class TestCluster:
         out = tmp_path / "run"
         assert main([str(path), "--out", str(out), "--config", str(cfg), "--log-every", "1", "--no-eval"]) == 0
         assert json.loads((out / "dataset.json").read_text())["D_analytic_m2s"] == loaded.meta["D_exact_m2s"]
+        cfg.write_text(json.dumps(tiny(n_iterations=3, holdout_trajectories=(0, 5)).to_dict()))
+        held = tmp_path / "held"
+        assert main([str(path), "--out", str(held), "--config", str(cfg), "--log-every", "1", "--no-eval"]) == 0
+        written = json.loads((held / "dataset.json").read_text())
+        assert written["holdout_trajectories"] == [0, 5] and written["n_trajectories"] == 4      # split in the folder
         other = SystemData(name="x", displacements=loaded.displacements, dt_ps=10.0, box_nm=loaded.box_nm,
                            meta={"process": "something_else"})
         other.save(tmp_path / "other.npz")

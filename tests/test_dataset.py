@@ -340,3 +340,53 @@ def test_offset_region_too_long_rejected():
     with pytest.raises(ValueError, match="training region"):
         WindowDataset(make_system(n_steps=2 * M + K - 1), block_len=M, step_skip=1, window_offset_max_steps=K)
 
+
+# =============================================================================
+# Held-out trajectories (Config.holdout_trajectories)
+
+HOLD = (1, 3)
+
+
+def _kept_system(sys_, hold):
+    keep = [i for i in range(sys_.n_trajectories) if i not in hold]
+    return SystemData(name=sys_.name, displacements=sys_.displacements[keep], dt_ps=sys_.dt_ps,
+                      box_nm=sys_.box_nm[keep], meta=sys_.meta)
+
+
+def test_empty_holdout_is_the_current_dataset_bit_for_bit():
+    a = WindowDataset(make_system(), block_len=M, step_skip=1)
+    b = WindowDataset(make_system(), block_len=M, step_skip=1, holdout_trajectories=())
+    assert torch.equal(a.windows, b.windows) and a.metadata == b.metadata and a.sigma_nm == b.sigma_nm
+    assert "holdout_trajectories" not in a.metadata and a.n_trajectories == 5
+    ga, gb = torch.Generator().manual_seed(4), torch.Generator().manual_seed(4)
+    assert torch.equal(a.sample(32, ga), b.sample(32, gb)) and torch.equal(ga.get_state(), gb.get_state())
+
+
+def test_holdout_is_exactly_the_dataset_of_the_kept_trajectories():
+    sys_ = make_system()
+    held = WindowDataset(sys_, block_len=M, step_skip=1, holdout_trajectories=HOLD)
+    kept = WindowDataset(_kept_system(sys_, HOLD), block_len=M, step_skip=1)
+    assert torch.equal(held.windows, kept.windows) and held.sigma_nm == kept.sigma_nm   # sigma from the kept only
+    assert held.position_rms_ratio == kept.position_rms_ratio
+    assert held.n_windows == 3 and held.n_trajectories == 3
+    assert held.metadata["holdout_trajectories"] == [1, 3]
+
+
+def test_holdout_with_offsets_samples_only_kept_trajectories():
+    sys_ = make_system()
+    ds = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=K, holdout_trajectories=HOLD)
+    out = ds.sample(400, torch.Generator().manual_seed(2)).numpy()
+    d = (sys_.displacements.astype(np.float64) / ds.sigma_nm).astype(np.float32)
+    owner = []
+    for w in out:
+        hits = [i for i in range(sys_.n_trajectories) for o in range(K + 1) if np.array_equal(d[i, o:o + 2 * M], w)]
+        assert hits
+        owner.append(hits[0])
+    assert set(owner) == {0, 2, 4}                                        # never 1 or 3
+
+
+@pytest.mark.parametrize("bad", [(1, 1), (-1,), (5,), (0, 1, 2, 3, 4)])
+def test_invalid_holdout_rejected(bad):
+    with pytest.raises(ValueError, match="holdout_trajectories"):
+        WindowDataset(make_system(), block_len=M, step_skip=1, holdout_trajectories=bad)
+

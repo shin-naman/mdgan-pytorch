@@ -49,6 +49,7 @@ class Config:
     phase_mode: str = "single"
     scale_inputs: bool = True       # divide by sigma; False is the unscaled ablation
     window_offset_max_steps: int = 0  # > 0: each training window starts at a fresh offset in [0, K] steps
+    holdout_trajectories: tuple[int, ...] = ()  # trajectory indices never trained on (reference MSD still uses all)
     critic_input: str = "increments"  # "positions": the critic sees cumsum(window) over all 2M steps
     critic_position_scale: float | None = None  # "positions_scaled": cumsum(window) / this (the training set's RMS ratio)
 
@@ -95,6 +96,9 @@ class Config:
             raise ValueError("gz_weight_decay_on_norm must be true or false")
         if not 0.0 <= self.gz_dropout < 1.0:
             raise ValueError("gz_dropout must be in [0, 1)")
+        if any(int(i) != i or i < 0 for i in self.holdout_trajectories) or \
+                len(set(self.holdout_trajectories)) != len(self.holdout_trajectories):
+            raise ValueError("holdout_trajectories must be distinct non-negative integers")
         if any(int(i) != i or i <= 0 or i % self.checkpoint_every for i in self.full_checkpoint_iterations):
             raise ValueError("full_checkpoint_iterations must be positive multiples of checkpoint_every")
         if self.critic_input not in CRITIC_INPUTS:
@@ -157,5 +161,5 @@ class Config:
         unknown = set(d) - known
         if unknown:
             raise ValueError(f"unknown Config keys: {sorted(unknown)}")
-        tuple_fields = {"betas", "err_window_ps", "diffusion_fit_ps", "full_checkpoint_iterations"}
+        tuple_fields = {"betas", "err_window_ps", "diffusion_fit_ps", "full_checkpoint_iterations", "holdout_trajectories"}
         return cls(**{k: tuple(v) if k in tuple_fields else v for k, v in d.items()})

@@ -1,0 +1,62 @@
+# Batch 6, new runs: 12 jobs. Sigma units, M 64 unless stated, otherwise configs/pe_paper.json. Every run keeps
+# snapshots every 10k and ONE full checkpoint (critic, optimisers, RNG) at 50k (full_050000.pt).
+#   positions        seeds 3-5, 100k   critic_input "positions" (the 2023 methods reading).
+#                    PREDICTION: >= 2 of 3 reach latent_pass by 50k if the reading changes the basin rate; <= 1 if seed luck.
+#   positions_m128   seeds 0-2,  50k   critic_input "positions", block_len 128 (2.56 ns input).
+#                    PREDICTION: more mixing seeds than either lever alone; closes if two seeds blow up.
+#   offsets2000      seeds 0-2,  50k   window_offset_max_steps 2000: region 2*64 + 2000 = 2128 steps = 21.28 ns.
+#                    PREDICTION: var/MD near 1; DC and share78 unchanged unless memorisation sets the basin.
+#   offsets_full     seeds 0-2,  50k   window_offset_max_steps 7872 (region = all 8000 steps = 80 ns), trained on 50
+#                    trajectories: holdout_trajectories [7, 9, 10, 11, 32, 41, 44, 45, 47, 57], drawn once with
+#                    numpy.random.default_rng(20261113).choice(60, 10, replace=False), sorted. sigma from the offset-0
+#                    windows of the 50; the held-out ten are used for nothing but the generalisation check and the
+#                    reference MSD, which (built from the full system) still uses all 60. The split is in each run's
+#                    dataset.json and checked on resume. PREDICTION: at or above offsets2000 on every count.
+# Offsets: a fresh offset per draw, uniform on [0, max], from the training generator; the maximum is in dataset.json
+# and checked on resume. The 3 resumes are tools/chtc/batch6_resume.sub.
+# Submit from the repository root in /home:  condor_submit tools/chtc/batch6.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+executable                = tools/chtc/run_train.sh
+should_transfer_files     = YES
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+
+request_gpus              = 1
+# The container's PyTorch (2.5.1, CUDA 12.4) has GPU code for compute capability 5.0-9.0 only;
+# newer GPUs fail at the first CUDA call ('no kernel image is available'). 9.0 = H100, 8.9 = L40.
+gpus_minimum_capability   = 7.0
+gpus_maximum_capability   = 9.0
+# gpu2008: its GPU fails every job at the first CUDA call (busy or unavailable), Nov 2026
+requirements              = (Machine != "gpu2008.chtc.wisc.edu")
++WantGPULab               = true
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 5GB
+
+# ---- new runs -------------------------------------------------------------------------------------
+arguments                 = $(ARM)_c$(Cluster)_seed$(SEED) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=batch6_$(ARM).json"
+transfer_input_files      = src, configs/batch6_$(ARM).json, data/cache/PE.npz
+transfer_checkpoint_files = run_$(ARM)_c$(Cluster)_seed$(SEED)
+transfer_output_files     = run_$(ARM)_c$(Cluster)_seed$(SEED)
+log                       = logs/$(ARM)_c$(Cluster)_seed$(SEED).log
+output                    = logs/$(ARM)_c$(Cluster)_seed$(SEED).out
+error                     = logs/$(ARM)_c$(Cluster)_seed$(SEED).err
+
+queue ARM, SEED from (
+  positions, 3
+  positions, 4
+  positions, 5
+  positions_m128, 0
+  positions_m128, 1
+  positions_m128, 2
+  offsets2000, 0
+  offsets2000, 1
+  offsets2000, 2
+  offsets_full, 0
+  offsets_full, 1
+  offsets_full, 2
+)

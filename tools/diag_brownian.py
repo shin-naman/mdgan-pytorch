@@ -108,7 +108,8 @@ def main() -> None:
     if not args.summary_only:
         c = config(args)
         system = brownian(args.trajectories)
-        dataset = WindowDataset(system, c.block_len, c.step_skip, c.phase_mode, c.scale_inputs, c.window_offset_max_steps)
+        dataset = WindowDataset(system, c.block_len, c.step_skip, c.phase_mode, c.scale_inputs, c.window_offset_max_steps,
+                                c.holdout_trajectories)
         Trainer(c, dataset, out, device=args.device, reference=reference_msd(system),
                 log_every=max(1, args.checkpoint_every // 2), resume=args.resume).run()
     summary(out)

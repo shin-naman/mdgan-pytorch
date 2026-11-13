@@ -1,0 +1,61 @@
+{
+  "latent_dim": 32,
+  "noise_dim": 32,
+  "block_len": 64,
+  "n_channels": 3,
+  "hidden_dim": 2048,
+  "negative_slope": 0.2,
+  "use_running_stats": false,
+  "init": "pytorch",
+  "gz_additive_noise_std": 0.0,
+  "gz_weight_decay": 0.0,
+  "gz_weight_decay_on_norm": true,
+  "gz_dropout": 0.0,
+  "gz_norm_position": "output",
+  "latent_noise_share": 0.0,
+  "step_skip": 1,
+  "phase_mode": "single",
+  "scale_inputs": true,
+  "window_offset_max_steps": 7872,
+  "holdout_trajectories": [
+    7,
+    9,
+    10,
+    11,
+    32,
+    41,
+    44,
+    45,
+    47,
+    57
+  ],
+  "critic_input": "increments",
+  "critic_position_scale": null,
+  "batch_size": 64,
+  "n_iterations": 50000,
+  "n_critic": 5,
+  "lr": 0.0001,
+  "betas": [
+    0.0,
+    0.9
+  ],
+  "gp_lambda": 10.0,
+  "burn_in": 7,
+  "pair_window": 4,
+  "mean_operation": true,
+  "seed": 0,
+  "checkpoint_every": 10000,
+  "full_checkpoint_iterations": [
+    50000
+  ],
+  "estimation_chains": 8192,
+  "estimation_time_ps": 80000.0,
+  "err_window_ps": [
+    200.0,
+    78000.0
+  ],
+  "diffusion_fit_ps": [
+    10000.0,
+    20000.0
+  ]
+}

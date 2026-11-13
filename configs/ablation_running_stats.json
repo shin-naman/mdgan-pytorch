@@ -17,6 +17,7 @@
   "phase_mode": "single",
   "scale_inputs": true,
   "window_offset_max_steps": 0,
+  "holdout_trajectories": [],
   "critic_input": "increments",
   "critic_position_scale": null,
   "batch_size": 64,
