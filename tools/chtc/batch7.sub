@@ -1,0 +1,64 @@
+# Batch 7, new runs: 6 jobs. The Batch 6 offsets_full set-up (window_offset_max_steps 7872, the same ten held-out
+# trajectories, sigma units, M 64, 50k, snapshots every 10k and one full checkpoint at 50k) with a critic over 8
+# blocks and generator rewards. NOT in the papers; the control is Batch 6 offsets_full (2-block critic, no reward).
+# Every piece passed only on the miniature cage walk (8-step blocks, ten seeds, 30k); none was trained at this size.
+#   c8_noise         seeds 0-2,  50k   critic_blocks 8: D_G scores 8 consecutive blocks = 512 steps = 5.12 ns of one
+#                    trajectory (the papers: 2 blocks = 1.28 ns), drawn at every offset of the 80 ns region.
+#                    noise_use_min 0.5 (weight 100, 1024 side chains): each latent dimension is penalised while less
+#                    than half of z_{t+1} is set by the fresh noise r.
+#                    PREDICTION: noise_use_share (metrics.jsonl) at or above 0.5 by 10k; no seed with a DC or share78
+#                    failure at 30-50k; sum rho (lags 1-30) below every offsets_full seed; D_gen / D_ref nearer 1 than
+#                    offsets_full and possibly below it (miniature: a fifth low). Closes if sum rho stays in the
+#                    offsets_full range.
+#   c8_noise_corr    seeds 0-2,  50k   the same plus corr_reward_blocks 8 (weight 10): the block-sum correlations of
+#                    the 1024 side chains at lags 1-7 are pulled to the training region's (dataset.json,
+#                    corr_reward_targets: -0.148 at lag 1, within 0.02 of zero at lags 2-7).
+#                    PREDICTION: corr_error (metrics.jsonl) below 0.01 by 20k; sum rho (lags 1-30) within 0.3 of the
+#                    MD's -0.21; D_gen / D_ref in 0.8-1.2 for at least 2 of 3 seeds over 30-50k. Closes if corr_error is
+#                    small while sum rho of the 8192-chain rollout stays above +0.5 (the reward is met on the side
+#                    batch and the estimation rollout still drifts).
+# Extra columns in metrics.jsonl: noise_use_share, noise_use_penalty, corr_error (second arm), reward_loss;
+# generator_loss stays the critic term. Read D over the 30k-50k snapshots, not at one of them.
+# Cost, measured on a laptop only (60 iterations; CPU / Apple GPU), as time per iteration against offsets_full:
+# c8_noise 2.3 x / 5.9 x, c8_noise_corr 4.5 x / 7.0 x. The M = 64 offsets runs logged about 19 it/s here, so expect
+# roughly 3-8 it/s and 2-5 hours for 50k; a session that reaches MAX_HOURS checkpoints and restarts as before.
+# Submit from the repository root in /home:  condor_submit tools/chtc/batch7.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+executable                = tools/chtc/run_train.sh
+should_transfer_files     = YES
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+
+request_gpus              = 1
+# The container's PyTorch (2.5.1, CUDA 12.4) has GPU code for compute capability 5.0-9.0 only;
+# newer GPUs fail at the first CUDA call ('no kernel image is available'). 9.0 = H100, 8.9 = L40.
+gpus_minimum_capability   = 7.0
+gpus_maximum_capability   = 9.0
+# gpu2008: its GPU fails every job at the first CUDA call (busy or unavailable), Nov 2026
+requirements              = (Machine != "gpu2008.chtc.wisc.edu")
++WantGPULab               = true
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 5GB
+
+# ---- new runs -------------------------------------------------------------------------------------
+arguments                 = $(ARM)_c$(Cluster)_seed$(SEED) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=batch7_$(ARM).json"
+transfer_input_files      = src, configs/batch7_$(ARM).json, data/cache/PE.npz
+transfer_checkpoint_files = run_$(ARM)_c$(Cluster)_seed$(SEED)
+transfer_output_files     = run_$(ARM)_c$(Cluster)_seed$(SEED)
+log                       = logs/$(ARM)_c$(Cluster)_seed$(SEED).log
+output                    = logs/$(ARM)_c$(Cluster)_seed$(SEED).out
+error                     = logs/$(ARM)_c$(Cluster)_seed$(SEED).err
+
+queue ARM, SEED from (
+  c8_noise, 0
+  c8_noise, 1
+  c8_noise, 2
+  c8_noise_corr, 0
+  c8_noise_corr, 1
+  c8_noise_corr, 2
+)

@@ -390,3 +390,129 @@ def test_invalid_holdout_rejected(bad):
     with pytest.raises(ValueError, match="holdout_trajectories"):
         WindowDataset(make_system(), block_len=M, step_skip=1, holdout_trajectories=bad)
 
+
+
+# =============================================================================
+# Critic windows of L blocks (Config.critic_blocks) and the correlation targets
+
+L, KL = 4, 23                  # 4 blocks of M = 8 need K >= 16; region 2M + K = 39 steps, offsets 0..7
+
+
+def test_two_blocks_is_the_current_dataset_bit_for_bit():
+    for kw in ({}, {"window_offset_max_steps": K}):
+        a = WindowDataset(make_system(), block_len=M, step_skip=1, **kw)
+        b = WindowDataset(make_system(), block_len=M, step_skip=1, critic_blocks=2, **kw)
+        assert torch.equal(a.windows, b.windows) and a.metadata == b.metadata and "critic_blocks" not in a.metadata
+        ga, gb = torch.Generator().manual_seed(5), torch.Generator().manual_seed(5)
+        assert torch.equal(a.sample(32, ga), b.sample(32, gb)) and torch.equal(ga.get_state(), gb.get_state())
+
+
+def test_long_windows_leave_sigma_region_and_offset_zero_windows_unchanged():
+    a = WindowDataset(make_system(), block_len=M, step_skip=1, window_offset_max_steps=KL)
+    b = WindowDataset(make_system(), block_len=M, step_skip=1, window_offset_max_steps=KL, critic_blocks=L)
+    assert b.sigma_nm == a.sigma_nm and b.region_steps == a.region_steps == 2 * M + KL
+    assert torch.equal(a.windows, b.windows) and b.position_rms_ratio == a.position_rms_ratio
+    assert b.metadata == {**a.metadata, "critic_blocks": L} and b.sample_len == L * M and a.sample_len == 2 * M
+
+
+def test_long_windows_are_trajectory_slices_inside_the_region():
+    """Re-derive every sampled window from the indices and offsets the same generator draws; the offsets
+    stop at 2M + K - L*M, so no window leaves the training region (the system holds LEAK beyond it)."""
+    sys_ = make_system()
+    sys_.displacements[:, 2 * M + KL:] = LEAK
+    sys_.displacements[:, :2 * M + KL] = np.random.default_rng(3).normal(scale=0.17, size=(5, 2 * M + KL, 3))
+    ds = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=KL, critic_blocks=L)
+    out = ds.sample(400, torch.Generator().manual_seed(9))
+    assert out.shape == (400, L * M, 3) and out.abs().max() < 100
+    g = torch.Generator().manual_seed(9)
+    idx = torch.randint(0, ds.n_windows, (400,), generator=g)
+    off = torch.randint(0, 2 * M + KL - L * M + 1, (400,), generator=g)
+    assert int(off.min()) == 0 and int(off.max()) == 2 * M + KL - L * M == 7
+    d = sys_.displacements.astype(np.float64)
+    for b in range(400):
+        i, o = int(idx[b]), int(off[b])
+        np.testing.assert_array_equal(out[b].numpy(), (d[i, o:o + L * M] / ds.sigma_nm).astype(np.float32))
+
+
+def test_long_windows_respect_the_holdout():
+    sys_ = make_system()
+    sys_.displacements[:, :2 * M + KL] = np.random.default_rng(3).normal(scale=0.17, size=(5, 2 * M + KL, 3))
+    ds = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=KL, holdout_trajectories=HOLD,
+                       critic_blocks=L)
+    out = ds.sample(200, torch.Generator().manual_seed(2)).numpy()
+    d = (sys_.displacements.astype(np.float64) / ds.sigma_nm).astype(np.float32)
+    owner = {i for w in out for i in range(5) for o in range(8) if np.array_equal(d[i, o:o + L * M], w)}
+    assert owner == {0, 2, 4}
+
+
+@pytest.mark.parametrize("kw", [dict(critic_blocks=1), dict(critic_blocks=3), dict(critic_blocks=2.0),
+                                dict(critic_blocks=L, window_offset_max_steps=(L - 2) * M - 1)])
+def test_long_windows_need_enough_offsets(kw):
+    with pytest.raises(ValueError, match="critic_blocks"):
+        WindowDataset(make_system(), block_len=M, step_skip=1, **kw)
+    WindowDataset(make_system(), block_len=M, step_skip=1, critic_blocks=L, window_offset_max_steps=(L - 2) * M)
+
+
+def _ar_system(phi, n_traj=40, n_blocks=60, seed=0):
+    """Displacements whose M-step block sums are an AR(1) chain with coefficient phi: rho_k = phi^k.
+    Each block's steps are that block's sum spread evenly plus noise that sums to zero within the block."""
+    rng = np.random.default_rng(seed)
+    s = np.zeros((n_traj, n_blocks, 3))
+    s[:, 0] = rng.normal(size=(n_traj, 3))
+    for t in range(1, n_blocks):
+        s[:, t] = phi * s[:, t - 1] + np.sqrt(1 - phi ** 2) * rng.normal(size=(n_traj, 3))
+    e = rng.normal(size=(n_traj, n_blocks, M, 3))
+    d = (s[:, :, None, :] / M + (e - e.mean(axis=2, keepdims=True))).reshape(n_traj, n_blocks * M, 3)
+    return SystemData(name="ar", displacements=d.astype(np.float32), dt_ps=10.0,
+                      box_nm=np.full((n_traj, 3), 4.75), meta={})
+
+
+def test_block_sum_correlations_equal_an_independent_computation():
+    """np.corrcoef on explicitly summed blocks, per grid position, averaged over the M positions."""
+    sys_ = _ar_system(-0.4)
+    ds = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=58 * M)       # the whole system
+    d = sys_.displacements.astype(np.float64)
+    expected = np.zeros(3)
+    for o in range(M):
+        nb = (d.shape[1] - o) // M
+        sums = np.stack([d[:, o + b * M:o + (b + 1) * M].sum(axis=1) for b in range(nb)], axis=1)   # (N, nb, C)
+        expected += [np.corrcoef(sums[:, :-k].ravel(), sums[:, k:].ravel())[0, 1] for k in (1, 2, 3)]
+    got = ds.block_sum_correlations(4)
+    assert got.shape == (3,)
+    np.testing.assert_allclose(got, expected / M, rtol=0, atol=1e-6)        # float32 windows against float64
+
+
+@pytest.mark.statistical
+def test_block_sum_correlations_recover_planted_values():
+    """Independent steps: rho_k = 0 (standard error near 1 / sqrt(200 * 3 * 28) = 0.008 per grid position).
+    Steps mu_i + eps with one mu ~ N(0, a^2) per trajectory and axis: a block sum is M mu + sum(eps), so
+    rho_k = M a^2 / (M a^2 + 1) at every lag and grid position; 0.5 for a^2 = 1 / M. 600 values of mu put
+    the standard error near 0.03. Tolerances are 4 standard errors."""
+    rng = np.random.default_rng(0)
+    eps = rng.normal(size=(200, 30 * M, 3))
+    mu = rng.normal(scale=np.sqrt(1 / M), size=(200, 1, 3))
+    for d, expected, tol in ((eps, 0.0, 0.03), (eps + mu, 0.5, 0.12)):
+        sys_ = SystemData(name="planted", displacements=d.astype(np.float32), dt_ps=10.0,
+                          box_nm=np.full((200, 3), 4.75), meta={})
+        ds = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=28 * M)
+        np.testing.assert_allclose(ds.block_sum_correlations(6), np.full(5, expected), rtol=0, atol=tol)
+
+
+def test_block_sum_correlations_use_training_trajectories_and_the_region_only():
+    sys_ = _ar_system(-0.4)
+    full = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=58 * M)
+    held = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=58 * M, holdout_trajectories=(0, 1, 2))
+    kept = WindowDataset(_kept_system(sys_, (0, 1, 2)), block_len=M, step_skip=1, window_offset_max_steps=58 * M)
+    np.testing.assert_array_equal(held.block_sum_correlations(4), kept.block_sum_correlations(4))
+    assert not np.array_equal(held.block_sum_correlations(4), full.block_sum_correlations(4))
+    short = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=2 * M)       # 4 blocks of region
+    assert not np.allclose(short.block_sum_correlations(4), full.block_sum_correlations(4))
+    assert np.isfinite(short.block_sum_correlations(4)).all()
+    assert np.isfinite(WindowDataset(sys_, block_len=M, step_skip=1).block_sum_correlations(2)).all()   # lag 1, K = 0
+
+
+@pytest.mark.parametrize("n", [1, 5, 2.0])
+def test_block_sum_correlations_need_the_blocks_in_the_region(n):
+    ds = WindowDataset(make_system(), block_len=M, step_skip=1, window_offset_max_steps=2 * M)    # 4 blocks
+    with pytest.raises(ValueError, match="n_blocks"):
+        ds.block_sum_correlations(n)

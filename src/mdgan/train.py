@@ -6,6 +6,8 @@ One ITERATION = one generator update:
      critic_loss, Adam step on D_G.
   2. one generator step: a fresh fake window WITH graph, generator_loss through a
      frozen critic (no parameter gradients for D_G), Adam step on G_z + G_Y.
+     With a generator reward enabled (mdgan.rewards; off by default, not in the papers)
+     its terms are added to that loss before the step.
   3. every checkpoint_every iterations (and at the end): latest.pt (full resume
      state, overwritten), snap_XXXXXX.pt (generators only), and, if an MD
      reference was given, an evaluation appended to evaluations.jsonl.
@@ -62,6 +64,7 @@ from mdgan.data.dataset import WindowDataset
 from mdgan.evaluate import evaluate
 from mdgan.losses import critic_loss, generator_loss
 from mdgan.models import build_models
+from mdgan.rewards import generator_rewards, reward_metric_names
 from mdgan.rollout import make_fake_window
 
 LATEST = "latest.pt"
@@ -183,7 +186,7 @@ def _git_state() -> dict:
 def _check_dataset_matches_config(config: Config, dataset: WindowDataset) -> None:
     pairs = {"block_len": dataset.block_len, "step_skip": dataset.step_skip, "phase_mode": dataset.phase_mode,
              "scale_inputs": dataset.scale_inputs, "n_channels": dataset.n_channels,
-             "window_offset_max_steps": dataset.window_offset_max_steps}
+             "window_offset_max_steps": dataset.window_offset_max_steps, "critic_blocks": dataset.critic_blocks}
     bad = {k: (v, getattr(config, k)) for k, v in pairs.items() if v != getattr(config, k)}
     if dataset.holdout_trajectories != tuple(sorted(config.holdout_trajectories)):      # the split, order-insensitive
         bad["holdout_trajectories"] = (dataset.holdout_trajectories, config.holdout_trajectories)
@@ -218,6 +221,11 @@ class Trainer:
         self.gen = torch.Generator()
         self.rollbacks: list[dict] = []
         self._rollbacks_since_checkpoint = 0
+        self.metric_names = METRIC_NAMES + reward_metric_names(config)     # METRIC_NAMES alone without rewards
+        # the correlation reward's targets: the training region's block-sum correlations, fixed for the run
+        self.corr_targets = (torch.as_tensor(dataset.block_sum_correlations(config.corr_reward_blocks),
+                                             dtype=torch.float32, device=self.device)
+                             if config.corr_reward_blocks else None)
 
         torch.manual_seed(config.seed)
         self.gz, self.gy, self.dg = (m.to(self.device) for m in build_models(config))
@@ -241,7 +249,8 @@ class Trainer:
         (self.out / "config.json").write_text(json.dumps(self.config.to_dict(), indent=2))
         (self.out / "dataset.json").write_text(json.dumps(
             {**self.dataset.metadata, "position_rms_ratio": self.dataset.position_rms_ratio,
-             **({"D_analytic_m2s": self.dataset.analytic_D_m2s} if self.dataset.analytic_D_m2s is not None else {})},
+             **({"D_analytic_m2s": self.dataset.analytic_D_m2s} if self.dataset.analytic_D_m2s is not None else {}),
+             **({"corr_reward_targets": self.corr_targets.tolist()} if self.corr_targets is not None else {})},
             indent=2))
         (self.out / "provenance.json").write_text(json.dumps({
             **_git_state(), "torch": torch.__version__, "python": platform.python_version(),
@@ -288,7 +297,7 @@ class Trainer:
     def _fake(self):
         c = self.config
         return make_fake_window(self.gz, self.gy, c.batch_size, c.burn_in, c.pair_window,
-                                mean_operation=c.mean_operation, generator=self.gen)
+                                mean_operation=c.mean_operation, blocks=c.critic_blocks, generator=self.gen)
 
     def _critic_step(self) -> dict:
         real = self.dataset.sample(self.config.batch_size, generator=self.gen, device=self.device)
@@ -306,10 +315,15 @@ class Trainer:
         with _frozen(self.dg):
             fake = self._fake()
             loss = generator_loss(self.dg, critic_view(fake, self.config.critic_input, self.config.critic_position_scale))
+            total, rewards = loss, {}
+            if self.config.rewards_on:                 # drawn after the fake window, from the same generator
+                reward, rewards = generator_rewards(self.gz, self.gy, self.config, self.corr_targets, generator=self.gen)
+                total = loss + reward
             self.opt_g.zero_grad(set_to_none=True)
-            loss.backward()
+            total.backward()
             self.opt_g.step()
-        return {"loss": loss.detach(), "fake_step_std": fake.detach().std(dim=0).mean()}
+        # "loss" stays the critic term -E[D(fake)], the same quantity in every run; the reward terms are in `rewards`
+        return {"loss": loss.detach(), "fake_step_std": fake.detach().std(dim=0).mean(), **rewards}
 
     def _iteration(self) -> bool:
         """One generator update. Returns False if a loss was non-finite."""
@@ -317,18 +331,19 @@ class Trainer:
             m.train()
         crit = [self._critic_step() for _ in range(self.config.n_critic)]
         gen = self._generator_step()
-        if not bool(torch.isfinite(crit[-1]["loss"] + gen["loss"])):      # the one sync per iteration
+        extra = [gen[name] for name in self.metric_names[len(METRIC_NAMES):]]      # reward terms; empty by default
+        if not bool(torch.isfinite(sum(extra, crit[-1]["loss"] + gen["loss"]))):  # the one sync per iteration
             return False
         mean = lambda key: torch.stack([c[key] for c in crit]).mean()     # noqa: E731
         self._acc += torch.stack([mean("wasserstein"), mean("gradient_penalty"), mean("grad_norm"),
-                                  gen["loss"], gen["fake_step_std"]]).to(self._acc)
+                                  gen["loss"], gen["fake_step_std"], *extra]).to(self._acc)
         self._acc_n += 1
         return True
 
     # --- metrics, checkpoints, rollback ------------------------------------------------------
 
     def _reset_metrics(self) -> None:
-        self._acc = torch.zeros(len(METRIC_NAMES), device=self.device)       # float32: MPS has no float64
+        self._acc = torch.zeros(len(self.metric_names), device=self.device)  # float32: MPS has no float64
         self._acc_n = 0
         self._t0 = time.perf_counter()
 
@@ -338,13 +353,14 @@ class Trainer:
         values = (self._acc / self._acc_n).tolist()
         dt = time.perf_counter() - self._t0
         rate = self._acc_n / dt if dt > 0 else None
-        record = {"iteration": self.iteration, **dict(zip(METRIC_NAMES, values, strict=True)),
+        record = {"iteration": self.iteration, **dict(zip(self.metric_names, values, strict=True)),
                   "iterations_per_second": rate, "rollbacks": len(self.rollbacks)}
         _append_jsonl(self.out / "metrics.jsonl", record)
         if self.progress:
             print(f"it {self.iteration:7d} | W {record['wasserstein']:7.3f}  gp {record['gradient_penalty']:.3f}  "
                   f"|g| {record['grad_norm']:.2f}  step std {record['fake_step_std']:.3f} | "
-                  f"{(rate or 0):.1f} it/s | rollbacks {len(self.rollbacks)}", flush=True)
+                  f"{(rate or 0):.1f} it/s | rollbacks {len(self.rollbacks)}"
+                  + "".join(f" | {k} {record[k]:.4f}" for k in self.metric_names[len(METRIC_NAMES):]), flush=True)
         self._reset_metrics()
 
     def _save_latest(self) -> None:
@@ -493,7 +509,7 @@ def main(argv=None) -> int:
 
     system = load_system(args.data, args.cache)
     dataset = WindowDataset(system, config.block_len, config.step_skip, config.phase_mode, config.scale_inputs,
-                            config.window_offset_max_steps, config.holdout_trajectories)
+                            config.window_offset_max_steps, config.holdout_trajectories, config.critic_blocks)
     reference = None if args.no_eval else reference_msd(system)
     trainer = Trainer(config, dataset, args.out, device=args.device, reference=reference,
                       log_every=args.log_every, resume=resume, progress=True)

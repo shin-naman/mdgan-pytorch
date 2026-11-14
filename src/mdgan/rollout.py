@@ -1,6 +1,6 @@
 """Generating trajectories with G_z and G_Y.
 
-make_fake_window  training: one 2M-step window per chain, shown to the critic.
+make_fake_window  training: one 2M-step window per chain (L*M with blocks = L), shown to the critic.
 rollout           estimation: long trajectories, block after block.
 
 Both start each chain at z_0 ~ U[0,1)^{n_z} and discard the first `burn_in` (= c)
@@ -45,14 +45,15 @@ def _initial_latents(gz, batch, generator, device, dtype):
 
 
 def make_fake_window(gz, gy, batch: int, burn_in: int, pair_window: int, *,
-                     mean_operation: bool = True,
+                     mean_operation: bool = True, blocks: int = 2,
                      generator: torch.Generator | None = None) -> torch.Tensor:
     """One generated 2M-step window per chain: (batch, 2M, C), differentiable.
+    With blocks = L (Config.critic_blocks) the window is the L consecutive blocks y_j .. y_{j+L-1}: (batch, L*M, C).
 
     1. j ~ uniform integer in [burn_in, burn_in + pair_window - 1]   (one j per call)
     2. z_0 ~ U[0, 1)^{n_z}
-    3. z_1 .. z_{j+1} by G_z (full BPTT; gradients reach z_0's descendants and G_z)
-    4. y_j = G_Y(z_j), y_{j+1} = G_Y(z_{j+1}); window = [y_j, y_{j+1}] along time
+    3. z_1 .. z_{j+1} by G_z (full BPTT; gradients reach z_0's descendants and G_z); to z_{j+L-1} for L blocks
+    4. y_j = G_Y(z_j), y_{j+1} = G_Y(z_{j+1}); window = [y_j, y_{j+1}] along time (in block order for L blocks)
     5. mean operation over the batch if enabled
     Random draws happen in exactly this order from `generator`.
     Runs in whatever train/eval mode the modules are in (the trainer sets train).
@@ -60,12 +61,12 @@ def make_fake_window(gz, gy, batch: int, burn_in: int, pair_window: int, *,
     positive_int("batch", batch)
     _non_negative_int("burn_in", burn_in)
     positive_int("pair_window", pair_window)
+    positive_int("blocks", blocks)
     param = next(gz.parameters())
     j = int(torch.randint(burn_in, burn_in + pair_window, (1,), generator=generator))
     z0 = _initial_latents(gz, batch, generator, param.device, param.dtype)
-    states = gz.unroll(z0, j + 1, generator=generator)                  # (j + 2, B, n_z)
-    window = torch.cat([gy.generate(states[j], generator=generator),
-                        gy.generate(states[j + 1], generator=generator)], dim=1)
+    states = gz.unroll(z0, j + blocks - 1, generator=generator)         # (j + 2, B, n_z) at blocks = 2
+    window = torch.cat([gy.generate(states[j + i], generator=generator) for i in range(blocks)], dim=1)
     return _center(window) if mean_operation else window
 
 

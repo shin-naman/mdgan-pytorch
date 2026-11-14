@@ -71,6 +71,33 @@ class TestMakeFakeWindow:
         torch.testing.assert_close(gy_in[0], gz_out[-2], rtol=0, atol=0)    # z_j
         torch.testing.assert_close(gy_in[1], gz_out[-1], rtol=0, atol=0)    # z_{j+1} = G_z(z_j)
 
+    def test_two_blocks_is_the_default_bit_for_bit(self, gz, gy):
+        ga, gb = torch.Generator().manual_seed(4), torch.Generator().manual_seed(4)
+        a = make_fake_window(gz, gy, 8, 2, 3, generator=ga)
+        b = make_fake_window(gz, gy, 8, 2, 3, blocks=2, generator=gb)
+        assert torch.equal(a, b) and torch.equal(ga.get_state(), gb.get_state())
+
+    def test_L_blocks_match_hand_construction_in_documented_draw_order(self, gz, gy):
+        w = make_fake_window(gz, gy, 8, burn_in=2, pair_window=3, blocks=5, generator=torch.Generator().manual_seed(5))
+        g = torch.Generator().manual_seed(5)
+        j = int(torch.randint(2, 5, (1,), generator=g))
+        states = gz.unroll(torch.rand(8, LAT, generator=g), j + 4, generator=g)
+        ref = torch.cat([gy.generate(states[j + i], generator=g) for i in range(5)], dim=1)
+        assert w.shape == (8, 5 * M, C)
+        torch.testing.assert_close(w, ref - ref.mean(0, keepdim=True), rtol=0, atol=0)
+
+    def test_L_blocks_decode_L_consecutive_latents(self, gz, gy):
+        gz_out, gy_in, hooks = _recorders(gz, gy)
+        try:
+            with torch.no_grad():
+                make_fake_window(gz, gy, 8, burn_in=3, pair_window=2, blocks=4, generator=torch.Generator().manual_seed(1))
+        finally:
+            for h in hooks:
+                h.remove()
+        assert len(gy_in) == 4
+        for i in range(4):                                                   # z_j .. z_{j+3}, each G_z of the last
+            torch.testing.assert_close(gy_in[i], gz_out[i - 4], rtol=0, atol=0)
+
     def test_burn_in_zero_and_K_one_decodes_z0_and_z1(self, gz, gy):
         calls = []
         h = gz.register_forward_hook(lambda m, i, o: calls.append(1))

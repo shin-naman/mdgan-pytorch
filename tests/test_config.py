@@ -25,6 +25,8 @@ class TestDefaults:
         assert c.window_offset_max_steps == 0 and c.critic_input == "increments" and c.full_checkpoint_iterations == ()
         assert c.gz_weight_decay_on_norm is True and c.critic_position_scale is None and c.latent_noise_share == 0.0
         assert c.holdout_trajectories == ()
+        assert c.critic_blocks == 2 and (c.noise_use_min, c.corr_reward_blocks) == (0.0, 0) and not c.rewards_on
+        assert (c.noise_use_weight, c.corr_reward_weight, c.reward_chains) == (100.0, 10.0, 1024)
         assert (c.step_skip, c.phase_mode, c.scale_inputs) == (1, "single", True)
         assert (c.batch_size, c.n_iterations, c.n_critic) == (64, 300_000, 5)
         assert (c.lr, c.betas, c.gp_lambda) == (1e-4, (0.0, 0.9), 10.0)
@@ -38,6 +40,12 @@ class TestDefaults:
 
     def test_window_len(self):
         assert Config().window_len == 128 and Config(block_len=8).window_len == 16
+
+    def test_critic_window_len_and_rewards_on(self):
+        assert Config().critic_window_len == 128
+        c = Config(block_len=8, critic_blocks=8, window_offset_max_steps=48)
+        assert c.critic_window_len == 64 and c.window_len == 16
+        assert Config(noise_use_min=0.5).rewards_on and Config(corr_reward_blocks=2).rewards_on
 
     @pytest.mark.parametrize("step_skip,blocks", [(1, 125), (5, 25), (7, 18), (20, 7)])
     def test_estimation_blocks_cover_80_ns(self, step_skip, blocks):
@@ -57,7 +65,7 @@ class TestValidation:
         dict(step_skip=2.0), dict(pair_window=0), dict(estimation_chains=0),
         dict(burn_in=-1), dict(seed=-1), dict(phase_mode="some"),
         dict(lr=0.0), dict(betas=(0.0, 1.0)), dict(betas=(0.5,)), dict(gp_lambda=-1.0),
-        dict(negative_slope=-0.1), dict(init="xavier"), dict(gz_additive_noise_std=-0.1), dict(gz_weight_decay=-1.0), dict(gz_dropout=1.0), dict(gz_norm_position="input"), dict(window_offset_max_steps=-1), dict(critic_input="velocities"), dict(gz_weight_decay_on_norm="no"), dict(latent_noise_share=1.0), dict(holdout_trajectories=(3, 3)), dict(holdout_trajectories=(-1,)), dict(critic_input="positions_scaled"), dict(critic_input="positions_scaled", critic_position_scale=-1.0), dict(critic_position_scale=2.9873), dict(full_checkpoint_iterations=(5000,)), dict(full_checkpoint_iterations=(0,)), dict(window_offset_max_steps=2.5), dict(err_window_ps=(78_000.0, 200.0)),
+        dict(negative_slope=-0.1), dict(init="xavier"), dict(gz_additive_noise_std=-0.1), dict(gz_weight_decay=-1.0), dict(gz_dropout=1.0), dict(gz_norm_position="input"), dict(window_offset_max_steps=-1), dict(critic_input="velocities"), dict(gz_weight_decay_on_norm="no"), dict(latent_noise_share=1.0), dict(holdout_trajectories=(3, 3)), dict(holdout_trajectories=(-1,)), dict(critic_input="positions_scaled"), dict(critic_input="positions_scaled", critic_position_scale=-1.0), dict(critic_position_scale=2.9873), dict(full_checkpoint_iterations=(5000,)), dict(full_checkpoint_iterations=(0,)), dict(window_offset_max_steps=2.5), dict(critic_blocks=1), dict(critic_blocks=2.0), dict(critic_blocks=3), dict(critic_blocks=8, window_offset_max_steps=383), dict(critic_blocks=4, window_offset_max_steps=128, critic_input="positions"), dict(noise_use_min=1.0), dict(noise_use_min=-0.1), dict(noise_use_weight=-1.0), dict(corr_reward_blocks=1), dict(corr_reward_blocks=-2), dict(corr_reward_blocks=2.0), dict(corr_reward_blocks=True), dict(corr_reward_blocks=8, window_offset_max_steps=383), dict(corr_reward_weight=-1.0), dict(reward_chains=0), dict(noise_use_min=0.5, reward_chains=1), dict(err_window_ps=(78_000.0, 200.0)),
         dict(diffusion_fit_ps=(0.0, 10.0)), dict(estimation_time_ps=0.0),
         dict(estimation_time_ps=10_000.0), dict(err_window_ps=(200.0, 90_000.0)),
         dict(diffusion_fit_ps=(10_000.0, 85_000.0)),
@@ -68,6 +76,8 @@ class TestValidation:
 
     def test_edge_values_accepted(self):
         Config(burn_in=0, gp_lambda=0.0, negative_slope=0.0, seed=0, phase_mode="all")
+        Config(critic_blocks=8, corr_reward_blocks=8, window_offset_max_steps=384, noise_use_weight=0.0)
+        Config(corr_reward_blocks=2)                # lag 1 needs no more data than the papers' two blocks
 
 
 # =============================================================================
@@ -119,6 +129,13 @@ class TestBuildModels:
         assert (gz.gz_additive_noise_std, gz.gz_dropout, gz.gz_norm_position) == (0.5, 0.2, "hidden")
         assert build_models(Config(hidden_dim=8, latent_noise_share=0.3))[0].latent_noise_share == 0.3
         assert gz.input_layer.in_features == gz.latent_dim and hasattr(gz, "hidden_norm")
+
+    def test_critic_blocks_sizes_the_critic_only(self):
+        from mdgan.models import build_models
+        c = Config(hidden_dim=8, block_len=8, critic_blocks=4, window_offset_max_steps=16)
+        gz, gy, dg = build_models(c)
+        assert (dg.n_blocks, dg.window_len, dg.block_len) == (4, 32, 8) and gy.block_len == 8
+        assert dg.input_conv.kernel_size == (32,) and build_models(Config(hidden_dim=8))[2].window_len == 128
 
     def test_running_stats_option_is_passed_through(self):
         from mdgan.models import build_models

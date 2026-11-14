@@ -177,6 +177,13 @@ class TestSave:
         with pytest.raises(ValueError, match="do not match"):
             _save(tmp_path / "ck.pt", other)
 
+    def test_critic_window_must_match_the_config(self, models, tmp_path):
+        """A critic over 4 blocks cannot be saved under a config that says 2 (it could not be rebuilt on load)."""
+        torch.manual_seed(0)
+        long = build_models(Config(**{**CFG.to_dict(), "critic_blocks": 4, "window_offset_max_steps": 16}))
+        with pytest.raises(ValueError, match="critic_blocks"):
+            _save(tmp_path / "ck.pt", (models[0], models[1], long[2]))
+
     def test_models_must_be_in_order(self, models, tmp_path):
         gz, gy, dg = models
         with pytest.raises(ValueError, match="G_z must be"):

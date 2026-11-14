@@ -52,6 +52,7 @@ class Config:
     holdout_trajectories: tuple[int, ...] = ()  # trajectory indices never trained on (reference MSD still uses all)
     critic_input: str = "increments"  # "positions": the critic sees cumsum(window) over all 2M steps
     critic_position_scale: float | None = None  # "positions_scaled": cumsum(window) / this (the training set's RMS ratio)
+    critic_blocks: int = 2          # L: consecutive blocks in one critic window (the papers: 2); L > 2 needs offsets
 
     # --- training (WGAN-GP) ---------------------------------------------------------------
     batch_size: int = 64
@@ -64,6 +65,13 @@ class Config:
     pair_window: int = 4            # K: the decoded pair (z_j, z_j+1) has j in [c, c+K-1]
     mean_operation: bool = True     # 2023 eq. 9 on the generated window
     seed: int = 0
+    # Generator rewards (not in the papers; off at these defaults, see mdgan.rewards). Both are computed on one side
+    # batch of reward_chains chains and added to the generator loss; the critic step is unchanged.
+    noise_use_min: float = 0.0      # s > 0: penalise each latent dimension whose share set by fresh noise is below s
+    noise_use_weight: float = 100.0
+    corr_reward_blocks: int = 0     # L >= 2: match the block-sum correlations at lags 1..L-1 to the training region's
+    corr_reward_weight: float = 10.0
+    reward_chains: int = 1024
 
     # --- checkpoints and estimation ------------------------------------------------------
     checkpoint_every: int = 10_000
@@ -76,7 +84,7 @@ class Config:
     def __post_init__(self):
         for name in ("latent_dim", "noise_dim", "block_len", "n_channels", "hidden_dim",
                      "step_skip", "batch_size", "n_iterations", "n_critic", "pair_window",
-                     "checkpoint_every", "estimation_chains"):
+                     "checkpoint_every", "estimation_chains", "critic_blocks", "reward_chains"):
             positive_int(name, getattr(self, name))
         if not isinstance(self.burn_in, int) or isinstance(self.burn_in, bool) or self.burn_in < 0:
             raise ValueError("burn_in must be a non-negative integer")
@@ -110,6 +118,24 @@ class Config:
             raise ValueError("critic_position_scale is only used with critic_input 'positions_scaled'")
         if not 0.0 <= self.latent_noise_share < 1.0:
             raise ValueError("latent_noise_share must be in [0, 1)")
+        if self.critic_blocks < 2:
+            raise ValueError("critic_blocks must be at least 2")
+        if self.critic_blocks != 2 and self.critic_input != "increments":
+            raise ValueError("critic_blocks other than 2 is only supported with critic_input 'increments'")
+        if not 0.0 <= self.noise_use_min < 1.0:
+            raise ValueError("noise_use_min must be in [0, 1)")
+        if isinstance(self.corr_reward_blocks, bool) or not isinstance(self.corr_reward_blocks, int) or \
+                self.corr_reward_blocks < 0 or self.corr_reward_blocks == 1:
+            raise ValueError("corr_reward_blocks must be 0 (off) or an integer >= 2")
+        # a window or a reward over L blocks needs L*M contiguous steps of training data: 2M + K >= L*M
+        for name in ("critic_blocks", "corr_reward_blocks"):
+            if (getattr(self, name) - 2) * self.block_len > self.window_offset_max_steps:
+                raise ValueError(f"{name} = {getattr(self, name)} needs window_offset_max_steps >= "
+                                 f"{(getattr(self, name) - 2) * self.block_len} (training data for that many blocks)")
+        if not (self.noise_use_weight >= 0 and self.corr_reward_weight >= 0):
+            raise ValueError("noise_use_weight and corr_reward_weight must be non-negative")
+        if (self.noise_use_min > 0 or self.corr_reward_blocks) and self.reward_chains < 2:
+            raise ValueError("the rewards need reward_chains >= 2")
         if self.gz_norm_position not in GZ_NORM_POSITIONS:
             raise ValueError(f"gz_norm_position must be one of {GZ_NORM_POSITIONS}")
         if not self.lr > 0:
@@ -134,8 +160,17 @@ class Config:
 
     @property
     def window_len(self) -> int:
-        """2M: the critic's input length in coarse steps."""
+        """2M: the papers' window (and the critic's input length at critic_blocks = 2) in coarse steps."""
         return 2 * self.block_len
+
+    @property
+    def critic_window_len(self) -> int:
+        """L*M: the critic's input length in coarse steps."""
+        return self.critic_blocks * self.block_len
+
+    @property
+    def rewards_on(self) -> bool:
+        return self.noise_use_min > 0 or self.corr_reward_blocks > 0
 
     def estimation_blocks(self, dt_fine_ps: float) -> int:
         """Number of M-step blocks needed to cover estimation_time_ps at this n_s.

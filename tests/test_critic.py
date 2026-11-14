@@ -248,3 +248,31 @@ class TestGradientsAndState:
     def test_state_dict_of_different_config_is_rejected(self, dg):
         with pytest.raises(RuntimeError):
             dg.load_state_dict(Critic(M + 1, C, hidden_dim=H).state_dict(), strict=True)
+
+# =============================================================================
+class TestLongWindow:
+    """n_blocks = L (Config.critic_blocks): one window of L*M steps through the same single input map."""
+
+    def test_default_is_two_blocks(self, dg):
+        assert dg.n_blocks == 2 and dg.window_len == 2 * dg.block_len
+
+    def test_scores_a_window_of_L_blocks_and_refuses_other_lengths(self):
+        from mdgan.models.critic import Critic
+        m = Critic(block_len=8, n_channels=3, hidden_dim=24, n_blocks=5)
+        assert m.window_len == 40 and m.input_conv.kernel_size == (40,) and m.input_conv.stride == (40,)
+        assert m(torch.randn(6, 40, 3)).shape == (6,)
+        with pytest.raises(ValueError, match="per-sample shape"):
+            m(torch.randn(6, 16, 3))
+
+    def test_every_block_of_the_window_reaches_the_score(self):
+        from mdgan.models.critic import Critic
+        m = Critic(block_len=8, n_channels=3, hidden_dim=24, n_blocks=4)
+        w = torch.randn(5, 32, 3, requires_grad=True)
+        m(w).sum().backward()
+        assert (w.grad.reshape(5, 4, 8, 3).abs().amax(dim=(0, 2, 3)) > 0).all()
+
+    @pytest.mark.parametrize("bad", [1, 0, 2.0])
+    def test_invalid_n_blocks(self, bad):
+        from mdgan.models.critic import Critic
+        with pytest.raises(ValueError, match="n_blocks"):
+            Critic(block_len=8, n_blocks=bad)

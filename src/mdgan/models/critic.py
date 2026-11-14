@@ -8,7 +8,8 @@ from mdgan._util import positive_int
 class Critic(nn.Module):
     """WGAN-GP critic (D_G) for MD-GAN. Reference: Kawada et al. (2022) ESI Fig. S2(C).
 
-    Scores one 2M-step displacement window (y_k ‖ y_{k+1}). No normalization
+    Scores one 2M-step displacement window (y_k ‖ y_{k+1}); with n_blocks = L > 2 (Config.critic_blocks, not in
+    the papers) one window of L consecutive blocks, L*M steps, through the same single input map. No normalization
     layers anywhere: the gradient penalty is per-sample and BatchNorm would
     couple samples. Pure function of (window, parameters); never detaches.
     """
@@ -17,17 +18,22 @@ class Critic(nn.Module):
                  block_len: int = 64,
                  n_channels: int = 3,
                  hidden_dim: int = 2048,
-                 negative_slope: float = 0.2):
+                 negative_slope: float = 0.2,
+                 n_blocks: int = 2):
         super().__init__()
 
         positive_int("block_len", block_len)
         positive_int("n_channels", n_channels)
         positive_int("hidden_dim", hidden_dim)
+        positive_int("n_blocks", n_blocks)
+        if n_blocks < 2:
+            raise ValueError("n_blocks must be at least 2")
 
         self.block_len = block_len            # M
         self.n_channels = n_channels          # C
         self.hidden_dim = hidden_dim
-        self.window_len = 2 * block_len       # 2M = 128 at defaults
+        self.n_blocks = n_blocks              # L
+        self.window_len = n_blocks * block_len  # 2M = 128 at defaults
 
         # (B, 2M, C) -> Conv1d(C -> H, kernel 2M, stride 2M) -> (B, H, 1) -> (B, H)
         # With T == 2M exactly, this is one affine map from the flattened window.

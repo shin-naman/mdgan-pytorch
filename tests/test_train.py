@@ -21,7 +21,8 @@ from mdgan.data.dataset import WindowDataset
 from mdgan.data.preprocess import SystemData
 from mdgan.evaluate import reference_msd
 from mdgan.train import (
-    CHECKPOINT_EXIT_CODE, LATEST, MAX_CONSECUTIVE_ROLLBACKS, ROLLBACK_SEED_STRIDE, DivergenceError, Trainer, _frozen,
+    CHECKPOINT_EXIT_CODE, LATEST, MAX_CONSECUTIVE_ROLLBACKS, METRIC_NAMES, ROLLBACK_SEED_STRIDE, DivergenceError, Trainer,
+    _frozen,
     build_config, critic_view, full_checkpoint_name, load_system, main, make_generator_optimizer, snapshot_name,
 )
 
@@ -44,7 +45,7 @@ def brownian(seed=0, n_traj=6, n_steps=200):
 
 def windows(system, c: Config) -> WindowDataset:
     return WindowDataset(system, c.block_len, c.step_skip, c.phase_mode, c.scale_inputs, c.window_offset_max_steps,
-                         c.holdout_trajectories)
+                         c.holdout_trajectories, c.critic_blocks)
 
 
 def trainer(path, c=None, system=None, **kw) -> Trainer:
@@ -337,7 +338,9 @@ class TestAblation:
 class TestBatch1Probes:
     PROBES = [{"gz_additive_noise_std": 0.5}, {"gz_weight_decay": 0.1}, {"gz_dropout": 0.2},
               {"block_len": 16}, {"gz_norm_position": "hidden"}, {"window_offset_max_steps": 5},
-              {"critic_input": "positions"}, {"latent_noise_share": 0.25}, {"holdout_trajectories": (1, 4)}]
+              {"critic_input": "positions"}, {"latent_noise_share": 0.25}, {"holdout_trajectories": (1, 4)},
+              {"critic_blocks": 4, "window_offset_max_steps": 16}, {"noise_use_min": 0.9, "reward_chains": 16},
+              {"corr_reward_blocks": 3, "window_offset_max_steps": 8, "reward_chains": 16}]
 
     def test_default_generator_optimizer_is_the_paper_adam(self):
         from mdgan.models import build_models
@@ -621,6 +624,189 @@ class TestCriticInput:
         on_increments = (c * sum(k * k for k in range(1, 2 * m + 1))) ** 0.5
         assert float(info["grad_norm"]) == pytest.approx(on_positions, rel=1e-5)
         assert abs(float(info["grad_norm"]) - on_increments) > 1.0
+
+
+# =============================================================================
+class TestLongCriticAndRewards:
+    """critic_blocks, noise_use_min and corr_reward_blocks (not in the papers; off by default)."""
+
+    ALL = {"critic_blocks": 4, "window_offset_max_steps": 16, "noise_use_min": 0.9, "corr_reward_blocks": 4,
+           "reward_chains": 16}
+
+    def test_default_run_never_touches_the_rewards(self, tmp_path, monkeypatch):
+        import mdgan.train as train_module
+
+        def forbidden(*a, **kw):
+            raise AssertionError("generator_rewards called with both rewards off")
+
+        monkeypatch.setattr(train_module, "generator_rewards", forbidden)
+        t = trainer(tmp_path / "run")
+        t.run()
+        assert t.metric_names == METRIC_NAMES and t.corr_targets is None
+        keys = {"iteration", *METRIC_NAMES, "iterations_per_second", "rollbacks"}
+        assert all(set(r) == keys for r in jsonl(tmp_path / "run" / "metrics.jsonl"))
+        saved = json.loads((tmp_path / "run" / "dataset.json").read_text())
+        assert "corr_reward_targets" not in saved and "critic_blocks" not in saved
+
+    def test_reward_columns_targets_and_progress(self, tmp_path, capsys):
+        c = tiny(**self.ALL)
+        t = trainer(tmp_path / "run", c, progress=True)
+        t.run()
+        names = ("noise_use_share", "noise_use_penalty", "corr_error", "reward_loss")
+        assert t.metric_names == METRIC_NAMES + names
+        rows = jsonl(tmp_path / "run" / "metrics.jsonl")
+        assert len(rows) == 6 and all(np.isfinite([r[k] for k in t.metric_names]).all() for r in rows)
+        for r in rows:
+            assert 0 <= r["noise_use_share"] <= 2 and r["noise_use_penalty"] >= 0 and r["corr_error"] >= 0
+            assert r["reward_loss"] == pytest.approx(100 * r["noise_use_penalty"] + 10 * r["corr_error"], rel=1e-4)
+        targets = t.dataset.block_sum_correlations(4)
+        assert t.corr_targets.dtype == torch.float32
+        np.testing.assert_allclose(t.corr_targets.numpy(), targets, rtol=1e-6)
+        saved = json.loads((tmp_path / "run" / "dataset.json").read_text())
+        np.testing.assert_allclose(saved["corr_reward_targets"], targets, rtol=1e-6)
+        assert saved["critic_blocks"] == 4
+        lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("it ")]
+        assert len(lines) == 6 and all(f"| {k} " in ln for ln in lines for k in names)
+
+    def test_a_constant_reward_changes_nothing_and_generator_loss_stays_the_critic_term(self, tmp_path, monkeypatch):
+        """The reward acts through its gradient alone. A stand-in that returns a constant and draws nothing must
+        leave every weight and every logged critic-side value as in the default run."""
+        import mdgan.train as train_module
+        trainer(tmp_path / "plain").run()
+        const = {"noise_use_share": torch.tensor(0.5), "noise_use_penalty": torch.tensor(0.25), "reward_loss": torch.tensor(7.0)}
+        monkeypatch.setattr(train_module, "generator_rewards", lambda *a, **kw: (torch.tensor(7.0), const))
+        trainer(tmp_path / "const", tiny(noise_use_min=0.9)).run()
+        assert_same_weights(weights(tmp_path / "plain" / LATEST), weights(tmp_path / "const" / LATEST))
+        plain, const_rows = jsonl(tmp_path / "plain" / "metrics.jsonl"), jsonl(tmp_path / "const" / "metrics.jsonl")
+        assert [[r[k] for k in METRIC_NAMES] for r in plain] == [[r[k] for k in METRIC_NAMES] for r in const_rows]
+        assert [r["reward_loss"] for r in const_rows] == [7.0] * 6
+
+    @pytest.mark.parametrize("on,off", [({"noise_use_min": 0.9}, {"noise_use_weight": 0.0}),
+                                        ({"corr_reward_blocks": 3, "window_offset_max_steps": 8}, {"corr_reward_weight": 0.0})],
+                             ids=["noise_use", "correlations"])
+    def test_each_reward_moves_the_generators(self, tmp_path, on, off):
+        """Weight 0 draws the same numbers and adds nothing: the difference from the weighted run is the
+        reward's gradient. The critic sees the reward only through the generators it is trained against, so
+        after one iteration its weights still agree."""
+        base = {**on, "reward_chains": 16, "n_iterations": 1, "checkpoint_every": 1}
+        trainer(tmp_path / "with", tiny(**base)).run()
+        trainer(tmp_path / "zero", tiny(**base, **off)).run()
+        a, b = weights(tmp_path / "with" / LATEST), weights(tmp_path / "zero" / LATEST)
+        assert any(not torch.equal(a[k], b[k]) for k in a if k.startswith("gz."))
+        if "corr_reward_blocks" in on:
+            assert any(not torch.equal(a[k], b[k]) for k in a if k.startswith("gy."))
+        else:
+            assert all(torch.equal(a[k], b[k]) for k in a if k.startswith("gy."))       # the noise-use term has no G_Y
+        assert all(torch.equal(a[k], b[k]) for k in a if k.startswith("dg."))
+
+    def test_rewards_draw_from_the_trainer_generator_only(self, tmp_path, monkeypatch):
+        """One generator drives data and model noise, the side batch included; training leaves the global
+        torch RNG where the constructor put it."""
+        import mdgan.train as train_module
+        original, seen = train_module.generator_rewards, []
+
+        def spy(*a, generator=None, **kw):
+            seen.append(generator)
+            return original(*a, generator=generator, **kw)
+
+        monkeypatch.setattr(train_module, "generator_rewards", spy)
+        t = trainer(tmp_path / "run", tiny(**self.ALL))
+        before = torch.get_rng_state().clone()
+        t.run()
+        assert len(seen) == 6 and all(g is t.gen for g in seen)
+        assert torch.equal(before, torch.get_rng_state())
+
+    def test_non_finite_reward_rolls_back_at_that_iteration(self, tmp_path, monkeypatch):
+        import mdgan.train as train_module
+        original = train_module.generator_rewards
+        out = tmp_path / "run"
+        t = trainer(out, tiny(noise_use_min=0.9, reward_chains=16))
+        seen = []
+
+        def poisoned(*a, **kw):
+            reward, stats = original(*a, **kw)
+            seen.append(t.iteration)
+            if t.iteration == 3 and seen.count(3) == 1:                   # update 4, first attempt
+                return reward, {**stats, "reward_loss": stats["reward_loss"] * float("nan")}
+            return reward, stats
+
+        monkeypatch.setattr(train_module, "generator_rewards", poisoned)
+        t.run()
+        assert [(r["failed_at_iteration"], r["to_iteration"]) for r in t.rollbacks] == [(4, 3)]
+        assert [r["iteration"] for r in jsonl(out / "metrics.jsonl")] == [1, 2, 3, 4, 5, 6]
+        assert all(np.isfinite(r["reward_loss"]) for r in jsonl(out / "metrics.jsonl"))
+
+    def test_critic_sees_L_blocks_real_and_fake(self, tmp_path, monkeypatch):
+        import mdgan.train as train_module
+        crit, gen, shapes = train_module.critic_loss, train_module.generator_loss, []
+
+        def rec_crit(critic, real, fake, *a, **kw):
+            shapes.append((tuple(real.shape), tuple(fake.shape)))
+            return crit(critic, real, fake, *a, **kw)
+
+        def rec_gen(critic, fake):
+            shapes.append((tuple(fake.shape),))
+            return gen(critic, fake)
+
+        monkeypatch.setattr(train_module, "critic_loss", rec_crit)
+        monkeypatch.setattr(train_module, "generator_loss", rec_gen)
+        t = trainer(tmp_path / "run", tiny(critic_blocks=4, window_offset_max_steps=16, n_iterations=1))
+        t.run()
+        long = (TINY["batch_size"], 4 * TINY["block_len"], 3)
+        assert shapes == [(long, long), (long, long), (long,)] and t.dg.window_len == 4 * TINY["block_len"]
+
+    def test_dataset_and_config_must_agree_on_critic_blocks(self, tmp_path):
+        two = WindowDataset(brownian(), 8, 1, window_offset_max_steps=16)
+        four = WindowDataset(brownian(), 8, 1, window_offset_max_steps=16, critic_blocks=4)
+        for c, ds in ((tiny(critic_blocks=4, window_offset_max_steps=16), two), (tiny(window_offset_max_steps=16), four)):
+            with pytest.raises(ValueError, match="does not match.*critic_blocks"):
+                Trainer(c, ds, tmp_path / "run")
+
+    @pytest.mark.parametrize("change", [{"critic_blocks": 2}, {"noise_use_min": 0.5}, {"noise_use_weight": 1.0},
+                                        {"corr_reward_blocks": 3}, {"corr_reward_weight": 1.0}, {"reward_chains": 8}],
+                             ids=lambda p: next(iter(p)))
+    def test_resume_refuses_a_change_of_any_new_option(self, tmp_path, change):
+        out = tmp_path / "run"
+        trainer(out, tiny(**self.ALL, n_iterations=3)).run()
+        with pytest.raises(ValueError, match="config differs from the checkpoint.*" + next(iter(change))):
+            trainer(out, tiny(**{**self.ALL, **change}), resume=True)
+
+    def test_time_limit_restarts_with_everything_on_are_bit_exact(self, tmp_path):
+        """The cluster cycle (one iteration per session) with the long critic and both rewards: the rewards
+        draw from the checkpointed generator, so six sessions == one straight run, logs included."""
+        c = tiny(**self.ALL)
+        straight = tmp_path / "straight"
+        trainer(straight, c).run()
+        out = tmp_path / "chunked"
+        status, sessions = trainer(out, c).run(max_seconds=0), 1
+        while status == "time_limit" and sessions < 20:
+            status, sessions = trainer(out, c, resume=True).run(max_seconds=0), sessions + 1
+        assert status == "done" and sessions == 6
+        assert_same_weights(weights(straight / LATEST), weights(out / LATEST))
+        drop = lambda rows: [{k: v for k, v in r.items() if k != "iterations_per_second"} for r in rows]   # noqa: E731
+        assert drop(jsonl(straight / "metrics.jsonl")) == drop(jsonl(out / "metrics.jsonl"))
+        assert json.loads((straight / "dataset.json").read_text()) == json.loads((out / "dataset.json").read_text())
+
+    def test_cluster_job_cycle_with_everything_on(self, tmp_path, capsys):
+        """The command a CHTC job runs (cache file, --auto-resume, exit 85 until done) equals the straight run."""
+        cache, system = TestCluster()._cache(tmp_path)
+        c = tiny(**self.ALL)
+        cfg = tmp_path / "all.json"
+        cfg.write_text(json.dumps(c.to_dict()))
+        out = tmp_path / "run"
+        cmd = [str(cache), "--out", str(out), "--config", str(cfg), "--auto-resume", "--max-hours", "0",
+               "--log-every", "1", "--no-eval"]
+        codes = [main(cmd)]
+        while codes[-1] == CHECKPOINT_EXIT_CODE and len(codes) < 20:
+            codes.append(main(cmd))
+        assert codes == [CHECKPOINT_EXIT_CODE] * 5 + [0]
+        assert "| reward_loss " in capsys.readouterr().out
+        straight = tmp_path / "straight"
+        Trainer(c, windows(system, c), straight).run()
+        assert_same_weights(weights(straight / LATEST), weights(out / LATEST))
+        ck = load_checkpoint(out / LATEST)
+        assert ck.dg.n_blocks == 4 and ck.config == c
+        assert json.loads((out / "dataset.json").read_text())["critic_blocks"] == 4
 
 
 # =============================================================================

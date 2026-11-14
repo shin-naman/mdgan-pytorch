@@ -34,6 +34,14 @@ scale_inputs=False is the unscaled ablation: windows stay in nm and sigma_nm = 1
 window_std_nm (the raw spread) is recorded either way, so a resumed run can check it
 is training on the same data.
 
+LONGER CRITIC WINDOWS AND CORRELATION TARGETS (not in the papers)
+----------------------------------------------------------------
+critic_blocks = L > 2 makes sample() return windows of L*M steps for a critic over L blocks.
+They are drawn from the same region of (2M + K) steps that window offsets define, so L*M may
+not exceed it, and the region, sigma and the split are the same as for a 2-block run with the
+same K. block_sum_correlations gives the correlations of M-step block sums in that region, the
+target of the generator's correlation reward (mdgan.rewards).
+
 Units: windows in sigma units (dimensionless); dt_ps and sigma_nm in metadata.
 """
 
@@ -73,7 +81,7 @@ class WindowDataset:
 
     def __init__(self, system: SystemData, block_len: int = 64, step_skip: int = 1,
                  phase_mode: str = "single", scale_inputs: bool = True, window_offset_max_steps: int = 0,
-                 holdout_trajectories: tuple[int, ...] = ()):
+                 holdout_trajectories: tuple[int, ...] = (), critic_blocks: int = 2):
         positive_int("block_len", block_len)
         positive_int("step_skip", step_skip)
         if phase_mode not in PHASE_MODES:
@@ -104,6 +112,14 @@ class WindowDataset:
         # sigma is still computed from the offset-0 windows only, so it does not depend on K.
         self.window_offset_max_steps = int(window_offset_max_steps)
         span = self.window_len + self.window_offset_max_steps        # coarse steps a draw may touch
+        # Critic windows of L blocks (Config.critic_blocks; 2 = the papers'). A draw is then L*M steps starting at
+        # an offset in [0, 2M + K - L*M], inside the same region; sigma and the offset-0 windows do not depend on L.
+        positive_int("critic_blocks", critic_blocks)
+        if critic_blocks < 2 or critic_blocks * block_len > span:
+            raise ValueError(f"critic_blocks = {critic_blocks} needs 2 <= critic_blocks and "
+                             f"window_offset_max_steps >= {(critic_blocks - 2) * block_len}")
+        self.critic_blocks = critic_blocks
+        self.sample_len = critic_blocks * block_len                  # steps in one sampled window (2M by default)
 
         # --- 1. Training region: the first (2M + K)*n_s fine steps (+ n_s-1 for "all") ---
         phases = range(step_skip) if phase_mode == "all" else range(1)
@@ -154,16 +170,44 @@ class WindowDataset:
                device=None) -> torch.Tensor:
         """`batch` windows drawn WITH replacement (W may be < batch): (B, 2M, C) float32.
         With window offsets, each window then starts at its own offset ~ U{0..K}, drawn after the
-        indices from the same generator; with K = 0 nothing extra is drawn (the paper's sampling)."""
+        indices from the same generator; with K = 0 nothing extra is drawn (the paper's sampling).
+        With critic_blocks = L the windows are (B, L*M, C) and the offsets ~ U{0..K - (L - 2)M}."""
         positive_int("batch", batch)
         idx = torch.randint(0, self.n_windows, (batch,), generator=generator)
         if self._series is None:
             out = self._windows[idx]
         else:
-            off = torch.randint(0, self.window_offset_max_steps + 1, (batch,), generator=generator)
-            pos = off[:, None] + torch.arange(self.window_len)[None, :]                     # (B, 2M)
+            last = self.window_len + self.window_offset_max_steps - self.sample_len     # K at critic_blocks = 2
+            off = torch.randint(0, last + 1, (batch,), generator=generator)
+            pos = off[:, None] + torch.arange(self.sample_len)[None, :]                     # (B, L*M)
             out = self._series[idx[:, None], pos]
         return out.to(device) if device is not None else out
+
+    def block_sum_correlations(self, n_blocks: int) -> np.ndarray:
+        """(n_blocks - 1,) correlations of the training region's M-step block sums at lags 1 .. n_blocks - 1.
+
+        Pooled over trajectories, blocks and axes (means removed per lag), for the block grid started at each of
+        the M positions o = 0 .. M-1 of the region, then averaged over o. Scale-free. Training trajectories only,
+        the same (2M + K) steps the windows come from; needs n_blocks * M of them."""
+        positive_int("n_blocks", n_blocks)
+        series = (self._windows if self._series is None else self._series).numpy().astype(np.float64)
+        w, span, c = series.shape
+        if n_blocks < 2 or n_blocks * self.block_len > span:
+            raise ValueError(f"block-sum correlations over {n_blocks} blocks need 2 <= n_blocks and "
+                             f"window_offset_max_steps >= {(n_blocks - 2) * self.block_len}")
+        rho = []
+        for o in range(self.block_len):
+            nb = (span - o) // self.block_len
+            if nb < n_blocks:                                   # this grid position no longer holds n_blocks blocks
+                break
+            sums = series[:, o:o + nb * self.block_len].reshape(w, nb, self.block_len, c).sum(axis=2)
+            row = []
+            for k in range(1, n_blocks):
+                x, y = sums[:, :-k].ravel(), sums[:, k:].ravel()
+                x, y = x - x.mean(), y - y.mean()
+                row.append((x * y).mean() / np.sqrt((x * x).mean() * (y * y).mean()))
+            rho.append(row)
+        return np.mean(rho, axis=0)
 
     @property
     def metadata(self) -> dict:
@@ -187,6 +231,7 @@ class WindowDataset:
             **({"window_offset_max_steps": self.window_offset_max_steps} if self.window_offset_max_steps else {}),
             # likewise present only when non-empty: the split is in dataset.json and checked on resume
             **({"holdout_trajectories": list(self.holdout_trajectories)} if self.holdout_trajectories else {}),
+            **({"critic_blocks": self.critic_blocks} if self.critic_blocks != 2 else {}),
         }
 
     def __len__(self) -> int:

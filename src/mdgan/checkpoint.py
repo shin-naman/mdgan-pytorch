@@ -86,6 +86,7 @@ def _check_models_match_config(config: Config, models) -> None:
         checks["hidden_dim"] += (dg.hidden_dim,)
         checks["block_len"] += (dg.block_len,)
         checks["n_channels"] += (dg.n_channels,)
+        checks["critic_blocks"] = (dg.n_blocks,)
     for name, values in checks.items():
         if any(v != getattr(config, name) for v in values):
             raise ValueError(f"models do not match the config: {name} = {values}, config has {getattr(config, name)}")
