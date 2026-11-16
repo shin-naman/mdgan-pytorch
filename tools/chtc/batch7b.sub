@@ -1,0 +1,44 @@
+# Batch 7b: c8_noise_corr at the smallest data budget an 8-block critic allows. 3 jobs, seeds 0-2, 50k, one full
+# checkpoint at 50k. configs/batch7_c8_noise_corr_5ns.json = batch7_c8_noise_corr.json with window_offset_max_steps
+# 384 instead of 7872: region 2M + K = 512 steps = 5.12 ns per trajectory (the papers: 1.28 ns), exactly one 8-block
+# critic window, so the offsets are U{0..0}: one fixed window per trajectory, as in the papers, 4x longer.
+# Same ten held-out trajectories as batch 7 (so the held-out test applies the same way); sigma and the correlation-
+# reward targets come from the 50 trajectories' 5.12 ns. NOT in the papers.
+# QUESTION: do the 8-block critic and the rewards still fix the drift with 16x less data than batch 7?
+# Submit from the repository root in /home:  condor_submit tools/chtc/batch7b.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+executable                = tools/chtc/run_train.sh
+should_transfer_files     = YES
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+
+request_gpus              = 1
+# The container's PyTorch (2.5.1, CUDA 12.4) has GPU code for compute capability 5.0-9.0 only;
+# newer GPUs fail at the first CUDA call ('no kernel image is available'). 9.0 = H100, 8.9 = L40.
+gpus_minimum_capability   = 7.0
+gpus_maximum_capability   = 9.0
+# gpu2008: its GPU fails every job at the first CUDA call (busy or unavailable), Nov 2026
+requirements              = (Machine != "gpu2008.chtc.wisc.edu")
++WantGPULab               = true
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 5GB
+
+arguments                 = $(ARM)_c$(Cluster)_seed$(SEED) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=batch7_$(ARM).json"
+transfer_input_files      = src, configs/batch7_$(ARM).json, data/cache/PE.npz
+transfer_checkpoint_files = run_$(ARM)_c$(Cluster)_seed$(SEED)
+transfer_output_files     = run_$(ARM)_c$(Cluster)_seed$(SEED)
+log                       = logs/$(ARM)_c$(Cluster)_seed$(SEED).log
+output                    = logs/$(ARM)_c$(Cluster)_seed$(SEED).out
+error                     = logs/$(ARM)_c$(Cluster)_seed$(SEED).err
+
+ARM = c8_noise_corr_5ns
+queue SEED from (
+  0
+  1
+  2
+)
