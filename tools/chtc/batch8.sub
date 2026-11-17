@@ -1,4 +1,4 @@
-# Batch 8: the rewards with a 2-block critic, and short data. 18 jobs = 6 arms x seeds 0-2, 50k, snapshots every
+# Batch 8: the rewards with a 2-block critic, and short data. 21 jobs = 7 arms x seeds 0-2, 50k, snapshots every
 # 10k and one full checkpoint at 50k. M 64, sigma units, 50 training trajectories with the same ten held out as in
 # Batches 6-7 everywhere. Each config is configs/batch7_c8_noise_corr.json with only window_offset_max_steps,
 # critic_blocks, noise_use_min and corr_reward_blocks changed. NOT in the papers.
@@ -26,10 +26,20 @@
 #                  PREDICTION: no collapse (unlike 7b); var/MD about 1; D 1.3 to 1.5 x.
 #   c4_both_10ns   16 blocks                           4       noise + corr(1-3)  c2_both_10ns
 #                  PREDICTION: same as c2_both_10ns.
+#   c8_none_full   all 80 ns                           8       none               offsets_full (2-block critic, same
+#                  The missing control for c8_noise_corr: in the miniature, with    data, no rewards) and c8_noise
+#                  both rewards on, the critic length made no difference at 16      (8-block critic, same data, noise
+#                  blocks, which implies the 8-block critic added nothing there.    reward)
+#                  If this arm gives sum rho at the MD's and no drift, the critic did the work and the rewards were
+#                  redundant; if it looks like offsets_full, the rewards did.
+#                  PREDICTION (from m256 and the miniature): sum rho (1-7) partly pinned, sum rho (8-30) free in some
+#                  seeds, DC share unchanged, var/MD near 1, D above 1 from the missing anticorrelation. No collapse
+#                  is expected on 80 ns, but read the critic distance (W in metrics.jsonl) in this arm: it is the
+#                  number that caught the collapse in the miniature.
 #
 # Read block variance, sum rho and the MSD against the reference at fixed times before D; D means nothing where the
 # MSD is bent. Extra columns in metrics.jsonl: noise_use_share, noise_use_penalty, corr_error, reward_loss.
-# Laptop check only (40 iterations of each config on CPU): all six start, values finite. Time per iteration on CPU:
+# Laptop check only (40 iterations of each config on CPU): all seven start, values finite. Time per iteration on CPU:
 # the arms with corr(1-3) about 2 x c2_noise_full. No run at this size exists; at 5.12 ns two 600-iteration laptop
 # runs (2- and 4-block critic, lags 1-7) trained without the 7b collapse (W 5, step std 0.95).
 # Submit from the repository root in /home:  condor_submit tools/chtc/batch8.sub
@@ -82,4 +92,7 @@ queue ARM, SEED from (
   c4_both_10ns, 0
   c4_both_10ns, 1
   c4_both_10ns, 2
+  c8_none_full, 0
+  c8_none_full, 1
+  c8_none_full, 2
 )
