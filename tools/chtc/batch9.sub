@@ -1,0 +1,91 @@
+# Batch 9: the seven Batch 8 arms with the critic on positions. 21 jobs = 7 arms x seeds 0-2, 50k, snapshots every
+# 10k and one full checkpoint at 50k. Each config is the same-named configs/batch8_<arm>.json with critic_input
+# "positions": the critic sees the cumulative sum over its whole window (2, 4 or 8 blocks), real and generated alike,
+# after the mean operation, and the gradient penalty is taken in position space. Unscaled positions, as Batches 4
+# and 6. Everything else is Batch 8: M 64, sigma units, the same 50 training trajectories and ten held out, rewards
+# noise = noise_use_min 0.5 and corr(1-3) = corr_reward_blocks 4, both computed on displacements as before.
+# WHY: 2023 p. 80 reads as a critic on trajectories ("the cumulative sum of the time series data of displacements
+# for the 2M steps generated"); the 2022 ESI figure draws the displacement pair. Batches 4-6 ran positions with a
+# 2-block critic and no rewards (they drifted); positions with the rewards has not been run at this size.
+# CODE: p_c4_both_10ns and p_c8_none_full need this branch: Config now accepts critic_blocks other than 2 with
+# critic_input "positions" (still refused with "positions_scaled", whose scale is that of 2M windows).
+# CONTROL for every arm: the same-named Batch 8 arm (critic on displacements).
+#
+#   arm               data region   critic  rewards
+#   p_c2_both_full    all 80 ns     2       noise + corr(1-3)
+#   p_c2_noise_full   all 80 ns     2       noise
+#   p_c2_corr_full    all 80 ns     2       corr(1-3)
+#   p_c2_both_10ns    10.24 ns      2       noise + corr(1-3)
+#   p_c2_both_5ns     5.12 ns       2       noise + corr(1-3)
+#   p_c4_both_10ns    10.24 ns      4       noise + corr(1-3)
+#   p_c8_none_full    all 80 ns     8       none
+#
+# MINIATURE (cage walk, 8-step blocks, 3 seeds, 10k; positions against displacements on the same seeds; sum rho over
+# lags 1-30, truth -0.426; MSD ratio to the reference at 10 ns):
+#   both rewards (4 arms)   positions is a little worse: sum rho weaker by 0.01-0.03, MSD ratio 1.34-2.18 against
+#                           1.23-1.56. Positions divided by their RMS ratio (not in this batch) matched displacements.
+#   noise only              worse: sum rho -0.283 against -0.356, MSD ratio 2.7 against 2.0.
+#   corr(1-3) only          drift in 2 of 3 seeds: sum rho -0.089 against -0.389, MSD ratio 5.7 against 1.35.
+#   8-block critic, none    drift in 3 of 3 seeds: sum rho +0.79 against -0.395, MSD ratio 17 against 1.1, MSD bent.
+# The miniature is far more anticorrelated than PE (1 + 2 sum rho = 0.15 against 0.61), so the size of these gaps
+# need not carry over; the direction is the prediction.
+# PREDICTION: no arm better than its Batch 8 twin on sum rho; p_c8_none_full and p_c2_corr_full drift (DC high, MSD
+# bent) in at least one seed; the three p_c2_both arms and p_c4_both_10ns within reach of their twins. Closes the
+# other way if the positions arms with both rewards have sum rho nearer the MD's than their twins in 2 of 3 seeds.
+# Read block variance, sum rho and the MSD against the reference at fixed times before D. Critic distances (W) are
+# in position units here and cannot be compared with Batch 8's.
+# Laptop check only: 40 iterations of each config on PE (CPU), all seven finite; fast suite 670 passed.
+# Submit from the repository root in /home:  condor_submit tools/chtc/batch9.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+executable                = tools/chtc/run_train.sh
+should_transfer_files     = YES
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+
+request_gpus              = 1
+# The container's PyTorch (2.5.1, CUDA 12.4) has GPU code for compute capability 5.0-9.0 only;
+# newer GPUs fail at the first CUDA call ('no kernel image is available'). 9.0 = H100, 8.9 = L40.
+gpus_minimum_capability   = 7.0
+gpus_maximum_capability   = 9.0
+# gpu2008: its GPU fails every job at the first CUDA call (busy or unavailable), Nov 2026
+requirements              = (Machine != "gpu2008.chtc.wisc.edu")
++WantGPULab               = true
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 5GB
+
+arguments                 = $(ARM)_c$(Cluster)_seed$(SEED) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=batch9_$(ARM).json"
+transfer_input_files      = src, configs/batch9_$(ARM).json, data/cache/PE.npz
+transfer_checkpoint_files = run_$(ARM)_c$(Cluster)_seed$(SEED)
+transfer_output_files     = run_$(ARM)_c$(Cluster)_seed$(SEED)
+log                       = logs/$(ARM)_c$(Cluster)_seed$(SEED).log
+output                    = logs/$(ARM)_c$(Cluster)_seed$(SEED).out
+error                     = logs/$(ARM)_c$(Cluster)_seed$(SEED).err
+
+queue ARM, SEED from (
+  p_c2_both_full, 0
+  p_c2_both_full, 1
+  p_c2_both_full, 2
+  p_c2_noise_full, 0
+  p_c2_noise_full, 1
+  p_c2_noise_full, 2
+  p_c2_corr_full, 0
+  p_c2_corr_full, 1
+  p_c2_corr_full, 2
+  p_c2_both_10ns, 0
+  p_c2_both_10ns, 1
+  p_c2_both_10ns, 2
+  p_c2_both_5ns, 0
+  p_c2_both_5ns, 1
+  p_c2_both_5ns, 2
+  p_c4_both_10ns, 0
+  p_c4_both_10ns, 1
+  p_c4_both_10ns, 2
+  p_c8_none_full, 0
+  p_c8_none_full, 1
+  p_c8_none_full, 2
+)

@@ -47,6 +47,10 @@ class TestDefaults:
         assert c.critic_window_len == 64 and c.window_len == 16
         assert Config(noise_use_min=0.5).rewards_on and Config(corr_reward_blocks=2).rewards_on
 
+    def test_long_critic_accepts_positions(self):
+        c = Config(block_len=8, critic_blocks=4, window_offset_max_steps=16, critic_input="positions")
+        assert c.critic_window_len == 32 and c.critic_input == "positions"
+
     @pytest.mark.parametrize("step_skip,blocks", [(1, 125), (5, 25), (7, 18), (20, 7)])
     def test_estimation_blocks_cover_80_ns(self, step_skip, blocks):
         """80 ns at 10 ps fine steps: PE n_s=1 -> 8000 coarse steps -> exactly 125 blocks;
@@ -65,7 +69,7 @@ class TestValidation:
         dict(step_skip=2.0), dict(pair_window=0), dict(estimation_chains=0),
         dict(burn_in=-1), dict(seed=-1), dict(phase_mode="some"),
         dict(lr=0.0), dict(betas=(0.0, 1.0)), dict(betas=(0.5,)), dict(gp_lambda=-1.0),
-        dict(negative_slope=-0.1), dict(init="xavier"), dict(gz_additive_noise_std=-0.1), dict(gz_weight_decay=-1.0), dict(gz_dropout=1.0), dict(gz_norm_position="input"), dict(window_offset_max_steps=-1), dict(critic_input="velocities"), dict(gz_weight_decay_on_norm="no"), dict(latent_noise_share=1.0), dict(holdout_trajectories=(3, 3)), dict(holdout_trajectories=(-1,)), dict(critic_input="positions_scaled"), dict(critic_input="positions_scaled", critic_position_scale=-1.0), dict(critic_position_scale=2.9873), dict(full_checkpoint_iterations=(5000,)), dict(full_checkpoint_iterations=(0,)), dict(window_offset_max_steps=2.5), dict(critic_blocks=1), dict(critic_blocks=2.0), dict(critic_blocks=3), dict(critic_blocks=8, window_offset_max_steps=383), dict(critic_blocks=4, window_offset_max_steps=128, critic_input="positions"), dict(noise_use_min=1.0), dict(noise_use_min=-0.1), dict(noise_use_weight=-1.0), dict(corr_reward_blocks=1), dict(corr_reward_blocks=-2), dict(corr_reward_blocks=2.0), dict(corr_reward_blocks=True), dict(corr_reward_blocks=8, window_offset_max_steps=383), dict(corr_reward_weight=-1.0), dict(reward_chains=0), dict(noise_use_min=0.5, reward_chains=1), dict(err_window_ps=(78_000.0, 200.0)),
+        dict(negative_slope=-0.1), dict(init="xavier"), dict(gz_additive_noise_std=-0.1), dict(gz_weight_decay=-1.0), dict(gz_dropout=1.0), dict(gz_norm_position="input"), dict(window_offset_max_steps=-1), dict(critic_input="velocities"), dict(gz_weight_decay_on_norm="no"), dict(latent_noise_share=1.0), dict(holdout_trajectories=(3, 3)), dict(holdout_trajectories=(-1,)), dict(critic_input="positions_scaled"), dict(critic_input="positions_scaled", critic_position_scale=-1.0), dict(critic_position_scale=2.9873), dict(full_checkpoint_iterations=(5000,)), dict(full_checkpoint_iterations=(0,)), dict(window_offset_max_steps=2.5), dict(critic_blocks=1), dict(critic_blocks=2.0), dict(critic_blocks=3), dict(critic_blocks=8, window_offset_max_steps=383), dict(critic_blocks=4, window_offset_max_steps=128, critic_input="positions_scaled", critic_position_scale=2.0), dict(noise_use_min=1.0), dict(noise_use_min=-0.1), dict(noise_use_weight=-1.0), dict(corr_reward_blocks=1), dict(corr_reward_blocks=-2), dict(corr_reward_blocks=2.0), dict(corr_reward_blocks=True), dict(corr_reward_blocks=8, window_offset_max_steps=383), dict(corr_reward_weight=-1.0), dict(reward_chains=0), dict(noise_use_min=0.5, reward_chains=1), dict(err_window_ps=(78_000.0, 200.0)),
         dict(diffusion_fit_ps=(0.0, 10.0)), dict(estimation_time_ps=0.0),
         dict(estimation_time_ps=10_000.0), dict(err_window_ps=(200.0, 90_000.0)),
         dict(diffusion_fit_ps=(10_000.0, 85_000.0)),

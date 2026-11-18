@@ -120,8 +120,8 @@ class Config:
             raise ValueError("latent_noise_share must be in [0, 1)")
         if self.critic_blocks < 2:
             raise ValueError("critic_blocks must be at least 2")
-        if self.critic_blocks != 2 and self.critic_input != "increments":
-            raise ValueError("critic_blocks other than 2 is only supported with critic_input 'increments'")
+        if self.critic_blocks != 2 and self.critic_input == "positions_scaled":      # its scale is that of 2M windows
+            raise ValueError("critic_blocks other than 2 is not supported with critic_input 'positions_scaled'")
         if not 0.0 <= self.noise_use_min < 1.0:
             raise ValueError("noise_use_min must be in [0, 1)")
         if isinstance(self.corr_reward_blocks, bool) or not isinstance(self.corr_reward_blocks, int) or \

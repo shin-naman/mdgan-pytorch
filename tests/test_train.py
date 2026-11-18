@@ -648,6 +648,47 @@ class TestLongCriticAndRewards:
         saved = json.loads((tmp_path / "run" / "dataset.json").read_text())
         assert "corr_reward_targets" not in saved and "critic_blocks" not in saved
 
+    def test_long_critic_on_positions_sees_the_cumsum_of_the_whole_window(self, tmp_path, monkeypatch):
+        """critic_blocks 4 with critic_input positions: every critic call gets cumsum over all 4 M steps of the
+        sampled real window and of the fake one; the generator call gets the same of its fake."""
+        import mdgan.train as train_module
+        t = trainer(tmp_path / "run", tiny(critic_blocks=4, window_offset_max_steps=16, critic_input="positions",
+                                           n_iterations=1))
+        sampled, fakes, critic_in, gen_in = [], [], [], []
+        sample, make, crit, gen = (t.dataset.sample, train_module.make_fake_window, train_module.critic_loss,
+                                   train_module.generator_loss)
+
+        def rec_sample(*a, **kw):
+            sampled.append(sample(*a, **kw))
+            return sampled[-1]
+
+        def rec_make(*a, **kw):
+            out = make(*a, **kw)
+            fakes.append(out.detach().clone())
+            return out
+
+        def rec_crit(critic, real, fake, *a, **kw):
+            critic_in.append((real.detach().clone(), fake.detach().clone()))
+            return crit(critic, real, fake, *a, **kw)
+
+        def rec_gen(critic, fake):
+            gen_in.append(fake.detach().clone())
+            return gen(critic, fake)
+
+        monkeypatch.setattr(t.dataset, "sample", rec_sample)
+        monkeypatch.setattr(train_module, "make_fake_window", rec_make)
+        monkeypatch.setattr(train_module, "critic_loss", rec_crit)
+        monkeypatch.setattr(train_module, "generator_loss", rec_gen)
+        t.run()
+        n, steps = TINY["n_critic"], 4 * t.config.block_len
+        assert len(critic_in) == n and len(sampled) == n and len(gen_in) == 1 and len(fakes) == n + 1
+        for (real, fake), s, f in zip(critic_in, sampled, fakes, strict=False):
+            assert real.shape[1] == steps and fake.shape[1] == steps
+            torch.testing.assert_close(real, torch.cumsum(s, dim=1))
+            torch.testing.assert_close(fake, torch.cumsum(f, dim=1))
+        torch.testing.assert_close(gen_in[0], torch.cumsum(fakes[-1], dim=1))
+        assert not torch.equal(critic_in[0][0][:, steps // 2], sampled[0][:, steps // 2])     # not the increments
+
     def test_reward_columns_targets_and_progress(self, tmp_path, capsys):
         c = tiny(**self.ALL)
         t = trainer(tmp_path / "run", c, progress=True)

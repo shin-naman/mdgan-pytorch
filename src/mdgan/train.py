@@ -75,11 +75,11 @@ METRIC_NAMES = ("wasserstein", "gradient_penalty", "grad_norm", "generator_loss"
 
 
 def critic_view(window: torch.Tensor, critic_input: str, scale: float | None = None) -> torch.Tensor:
-    """What the critic sees of a (B, 2M, C) window (Config.critic_input).
+    """What the critic sees of a (B, L*M, C) window, L = Config.critic_blocks (Config.critic_input).
 
     "increments" (the paper as read): the step displacements themselves; returned unchanged (the same
     tensor), so the default training step is bit-identical to before this option existed.
-    "positions": cumulative positions, cumsum over all 2M steps, with no reset at the block boundary
+    "positions": cumulative positions, cumsum over all L*M steps, with no reset at the block boundaries
     and no further normalisation. Applied after the mean operation (fake windows arrive centred from
     make_fake_window) to real and fake alike, in the critic step and the generator step; the gradient
     penalty is then built from, and differentiated with respect to, the position windows.
