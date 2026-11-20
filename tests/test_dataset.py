@@ -516,3 +516,99 @@ def test_block_sum_correlations_need_the_blocks_in_the_region(n):
     ds = WindowDataset(make_system(), block_len=M, step_skip=1, window_offset_max_steps=2 * M)    # 4 blocks
     with pytest.raises(ValueError, match="n_blocks"):
         ds.block_sum_correlations(n)
+
+
+# --- block-sum variance (the variance reward's target) ------------------------------------------------------
+
+def test_block_sum_variance_equals_an_independent_computation():
+    """np.var of explicitly summed blocks pooled over trajectories, blocks and axes, per grid position that holds
+    n_blocks blocks, averaged over those positions; in the model's units (here nm, scale_inputs False)."""
+    sys_ = _ar_system(-0.4)
+    d = sys_.displacements.astype(np.float64)
+    for k_max, n_blocks in ((58 * M, 4), (2 * M, 4), (0, 2)):           # whole system; exactly 4 blocks; the papers' 2
+        ds = WindowDataset(sys_, block_len=M, step_skip=1, scale_inputs=False, window_offset_max_steps=k_max)
+        span = 2 * M + k_max
+        vals = []
+        for o in range(M):
+            nb = (span - o) // M
+            if nb < n_blocks:
+                break
+            sums = np.stack([d[:, o + b * M:o + (b + 1) * M].sum(axis=1) for b in range(nb)], axis=1)
+            vals.append(np.var(sums))
+        assert len(vals) == (M if k_max == 58 * M else 1)
+        np.testing.assert_allclose(ds.block_sum_variance(n_blocks), np.mean(vals), rtol=1e-5)    # float32 windows
+
+
+@pytest.mark.statistical
+def test_block_sum_variance_recovers_a_known_variance():
+    """Independent normal steps of standard deviation s: a block sum of M steps has variance M s^2. 200 x 3
+    series of 30 blocks give 18,000 sums per grid position, a relative standard error of sqrt(2 / 18,000) =
+    1.1 %; the tolerance is 5 % (above 4 standard errors). With scaling, the same number divided by sigma^2."""
+    s = 0.17
+    d = np.random.default_rng(1).normal(scale=s, size=(200, 30 * M, 3))
+    sys_ = SystemData(name="iid", displacements=d.astype(np.float32), dt_ps=10.0, box_nm=np.full((200, 3), 4.75), meta={})
+    raw = WindowDataset(sys_, block_len=M, step_skip=1, scale_inputs=False, window_offset_max_steps=28 * M)
+    assert raw.block_sum_variance(4) == pytest.approx(M * s ** 2, rel=0.05)
+    scaled = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=28 * M)
+    assert scaled.block_sum_variance(4) == pytest.approx(raw.block_sum_variance(4) / scaled.sigma_nm ** 2, rel=1e-5)
+
+
+def test_block_sum_variance_uses_training_trajectories_and_the_region_only():
+    sys_ = _ar_system(-0.4)
+    full = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=58 * M)
+    held = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=58 * M, holdout_trajectories=(0, 1, 2))
+    kept = WindowDataset(_kept_system(sys_, (0, 1, 2)), block_len=M, step_skip=1, window_offset_max_steps=58 * M)
+    assert held.block_sum_variance(4) == kept.block_sum_variance(4) != full.block_sum_variance(4)
+    short = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=2 * M)
+    assert short.block_sum_variance(4) != full.block_sum_variance(4) and short.block_sum_variance(4) > 0
+
+
+@pytest.mark.parametrize("n", [1, 5, 2.0])
+def test_block_sum_variance_needs_the_blocks_in_the_region(n):
+    ds = WindowDataset(make_system(), block_len=M, step_skip=1, window_offset_max_steps=2 * M)    # 4 blocks
+    with pytest.raises(ValueError, match="n_blocks"):
+        ds.block_sum_variance(n)
+
+
+# --- region start (not in the papers) ----------------------------------------------------------------------
+
+def _plain_system(n_steps=200):
+    """Normal steps everywhere (make_system fills its reference region with a constant)."""
+    d = np.random.default_rng(3).normal(scale=0.17, size=(5, n_steps, 3)).astype(np.float32)
+    return SystemData(name="plain", displacements=d, dt_ps=10.0, box_nm=np.full((5, 3), 4.75), meta={})
+
+
+def test_region_start_zero_is_the_current_dataset_bit_for_bit():
+    a = WindowDataset(make_system(), block_len=M, step_skip=NS, window_offset_max_steps=2 * M)
+    b = WindowDataset(make_system(), block_len=M, step_skip=NS, window_offset_max_steps=2 * M, region_start_steps=0)
+    assert a.metadata == b.metadata and "region_start_steps" not in b.metadata
+    assert torch.equal(a.windows, b.windows) and torch.equal(a._series, b._series) and a.sigma_nm == b.sigma_nm
+
+
+@pytest.mark.parametrize("ns", [1, NS])
+def test_region_start_moves_the_whole_region(ns):
+    """Starting s coarse steps in equals dropping the first s * n_s fine steps of every trajectory: same windows,
+    series, sigma, position ratio and reward targets; only the metadata records the start."""
+    sys_ = _plain_system()
+    s, k = 5, 2 * M
+    moved = WindowDataset(sys_, block_len=M, step_skip=ns, window_offset_max_steps=k, region_start_steps=s)
+    cut = SystemData(name=sys_.name, displacements=sys_.displacements[:, s * ns:], dt_ps=sys_.dt_ps,
+                     box_nm=sys_.box_nm, meta=sys_.meta)
+    ref = WindowDataset(cut, block_len=M, step_skip=ns, window_offset_max_steps=k)
+    assert torch.equal(moved.windows, ref.windows) and torch.equal(moved._series, ref._series)
+    assert moved.sigma_nm == ref.sigma_nm and moved.position_rms_ratio == ref.position_rms_ratio
+    np.testing.assert_array_equal(moved.block_sum_correlations(4), ref.block_sum_correlations(4))
+    assert moved.block_sum_variance(4) == ref.block_sum_variance(4)
+    assert moved.metadata == {**ref.metadata, "region_start_steps": s}
+    origin = WindowDataset(sys_, block_len=M, step_skip=ns, window_offset_max_steps=k)
+    assert not torch.equal(moved.windows, origin.windows)
+
+
+def test_region_start_must_leave_room_for_the_region():
+    sys_ = _plain_system()
+    WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=2 * M, region_start_steps=200 - 4 * M)
+    with pytest.raises(ValueError, match="training region needs"):
+        WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=2 * M, region_start_steps=200 - 4 * M + 1)
+    for bad in (-1, 2.5, True):
+        with pytest.raises(ValueError, match="region_start_steps"):
+            WindowDataset(sys_, block_len=M, step_skip=1, region_start_steps=bad)

@@ -49,6 +49,7 @@ class Config:
     phase_mode: str = "single"
     scale_inputs: bool = True       # divide by sigma; False is the unscaled ablation
     window_offset_max_steps: int = 0  # > 0: each training window starts at a fresh offset in [0, K] steps
+    region_start_steps: int = 0     # > 0: the training region starts this many coarse steps into each trajectory
     holdout_trajectories: tuple[int, ...] = ()  # trajectory indices never trained on (reference MSD still uses all)
     critic_input: str = "increments"  # "positions": the critic sees cumsum(window) over all 2M steps
     critic_position_scale: float | None = None  # "positions_scaled": cumsum(window) / this (the training set's RMS ratio)
@@ -71,6 +72,9 @@ class Config:
     noise_use_weight: float = 100.0
     corr_reward_blocks: int = 0     # L >= 2: match the block-sum correlations at lags 1..L-1 to the training region's
     corr_reward_weight: float = 10.0
+    # w > 0: add w * log(V_gen / V_target)^2, V = the variance of M-step block sums, on the correlation reward's side
+    # chains (so it needs corr_reward_blocks); V_target from the same training region as the correlation targets
+    variance_reward_weight: float = 0.0
     reward_chains: int = 1024
 
     # --- checkpoints and estimation ------------------------------------------------------
@@ -96,6 +100,9 @@ class Config:
             raise ValueError(f"init must be one of {INIT_SCHEMES}")
         if int(self.window_offset_max_steps) != self.window_offset_max_steps or self.window_offset_max_steps < 0:
             raise ValueError("window_offset_max_steps must be a non-negative integer")
+        if isinstance(self.region_start_steps, bool) or int(self.region_start_steps) != self.region_start_steps \
+                or self.region_start_steps < 0:
+            raise ValueError("region_start_steps must be a non-negative integer")
         if not self.gz_additive_noise_std >= 0.0:
             raise ValueError("gz_additive_noise_std must be >= 0")
         if not self.gz_weight_decay >= 0.0:
@@ -134,6 +141,12 @@ class Config:
                                  f"{(getattr(self, name) - 2) * self.block_len} (training data for that many blocks)")
         if not (self.noise_use_weight >= 0 and self.corr_reward_weight >= 0):
             raise ValueError("noise_use_weight and corr_reward_weight must be non-negative")
+        if isinstance(self.variance_reward_weight, bool) or not isinstance(self.variance_reward_weight, (int, float)) \
+                or not self.variance_reward_weight >= 0:
+            raise ValueError("variance_reward_weight must be a non-negative number")
+        if self.variance_reward_weight > 0 and not self.corr_reward_blocks:
+            raise ValueError("variance_reward_weight > 0 needs corr_reward_blocks > 0: the block variance is measured "
+                             "on the correlation reward's side chains")
         if (self.noise_use_min > 0 or self.corr_reward_blocks) and self.reward_chains < 2:
             raise ValueError("the rewards need reward_chains >= 2")
         if self.gz_norm_position not in GZ_NORM_POSITIONS:

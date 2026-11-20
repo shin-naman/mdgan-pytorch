@@ -45,7 +45,7 @@ def brownian(seed=0, n_traj=6, n_steps=200):
 
 def windows(system, c: Config) -> WindowDataset:
     return WindowDataset(system, c.block_len, c.step_skip, c.phase_mode, c.scale_inputs, c.window_offset_max_steps,
-                         c.holdout_trajectories, c.critic_blocks)
+                         c.holdout_trajectories, c.critic_blocks, region_start_steps=c.region_start_steps)
 
 
 def trainer(path, c=None, system=None, **kw) -> Trainer:
@@ -682,15 +682,17 @@ class TestLongCriticAndRewards:
         assert [r["reward_loss"] for r in const_rows] == [7.0] * 6
 
     @pytest.mark.parametrize("on,off", [({"noise_use_min": 0.9}, {"noise_use_weight": 0.0}),
-                                        ({"corr_reward_blocks": 3, "window_offset_max_steps": 8}, {"corr_reward_weight": 0.0})],
-                             ids=["noise_use", "correlations"])
+                                        ({"corr_reward_blocks": 3, "window_offset_max_steps": 8}, {"corr_reward_weight": 0.0}),
+                                        ({"corr_reward_blocks": 3, "window_offset_max_steps": 8, "corr_reward_weight": 0.0,
+                                          "variance_reward_weight": 5.0}, {"variance_reward_weight": 0.0})],
+                             ids=["noise_use", "correlations", "variance"])
     def test_each_reward_moves_the_generators(self, tmp_path, on, off):
         """Weight 0 draws the same numbers and adds nothing: the difference from the weighted run is the
         reward's gradient. The critic sees the reward only through the generators it is trained against, so
         after one iteration its weights still agree."""
         base = {**on, "reward_chains": 16, "n_iterations": 1, "checkpoint_every": 1}
         trainer(tmp_path / "with", tiny(**base)).run()
-        trainer(tmp_path / "zero", tiny(**base, **off)).run()
+        trainer(tmp_path / "zero", tiny(**{**base, **off})).run()
         a, b = weights(tmp_path / "with" / LATEST), weights(tmp_path / "zero" / LATEST)
         assert any(not torch.equal(a[k], b[k]) for k in a if k.startswith("gz."))
         if "corr_reward_blocks" in on:
@@ -763,7 +765,8 @@ class TestLongCriticAndRewards:
                 Trainer(c, ds, tmp_path / "run")
 
     @pytest.mark.parametrize("change", [{"critic_blocks": 2}, {"noise_use_min": 0.5}, {"noise_use_weight": 1.0},
-                                        {"corr_reward_blocks": 3}, {"corr_reward_weight": 1.0}, {"reward_chains": 8}],
+                                        {"corr_reward_blocks": 3}, {"corr_reward_weight": 1.0}, {"reward_chains": 8},
+                                        {"variance_reward_weight": 1.0}],
                              ids=lambda p: next(iter(p)))
     def test_resume_refuses_a_change_of_any_new_option(self, tmp_path, change):
         out = tmp_path / "run"
@@ -992,3 +995,152 @@ def test_brownian_diffusion_coefficient_is_recovered(tmp_path):
     best = min(evals, key=lambda e: e["err_percent"])
     assert best["err_percent"] < 15.0, best
     assert abs(best["D_rel_error"]) < 0.15, best
+
+# =============================================================================
+class TestVarianceReward:
+    """variance_reward_weight (not in the papers; off by default): the block-sum variance of the correlation
+    reward's side chains pulled to the training region's, as w * log(V_gen / V_target)^2."""
+
+    ON = {"window_offset_max_steps": 16, "noise_use_min": 0.9, "corr_reward_blocks": 4, "reward_chains": 16}
+    VAR = {**ON, "variance_reward_weight": 2.0}
+
+    def test_default_weight_trains_exactly_as_the_batch8_code(self, tmp_path, monkeypatch):
+        """With the rewards on and the variance weight at its default 0, a run is the run of commit 6e41f72: the
+        trainer with the frozen 6e41f72 reward function in place of today's gives the same weights, optimiser
+        state, generator state and logged W, bit for bit; nothing new is computed, logged or written."""
+        import mdgan.train as train_module
+        from test_rewards import _generator_rewards_6e41f72
+
+        trainer(tmp_path / "now", tiny(**self.ON)).run()
+
+        def frozen(*a, variance_target=None, **kw):
+            assert variance_target is None
+            return _generator_rewards_6e41f72(*a, **kw)
+
+        monkeypatch.setattr(train_module, "generator_rewards", frozen)
+        t = trainer(tmp_path / "then", tiny(**self.ON))
+        t.run()
+        assert t.variance_target is None
+        assert t.metric_names == METRIC_NAMES + ("noise_use_share", "noise_use_penalty", "corr_error", "reward_loss")
+        now, then = load_checkpoint(tmp_path / "now" / LATEST), load_checkpoint(tmp_path / "then" / LATEST)
+        assert_same_weights(weights(tmp_path / "now" / LATEST), weights(tmp_path / "then" / LATEST))
+        assert torch.equal(now.generator_state, then.generator_state)
+        for name in ("generator", "critic"):
+            a, b = now.optimizer_states[name]["state"], then.optimizer_states[name]["state"]
+            assert all(torch.equal(a[k][f], b[k][f]) for k in a for f in a[k])
+        drop = lambda rows: [{k: v for k, v in r.items() if k != "iterations_per_second"} for r in rows]   # noqa: E731
+        rows = drop(jsonl(tmp_path / "now" / "metrics.jsonl"))
+        assert rows == drop(jsonl(tmp_path / "then" / "metrics.jsonl")) and len(rows) == 6
+        saved = json.loads((tmp_path / "now" / "dataset.json").read_text())
+        assert "variance_reward_target" not in saved and "corr_reward_targets" in saved
+
+    def test_columns_target_and_reward_loss(self, tmp_path, capsys):
+        t = trainer(tmp_path / "run", tiny(**self.VAR), progress=True)
+        t.run()
+        names = ("noise_use_share", "noise_use_penalty", "corr_error", "block_var_ratio", "variance_penalty", "reward_loss")
+        assert t.metric_names == METRIC_NAMES + names
+        target = t.dataset.block_sum_variance(4)
+        assert t.variance_target == target > 0
+        saved = json.loads((tmp_path / "run" / "dataset.json").read_text())
+        assert saved["variance_reward_target"] == target
+        rows = jsonl(tmp_path / "run" / "metrics.jsonl")
+        assert len(rows) == 6 and all(np.isfinite([r[k] for k in t.metric_names]).all() for r in rows)
+        for r in rows:          # log-iteration means, one iteration each: the penalty is the square of the ratio's log
+            assert r["block_var_ratio"] > 0 and r["variance_penalty"] == pytest.approx(np.log(r["block_var_ratio"]) ** 2, rel=1e-4)
+            assert r["reward_loss"] == pytest.approx(100 * r["noise_use_penalty"] + 10 * r["corr_error"]
+                                                     + 2.0 * r["variance_penalty"], rel=1e-4)
+        lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("it ")]
+        assert len(lines) == 6 and all(f"| {k} " in ln for ln in lines for k in names)
+
+    def test_target_is_measured_on_the_region_the_run_trains_on(self, tmp_path):
+        """Different offset maxima or a hold-out change the region; the target follows it."""
+        short = trainer(tmp_path / "short", tiny(**self.VAR))
+        long = trainer(tmp_path / "long", tiny(**{**self.VAR, "window_offset_max_steps": 64}))
+        held = trainer(tmp_path / "held", tiny(**self.VAR, holdout_trajectories=(0, 1)))
+        assert len({short.variance_target, long.variance_target, held.variance_target}) == 3
+        assert held.variance_target == held.dataset.block_sum_variance(4)
+
+    def test_time_limit_restarts_are_bit_exact(self, tmp_path):
+        c = tiny(**self.VAR)
+        trainer(tmp_path / "straight", c).run()
+        out = tmp_path / "chunked"
+        status, sessions = trainer(out, c).run(max_seconds=0), 1
+        while status == "time_limit" and sessions < 20:
+            status, sessions = trainer(out, c, resume=True).run(max_seconds=0), sessions + 1
+        assert status == "done" and sessions == 6
+        assert_same_weights(weights(tmp_path / "straight" / LATEST), weights(out / LATEST))
+        drop = lambda rows: [{k: v for k, v in r.items() if k != "iterations_per_second"} for r in rows]   # noqa: E731
+        assert drop(jsonl(tmp_path / "straight" / "metrics.jsonl")) == drop(jsonl(out / "metrics.jsonl"))
+
+    @pytest.mark.parametrize("tamper", ["changed", "missing"])
+    def test_resume_checks_the_recorded_target(self, tmp_path, tamper):
+        out = tmp_path / "run"
+        trainer(out, tiny(**{**self.VAR, "n_iterations": 3})).run()
+        f = out / "dataset.json"
+        saved = json.loads(f.read_text())
+        if tamper == "changed":
+            saved["variance_reward_target"] *= 1.001
+        else:
+            del saved["variance_reward_target"]
+        f.write_text(json.dumps(saved))
+        with pytest.raises(ValueError, match="variance_reward_target"):
+            trainer(out, tiny(**self.VAR), resume=True)
+
+    def test_a_batch8_run_resumes_under_this_code(self, tmp_path):
+        """A run started without the field (its checkpoint's config has no variance_reward_weight) resumes with
+        the default and ends where a straight run ends: the Batch 8 resumes to 300k depend on this."""
+        c = tiny(**self.ON)
+        trainer(tmp_path / "straight", c).run()
+        out = tmp_path / "old"
+        trainer(out, tiny(**{**self.ON, "n_iterations": 3})).run()
+        ck = torch.load(out / LATEST, weights_only=True)
+        assert "variance_reward_weight" in ck["config"]
+        del ck["config"]["variance_reward_weight"]                 # as a checkpoint written at 6e41f72 holds it
+        torch.save(ck, out / LATEST)
+        assert load_checkpoint(out / LATEST).config.variance_reward_weight == 0.0
+        trainer(out, c, resume=True).run()
+        assert_same_weights(weights(tmp_path / "straight" / LATEST), weights(out / LATEST))
+
+
+# =============================================================================
+class TestRegionStart:
+    """region_start_steps (not in the papers; 0 by default): the training region starts later in each trajectory."""
+
+    def test_recorded_and_targets_from_the_moved_region(self, tmp_path):
+        c = tiny(region_start_steps=40, window_offset_max_steps=16, corr_reward_blocks=4, reward_chains=16,
+                 variance_reward_weight=1.0, n_iterations=3)
+        t = trainer(tmp_path / "run", c)
+        t.run()
+        saved = json.loads((tmp_path / "run" / "dataset.json").read_text())
+        assert saved["region_start_steps"] == 40 and t.dataset.region_start_steps == 40
+        origin = windows(brownian(), tiny(window_offset_max_steps=16))
+        np.testing.assert_allclose(saved["corr_reward_targets"], t.dataset.block_sum_correlations(4), rtol=1e-6)
+        assert saved["variance_reward_target"] == t.dataset.block_sum_variance(4) != origin.block_sum_variance(4)
+        assert load_checkpoint(tmp_path / "run" / LATEST).dataset["region_start_steps"] == 40
+
+    def test_default_writes_nothing_new(self, tmp_path):
+        trainer(tmp_path / "run", tiny(n_iterations=3)).run()
+        assert "region_start_steps" not in json.loads((tmp_path / "run" / "dataset.json").read_text())
+
+    def test_dataset_and_config_must_agree(self, tmp_path):
+        moved = WindowDataset(brownian(), 8, 1, region_start_steps=8)
+        with pytest.raises(ValueError, match="does not match.*region_start_steps"):
+            Trainer(tiny(), moved, tmp_path / "a")
+        with pytest.raises(ValueError, match="does not match.*region_start_steps"):
+            Trainer(tiny(region_start_steps=8), WindowDataset(brownian(), 8, 1), tmp_path / "b")
+
+    def test_resume_refuses_another_start(self, tmp_path):
+        out = tmp_path / "run"
+        trainer(out, tiny(region_start_steps=8, n_iterations=3)).run()
+        with pytest.raises(ValueError, match="config differs from the checkpoint.*region_start_steps"):
+            trainer(out, tiny(region_start_steps=16), resume=True)
+
+    def test_resume_refuses_another_start_even_with_a_matching_config(self, tmp_path):
+        """The dataset metadata alone also catches it (a checkpoint written with start 8, data built with 16)."""
+        out = tmp_path / "run"
+        trainer(out, tiny(region_start_steps=8, n_iterations=3)).run()
+        ck = torch.load(out / LATEST, weights_only=True)
+        ck["config"]["region_start_steps"] = 16                    # config agrees with the new data, metadata not
+        torch.save(ck, out / LATEST)
+        with pytest.raises(ValueError, match="dataset differs"):
+            trainer(out, tiny(region_start_steps=16), resume=True)

@@ -40,7 +40,15 @@ critic_blocks = L > 2 makes sample() return windows of L*M steps for a critic ov
 They are drawn from the same region of (2M + K) steps that window offsets define, so L*M may
 not exceed it, and the region, sigma and the split are the same as for a 2-block run with the
 same K. block_sum_correlations gives the correlations of M-step block sums in that region, the
-target of the generator's correlation reward (mdgan.rewards).
+target of the generator's correlation reward (mdgan.rewards); block_sum_variance gives their variance on
+the same block grids, the target of the variance reward.
+
+REGION START (not in the papers)
+--------------------------------
+region_start_steps = s > 0 moves the whole training region s coarse steps (s * n_s fine steps) into
+every trajectory: the windows, the offsets, sigma, the position RMS ratio and the reward targets all come
+from steps s .. s + 2M + K instead of 0 .. 2M + K. s = 0 is the papers' region and leaves everything,
+metadata included, exactly as before the option existed.
 
 Units: windows in sigma units (dimensionless); dt_ps and sigma_nm in metadata.
 """
@@ -81,7 +89,7 @@ class WindowDataset:
 
     def __init__(self, system: SystemData, block_len: int = 64, step_skip: int = 1,
                  phase_mode: str = "single", scale_inputs: bool = True, window_offset_max_steps: int = 0,
-                 holdout_trajectories: tuple[int, ...] = (), critic_blocks: int = 2):
+                 holdout_trajectories: tuple[int, ...] = (), critic_blocks: int = 2, region_start_steps: int = 0):
         positive_int("block_len", block_len)
         positive_int("step_skip", step_skip)
         if phase_mode not in PHASE_MODES:
@@ -121,14 +129,19 @@ class WindowDataset:
         self.critic_blocks = critic_blocks
         self.sample_len = critic_blocks * block_len                  # steps in one sampled window (2M by default)
 
-        # --- 1. Training region: the first (2M + K)*n_s fine steps (+ n_s-1 for "all") ---
+        # --- 1. Training region: (2M + K)*n_s fine steps (+ n_s-1 for "all") from region_start_steps*n_s on ---
+        if isinstance(region_start_steps, bool) or int(region_start_steps) != region_start_steps or region_start_steps < 0:
+            raise ValueError("region_start_steps must be a non-negative integer")
+        self.region_start_steps = int(region_start_steps)
+        first = self.region_start_steps * step_skip                              # in fine steps
         phases = range(step_skip) if phase_mode == "all" else range(1)
         self.region_steps = span * step_skip + (step_skip - 1 if phase_mode == "all" else 0)
-        if self.region_steps > system.n_steps:
+        if first + self.region_steps > system.n_steps:
             raise ValueError(
-                f"training region needs {self.region_steps} fine steps but trajectories have {system.n_steps}"
+                f"training region needs fine steps {first} .. {first + self.region_steps} but trajectories have "
+                f"{system.n_steps}"
             )
-        region = np.array(system.displacements[keep, :self.region_steps], dtype=np.float64)   # copy (training trajectories)
+        region = np.array(system.displacements[keep, first:first + self.region_steps], dtype=np.float64)   # a copy
 
         # --- 2. One window per trajectory per phase (the offset-0 windows) ---
         series = np.concatenate([coarsen(region, step_skip, p)[:, :span] for p in phases], axis=0)   # (W, 2M+K, C)
@@ -183,24 +196,29 @@ class WindowDataset:
             out = self._series[idx[:, None], pos]
         return out.to(device) if device is not None else out
 
+    def _block_sum_grids(self, n_blocks: int):
+        """The (W, nb, C) M-step block sums of the training region for each block grid o = 0 .. M-1 that still
+        holds n_blocks blocks: the grids block_sum_correlations and block_sum_variance pool over."""
+        positive_int("n_blocks", n_blocks)
+        series = (self._windows if self._series is None else self._series).numpy().astype(np.float64)
+        w, span, c = series.shape
+        if n_blocks < 2 or n_blocks * self.block_len > span:
+            raise ValueError(f"block-sum statistics over {n_blocks} blocks need 2 <= n_blocks and "
+                             f"window_offset_max_steps >= {(n_blocks - 2) * self.block_len}")
+        for o in range(self.block_len):
+            nb = (span - o) // self.block_len
+            if nb < n_blocks:                                   # this grid position no longer holds n_blocks blocks
+                break
+            yield series[:, o:o + nb * self.block_len].reshape(w, nb, self.block_len, c).sum(axis=2)
+
     def block_sum_correlations(self, n_blocks: int) -> np.ndarray:
         """(n_blocks - 1,) correlations of the training region's M-step block sums at lags 1 .. n_blocks - 1.
 
         Pooled over trajectories, blocks and axes (means removed per lag), for the block grid started at each of
         the M positions o = 0 .. M-1 of the region, then averaged over o. Scale-free. Training trajectories only,
         the same (2M + K) steps the windows come from; needs n_blocks * M of them."""
-        positive_int("n_blocks", n_blocks)
-        series = (self._windows if self._series is None else self._series).numpy().astype(np.float64)
-        w, span, c = series.shape
-        if n_blocks < 2 or n_blocks * self.block_len > span:
-            raise ValueError(f"block-sum correlations over {n_blocks} blocks need 2 <= n_blocks and "
-                             f"window_offset_max_steps >= {(n_blocks - 2) * self.block_len}")
         rho = []
-        for o in range(self.block_len):
-            nb = (span - o) // self.block_len
-            if nb < n_blocks:                                   # this grid position no longer holds n_blocks blocks
-                break
-            sums = series[:, o:o + nb * self.block_len].reshape(w, nb, self.block_len, c).sum(axis=2)
+        for sums in self._block_sum_grids(n_blocks):
             row = []
             for k in range(1, n_blocks):
                 x, y = sums[:, :-k].ravel(), sums[:, k:].ravel()
@@ -208,6 +226,13 @@ class WindowDataset:
                 row.append((x * y).mean() / np.sqrt((x * x).mean() * (y * y).mean()))
             rho.append(row)
         return np.mean(rho, axis=0)
+
+    def block_sum_variance(self, n_blocks: int) -> float:
+        """Variance of the training region's M-step block sums, in the units the model sees (sigma units, or nm
+        without scaling): pooled over trajectories, blocks and axes (one mean removed), on the same block grids
+        and trajectories as block_sum_correlations(n_blocks), then averaged over the grids. The target of the
+        generator's variance reward (mdgan.rewards, Config.variance_reward_weight)."""
+        return float(np.mean([((x - x.mean()) ** 2).mean() for x in (s.ravel() for s in self._block_sum_grids(n_blocks))]))
 
     @property
     def metadata(self) -> dict:
@@ -232,6 +257,8 @@ class WindowDataset:
             # likewise present only when non-empty: the split is in dataset.json and checked on resume
             **({"holdout_trajectories": list(self.holdout_trajectories)} if self.holdout_trajectories else {}),
             **({"critic_blocks": self.critic_blocks} if self.critic_blocks != 2 else {}),
+            # likewise only when > 0: where the region starts is checked on resume, and s = 0 leaves metadata unchanged
+            **({"region_start_steps": self.region_start_steps} if self.region_start_steps else {}),
         }
 
     def __len__(self) -> int:

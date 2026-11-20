@@ -7,7 +7,9 @@ One ITERATION = one generator update:
   2. one generator step: a fresh fake window WITH graph, generator_loss through a
      frozen critic (no parameter gradients for D_G), Adam step on G_z + G_Y.
      With a generator reward enabled (mdgan.rewards; off by default, not in the papers)
-     its terms are added to that loss before the step.
+     its terms are added to that loss before the step. The rewards' targets are written to
+     dataset.json (corr_reward_targets, variance_reward_target); the variance target is checked
+     against it on resume.
   3. every checkpoint_every iterations (and at the end): latest.pt (full resume
      state, overwritten), snap_XXXXXX.pt (generators only), and, if an MD
      reference was given, an evaluation appended to evaluations.jsonl.
@@ -186,7 +188,8 @@ def _git_state() -> dict:
 def _check_dataset_matches_config(config: Config, dataset: WindowDataset) -> None:
     pairs = {"block_len": dataset.block_len, "step_skip": dataset.step_skip, "phase_mode": dataset.phase_mode,
              "scale_inputs": dataset.scale_inputs, "n_channels": dataset.n_channels,
-             "window_offset_max_steps": dataset.window_offset_max_steps, "critic_blocks": dataset.critic_blocks}
+             "window_offset_max_steps": dataset.window_offset_max_steps, "critic_blocks": dataset.critic_blocks,
+             "region_start_steps": dataset.region_start_steps}
     bad = {k: (v, getattr(config, k)) for k, v in pairs.items() if v != getattr(config, k)}
     if dataset.holdout_trajectories != tuple(sorted(config.holdout_trajectories)):      # the split, order-insensitive
         bad["holdout_trajectories"] = (dataset.holdout_trajectories, config.holdout_trajectories)
@@ -226,6 +229,9 @@ class Trainer:
         self.corr_targets = (torch.as_tensor(dataset.block_sum_correlations(config.corr_reward_blocks),
                                              dtype=torch.float32, device=self.device)
                              if config.corr_reward_blocks else None)
+        # the variance reward's target, from the same trajectories and block grids; None (never computed) when off
+        self.variance_target = (dataset.block_sum_variance(config.corr_reward_blocks)
+                                if config.variance_reward_weight > 0 else None)
 
         torch.manual_seed(config.seed)
         self.gz, self.gy, self.dg = (m.to(self.device) for m in build_models(config))
@@ -250,7 +256,8 @@ class Trainer:
         (self.out / "dataset.json").write_text(json.dumps(
             {**self.dataset.metadata, "position_rms_ratio": self.dataset.position_rms_ratio,
              **({"D_analytic_m2s": self.dataset.analytic_D_m2s} if self.dataset.analytic_D_m2s is not None else {}),
-             **({"corr_reward_targets": self.corr_targets.tolist()} if self.corr_targets is not None else {})},
+             **({"corr_reward_targets": self.corr_targets.tolist()} if self.corr_targets is not None else {}),
+             **({"variance_reward_target": self.variance_target} if self.variance_target is not None else {})},
             indent=2))
         (self.out / "provenance.json").write_text(json.dumps({
             **_git_state(), "torch": torch.__version__, "python": platform.python_version(),
@@ -272,6 +279,8 @@ class Trainer:
             raise ValueError(f"config differs from the checkpoint (only n_iterations may change): {diff}")
         if ck.dataset != self.dataset.metadata:
             raise ValueError("dataset differs from the one this run was trained on (metadata mismatch)")
+        if self.variance_target is not None:
+            self._check_variance_target()
         self._copy_from(ck)
         torch.set_rng_state(ck.torch_rng_state)
         self.rollbacks = list(ck.extra.get("rollbacks", []))
@@ -279,6 +288,17 @@ class Trainer:
         for name in ("metrics.jsonl", "evaluations.jsonl", "events.jsonl"):
             _truncate_jsonl(self.out / name, self.iteration)
         self._event("resume")
+
+    def _check_variance_target(self) -> None:
+        """On resume with the variance reward: the target recomputed now must be the one dataset.json recorded at
+        the start (relative 1e-9: the same data on the same platform gives it to rounding)."""
+        try:
+            stored = json.loads((self.out / "dataset.json").read_text())["variance_reward_target"]
+        except (OSError, ValueError, KeyError) as e:
+            raise ValueError(f"cannot resume: {self.out / 'dataset.json'} holds no variance_reward_target") from e
+        if not abs(stored / self.variance_target - 1) <= 1e-9:
+            raise ValueError(f"variance_reward_target {self.variance_target!r} differs from the {stored!r} this run "
+                             "started with")
 
     def _copy_from(self, ck) -> None:
         """Copy a full checkpoint into the existing modules, optimizers and generator (strict)."""
@@ -317,7 +337,8 @@ class Trainer:
             loss = generator_loss(self.dg, critic_view(fake, self.config.critic_input, self.config.critic_position_scale))
             total, rewards = loss, {}
             if self.config.rewards_on:                 # drawn after the fake window, from the same generator
-                reward, rewards = generator_rewards(self.gz, self.gy, self.config, self.corr_targets, generator=self.gen)
+                reward, rewards = generator_rewards(self.gz, self.gy, self.config, self.corr_targets, generator=self.gen,
+                                                    variance_target=self.variance_target)
                 total = loss + reward
             self.opt_g.zero_grad(set_to_none=True)
             total.backward()
@@ -509,7 +530,8 @@ def main(argv=None) -> int:
 
     system = load_system(args.data, args.cache)
     dataset = WindowDataset(system, config.block_len, config.step_skip, config.phase_mode, config.scale_inputs,
-                            config.window_offset_max_steps, config.holdout_trajectories, config.critic_blocks)
+                            config.window_offset_max_steps, config.holdout_trajectories, config.critic_blocks,
+                            region_start_steps=config.region_start_steps)
     reference = None if args.no_eval else reference_msd(system)
     trainer = Trainer(config, dataset, args.out, device=args.device, reference=reference,
                       log_every=args.log_every, resume=resume, progress=True)

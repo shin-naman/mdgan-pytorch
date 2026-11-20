@@ -1,7 +1,8 @@
-"""Generator rewards: noise use and block-sum correlations. NOT in the papers; off by default.
+"""Generator rewards: noise use, block-sum correlations, block-sum variance. NOT in the papers; off by default.
 
-Two terms can be added to the generator loss (Config.noise_use_min, Config.corr_reward_blocks). Both are
-computed on one side batch of Config.reward_chains chains, separate from the window shown to the critic:
+Three terms can be added to the generator loss (Config.noise_use_min, Config.corr_reward_blocks,
+Config.variance_reward_weight). All are computed on one side batch of Config.reward_chains chains, separate
+from the window shown to the critic:
 
     z_0 ~ U[0,1), z_1 .. z_c by G_z (c = burn_in)
 
@@ -21,9 +22,18 @@ with the targets measured once from the training region (WindowDataset.block_sum
 of squares on purpose: a form that can go negative is minimised by distorting single chains. Gradients
 reach G_Y and, through every transition from z_0 on, G_z.
 
+Block-sum variance (variance_reward_weight = w > 0; needs the correlation reward). On the SAME block sums as
+the correlations (no further forward pass, no further draw), V_gen = their variance pooled over chains, blocks
+and axes. The term is
+    w * (log(V_gen / V_target))^2
+with V_target measured once from the training region (WindowDataset.block_sum_variance, on the trajectories
+and block grids the correlation targets use). Symmetric in the log-ratio: a factor 2 too large costs as much
+as a factor 2 too small. Gradients reach G_Y and G_z as for the correlations. At w = 0 nothing is computed,
+so a run without it is the run before the term existed.
+
 Random draws, in order, from the one training generator: z_0; the c burn-in r's; (noise use) two r's;
-(correlations) L - 1 r's, then G_Y's (r', u) per block. With both rewards off nothing is drawn and the
-trainer never calls this module, so a default run is unchanged.
+(correlations) L - 1 r's, then G_Y's (r', u) per block. The variance term draws nothing. With every reward off
+nothing is drawn and the trainer never calls this module, so a default run is unchanged.
 
 The side batch passes through G_z in training mode like every training batch: with use_running_stats its
 transitions also enter the BatchNorm running statistics.
@@ -60,26 +70,42 @@ def block_sum_correlations(sums: torch.Tensor, max_lag: int) -> torch.Tensor:
     return torch.stack(rho)
 
 
+def block_sum_variance(sums: torch.Tensor) -> torch.Tensor:
+    """Variance of block sums pooled over chains, blocks and axes (one mean removed). sums: (B, L, C).
+    The torch twin of WindowDataset.block_sum_variance for one block grid."""
+    if sums.dim() != 3:
+        raise ValueError(f"sums must be (B, L, C); got {tuple(sums.shape)}")
+    x = sums.reshape(-1)
+    return (x - x.mean()).square().mean()
+
+
 def reward_metric_names(config) -> tuple[str, ...]:
-    """The extra columns of metrics.jsonl for this config (none with both rewards off). Unweighted values,
-    then reward_loss, the weighted sum that was added to the generator loss."""
+    """The extra columns of metrics.jsonl for this config (none with every reward off). Unweighted values,
+    then reward_loss, the weighted sum that was added to the generator loss. block_var_ratio = V_gen / V_target
+    and variance_penalty = log(V_gen / V_target)^2 appear only when the variance reward is on."""
     names = ()
     if config.noise_use_min > 0:
         names += ("noise_use_share", "noise_use_penalty")
     if config.corr_reward_blocks:
         names += ("corr_error",)
+    if config.variance_reward_weight > 0:
+        names += ("block_var_ratio", "variance_penalty")
     return names + ("reward_loss",) if names else ()
 
 
 def generator_rewards(gz, gy, config, corr_targets: torch.Tensor | None = None,
-                      generator: torch.Generator | None = None) -> tuple[torch.Tensor, dict]:
+                      generator: torch.Generator | None = None,
+                      variance_target: float | None = None) -> tuple[torch.Tensor, dict]:
     """(weighted sum of the enabled terms, {name: detached value} for reward_metric_names(config)).
-    corr_targets: (corr_reward_blocks - 1,) on the models' device; needed when that reward is on."""
+    corr_targets: (corr_reward_blocks - 1,) on the models' device; needed when that reward is on.
+    variance_target: V_target > 0 (WindowDataset.block_sum_variance); needed when the variance reward is on."""
     n, blocks = config.reward_chains, config.corr_reward_blocks
     if not config.rewards_on:
         raise ValueError("no reward is enabled in this config")
     if blocks and (corr_targets is None or corr_targets.shape != (blocks - 1,)):
         raise ValueError(f"corr_targets must hold the {blocks - 1} target correlations")
+    if config.variance_reward_weight > 0 and not (variance_target is not None and variance_target > 0):
+        raise ValueError("variance_target must be the positive target block-sum variance")
     param = next(gz.parameters())
 
     def step(z):
@@ -105,5 +131,10 @@ def generator_rewards(gz, gy, config, corr_targets: torch.Tensor | None = None,
         error = (block_sum_correlations(sums, blocks - 1) - corr_targets).square().sum()
         total = total + config.corr_reward_weight * error
         stats["corr_error"] = error.detach()
+        if config.variance_reward_weight > 0:                 # the same sums: no forward pass, no draw
+            ratio = block_sum_variance(sums) / variance_target
+            penalty = torch.log(ratio).square()
+            total = total + config.variance_reward_weight * penalty
+            stats["block_var_ratio"], stats["variance_penalty"] = ratio.detach(), penalty.detach()
     stats["reward_loss"] = total.detach()
     return total, stats

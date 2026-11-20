@@ -27,6 +27,7 @@ class TestDefaults:
         assert c.holdout_trajectories == ()
         assert c.critic_blocks == 2 and (c.noise_use_min, c.corr_reward_blocks) == (0.0, 0) and not c.rewards_on
         assert (c.noise_use_weight, c.corr_reward_weight, c.reward_chains) == (100.0, 10.0, 1024)
+        assert c.variance_reward_weight == 0.0 and c.region_start_steps == 0
         assert (c.step_skip, c.phase_mode, c.scale_inputs) == (1, "single", True)
         assert (c.batch_size, c.n_iterations, c.n_critic) == (64, 300_000, 5)
         assert (c.lr, c.betas, c.gp_lambda) == (1e-4, (0.0, 0.9), 10.0)
@@ -65,7 +66,7 @@ class TestValidation:
         dict(step_skip=2.0), dict(pair_window=0), dict(estimation_chains=0),
         dict(burn_in=-1), dict(seed=-1), dict(phase_mode="some"),
         dict(lr=0.0), dict(betas=(0.0, 1.0)), dict(betas=(0.5,)), dict(gp_lambda=-1.0),
-        dict(negative_slope=-0.1), dict(init="xavier"), dict(gz_additive_noise_std=-0.1), dict(gz_weight_decay=-1.0), dict(gz_dropout=1.0), dict(gz_norm_position="input"), dict(window_offset_max_steps=-1), dict(critic_input="velocities"), dict(gz_weight_decay_on_norm="no"), dict(latent_noise_share=1.0), dict(holdout_trajectories=(3, 3)), dict(holdout_trajectories=(-1,)), dict(critic_input="positions_scaled"), dict(critic_input="positions_scaled", critic_position_scale=-1.0), dict(critic_position_scale=2.9873), dict(full_checkpoint_iterations=(5000,)), dict(full_checkpoint_iterations=(0,)), dict(window_offset_max_steps=2.5), dict(critic_blocks=1), dict(critic_blocks=2.0), dict(critic_blocks=3), dict(critic_blocks=8, window_offset_max_steps=383), dict(critic_blocks=4, window_offset_max_steps=128, critic_input="positions"), dict(noise_use_min=1.0), dict(noise_use_min=-0.1), dict(noise_use_weight=-1.0), dict(corr_reward_blocks=1), dict(corr_reward_blocks=-2), dict(corr_reward_blocks=2.0), dict(corr_reward_blocks=True), dict(corr_reward_blocks=8, window_offset_max_steps=383), dict(corr_reward_weight=-1.0), dict(reward_chains=0), dict(noise_use_min=0.5, reward_chains=1), dict(err_window_ps=(78_000.0, 200.0)),
+        dict(negative_slope=-0.1), dict(init="xavier"), dict(gz_additive_noise_std=-0.1), dict(gz_weight_decay=-1.0), dict(gz_dropout=1.0), dict(gz_norm_position="input"), dict(window_offset_max_steps=-1), dict(critic_input="velocities"), dict(gz_weight_decay_on_norm="no"), dict(latent_noise_share=1.0), dict(holdout_trajectories=(3, 3)), dict(holdout_trajectories=(-1,)), dict(critic_input="positions_scaled"), dict(critic_input="positions_scaled", critic_position_scale=-1.0), dict(critic_position_scale=2.9873), dict(full_checkpoint_iterations=(5000,)), dict(full_checkpoint_iterations=(0,)), dict(window_offset_max_steps=2.5), dict(critic_blocks=1), dict(critic_blocks=2.0), dict(critic_blocks=3), dict(critic_blocks=8, window_offset_max_steps=383), dict(critic_blocks=4, window_offset_max_steps=128, critic_input="positions"), dict(noise_use_min=1.0), dict(noise_use_min=-0.1), dict(noise_use_weight=-1.0), dict(corr_reward_blocks=1), dict(corr_reward_blocks=-2), dict(corr_reward_blocks=2.0), dict(corr_reward_blocks=True), dict(corr_reward_blocks=8, window_offset_max_steps=383), dict(corr_reward_weight=-1.0), dict(region_start_steps=-1), dict(region_start_steps=2.5), dict(region_start_steps=True), dict(corr_reward_blocks=4, window_offset_max_steps=128, variance_reward_weight=-1.0), dict(corr_reward_blocks=4, window_offset_max_steps=128, variance_reward_weight=float("nan")), dict(corr_reward_blocks=4, window_offset_max_steps=128, variance_reward_weight=True), dict(corr_reward_blocks=4, window_offset_max_steps=128, variance_reward_weight="1"), dict(reward_chains=0), dict(noise_use_min=0.5, reward_chains=1), dict(err_window_ps=(78_000.0, 200.0)),
         dict(diffusion_fit_ps=(0.0, 10.0)), dict(estimation_time_ps=0.0),
         dict(estimation_time_ps=10_000.0), dict(err_window_ps=(200.0, 90_000.0)),
         dict(diffusion_fit_ps=(10_000.0, 85_000.0)),
@@ -78,6 +79,15 @@ class TestValidation:
         Config(burn_in=0, gp_lambda=0.0, negative_slope=0.0, seed=0, phase_mode="all")
         Config(critic_blocks=8, corr_reward_blocks=8, window_offset_max_steps=384, noise_use_weight=0.0)
         Config(corr_reward_blocks=2)                # lag 1 needs no more data than the papers' two blocks
+        Config(corr_reward_blocks=2, variance_reward_weight=3.5)
+        Config(corr_reward_blocks=4, window_offset_max_steps=128, variance_reward_weight=0.0, noise_use_min=0.5)
+
+    @pytest.mark.parametrize("other", [{}, {"noise_use_min": 0.5}], ids=["alone", "with_noise_use"])
+    def test_variance_reward_needs_the_correlation_reward(self, other):
+        """The variance is measured on the correlation reward's side chains; without them there is nothing to
+        measure it on, also when the noise-use reward makes a side batch."""
+        with pytest.raises(ValueError, match="variance_reward_weight > 0 needs corr_reward_blocks"):
+            Config(variance_reward_weight=1.0, **other)
 
 
 # =============================================================================

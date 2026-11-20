@@ -35,6 +35,13 @@ arm-eval     as-trained evaluation of run directories at checkpoints --iteration
              64-step (0.64 ns) blocks for every arm with Σρ split into lags 1-3 and 4-30, latent
              metrics from a fixed 125-transition latent path (so lag 100 exists for any M), plateau at
              k = 25 and 50. Prints env100 and Σρ first, then one summary row per arm.
+             From the run's own logs, no rollout: W_100 = the critic's W averaged over the 100 iterations
+             up to the checkpoint (metrics.jsonl; each logged row is the mean since the row before, so
+             with --log-every 100 this is that one row, the column W); s_per_it = the run's median
+             seconds per training iteration (metrics.jsonl iterations_per_second; the median leaves out
+             the rows that also hold a checkpoint's evaluation); wall_s_per_it = active wall time per
+             iteration (events.jsonl timestamps, summed over sessions from each start/resume to that
+             session's last event, so queue time between sessions is not counted).
 
 Usage (repository root):
     python tools/step0_rollouts.py --self-test
@@ -415,15 +422,52 @@ def _run_length(run_dir: Path) -> int:
 
 def _run_record(run_dir: Path) -> dict:
     """From events.jsonl and metrics.jsonl: rollback count, the divergence stop (train.py records a
-    'diverged' event before raising), and W by logged iteration."""
+    'diverged' event before raising), W by logged iteration, the rows themselves, and the run's timing."""
     def rows(name):
         f = Path(run_dir) / name
         return [json.loads(x) for x in f.read_text().splitlines() if x.strip()] if f.exists() else []
-    events = rows("events.jsonl")
+    events, metrics = rows("events.jsonl"), rows("metrics.jsonl")
     stop = next((e for e in events if e.get("event") == "diverged"), None)
     return {"rollbacks": sum(e.get("event") == "rollback" for e in events),
             "diverged_at": stop["failed_at_iteration"] if stop else None,
-            "W": {m["iteration"]: m.get("wasserstein") for m in rows("metrics.jsonl")}}
+            "W": {m["iteration"]: m.get("wasserstein") for m in metrics},
+            "metrics": metrics, **run_timing(metrics, events)}
+
+
+def w_mean(metrics: list[dict], iteration: int, span: int = 100) -> float | None:
+    """The critic's W averaged over iterations (iteration - span, iteration]. A metrics.jsonl row at iteration i is
+    the mean over the iterations since the previous row, so each row counts with the number of its iterations that
+    fall in the window. None when no logged iteration falls in it."""
+    num = den = prev = 0
+    for m in sorted(metrics, key=lambda m: m["iteration"]):
+        lo, hi = max(prev, iteration - span), min(m["iteration"], iteration)
+        if hi > lo and m.get("wasserstein") is not None:
+            num, den = num + (hi - lo) * m["wasserstein"], den + (hi - lo)
+        prev = m["iteration"]
+    return num / den if den else None
+
+
+def run_timing(metrics: list[dict], events: list[dict]) -> dict:
+    """s_per_it: median over metrics.jsonl rows of 1 / iterations_per_second (training only: the few rows that also
+    hold a checkpoint's evaluation fall outside the median). wall_s_per_it: active wall time per iteration from
+    events.jsonl, each session (a start or resume event to the last event before the next one) counted from its
+    first to its last timestamp, divided by the highest iteration an event records. None where the logs lack them."""
+    rates = [m["iterations_per_second"] for m in metrics if m.get("iterations_per_second")]
+    s_per_it = float(np.median([1 / r for r in rates])) if rates else None
+    active, start, last = 0.0, None, None
+    for e in events:
+        t = e.get("time")
+        if t is None:
+            continue
+        if e.get("event") in ("start", "resume"):
+            if start is not None:
+                active += last - start
+            start = t
+        last = t
+    if start is not None:
+        active += last - start
+    top = max((e["iteration"] for e in events if e.get("time") is not None), default=0)
+    return {"s_per_it": s_per_it, "wall_s_per_it": active / top if top and active > 0 else None}
 
 
 def _iterations_for(run_dir: Path, explicit: list[int] | None) -> list[int]:
@@ -523,6 +567,7 @@ def _evaluate_one(args, i, snap, ck, cfg, gz, gy, arm, n_blocks, ref, dt_ref, md
     row = {"snapshot": str(snap), "run": snap.parent.name, "arm": arm, "iteration": ck.iteration,
            "rollout_seed": rollout_seed, "draw": "config" if rollout_seed == cfg.seed else "new",
            "rollbacks": rec["rollbacks"], "diverged_at": rec["diverged_at"], "W": rec["W"].get(ck.iteration),
+           "W_100": w_mean(rec["metrics"], ck.iteration), "s_per_it": rec["s_per_it"], "wall_s_per_it": rec["wall_s_per_it"],
            "n_iterations": cfg.n_iterations, "run_length": _run_length(snap.parent), "seed": cfg.seed,
            "block_len": cfg.block_len, "rollout_blocks": n_blocks}
     row.update(trajectory_metrics(d, ck.sigma_nm, cfg, ref, dt_ref, md_block, args.block_steps))
@@ -568,7 +613,9 @@ def _fmt_a(r: dict) -> str:
          + (f" (D/D_analytic {r['D_ratio_analytic']:.2f})" if "D_ratio_analytic" in r else "")
          + f"  err {r['err_percent']:.1f}%  "
          f"period {r['period_blocks']:.2f}  cycle {r['cycle_share'] * 100:.0f}%"
-         + (f"  W {r['W']:.2f}" if r.get("W") is not None else "") + f"  rollbacks {r.get('rollbacks', 0)}"
+         + (f"  W {r['W']:.2f}" if r.get("W") is not None else "")
+         + (f"  W_100 {r['W_100']:.2f}" if r.get("W_100") is not None else "")
+         + (f"  {r['s_per_it']:.3f} s/it" if r.get("s_per_it") is not None else "") + f"  rollbacks {r.get('rollbacks', 0)}"
          + (f"  [run DIVERGED at {r['diverged_at']}]" if r.get("diverged_at") is not None else ""))
     if "horizon_ns" in r:
         s += (f"\n   horizon {r['horizon_ns']:.0f} ns: Σρ first 80 ns {r['rho_sum_first']:+.2f} | last 80 ns "
@@ -597,19 +644,25 @@ def summarize_arms(results: list[dict], var_range: tuple | None = None, max_err:
     results = list(primary.values())
     arms = sorted({r["arm"] for r in results}, key=lambda a: (a != "baseline", a))
     print(f"\n{'arm':<26} {'n':>3} {'Σρ':>6} {'1-3':>6} {'4-30':>6} {'env100':>6} {'DC dim':>6} {'ACF dim':>7} "
-          f"{'drift78':>8} {'share78':>7} {'v2':>8} {'var/MD':>6} {'D':>5} {'err%':>6} {'D>MD':>5} {'pass':>5} {'latent':>6}  periods")
+          f"{'drift78':>8} {'share78':>7} {'v2':>8} {'var/MD':>6} {'D':>5} {'err%':>6} {'D>MD':>5} {'pass':>5} {'latent':>6} "
+          f"{'W_100':>6} {'s/it':>6}  periods")
     for arm in arms:
         rr = [r for r in results if r["arm"] == arm]
 
         def med(k, rr=rr):
             return float(np.nanmedian([x[k] for x in rr]))
 
+        def med_opt(k, rr=rr):                     # columns that rows from older files may lack
+            v = [x[k] for x in rr if x.get(k) is not None]
+            return float(np.median(v)) if v else float("nan")
+
         periods = sorted({round(x["period_blocks"], 1) for x in rr})
         print(f"{arm:<26} {len(rr):>3} {med('rho_sum_1_30'):>+6.2f} {med('rho_sum_1_3'):>+6.2f} {med('rho_sum_4_30'):>+6.2f} "
               f"{med('env100'):>6.3f} {med('dc_share_max_dim'):>6.2f} {med('acf100_max_dim'):>7.2f} {med('drift78'):>+8.3f} "
               f"{med('share78'):>7.2f} {med('v2_nm2_per_ns2'):>+8.4f} {med('var_over_md'):>6.2f} {med('D_ratio'):>5.2f} "
               f"{med('err_percent'):>6.1f} {np.mean([x['D_ratio'] > 1 for x in rr]) * 100:>4.0f}% "
-              f"{np.mean([x['pass'] for x in rr]) * 100:>4.0f}% {np.mean([x['latent_pass'] for x in rr]) * 100:>5.0f}%  "
+              f"{np.mean([x['pass'] for x in rr]) * 100:>4.0f}% {np.mean([x['latent_pass'] for x in rr]) * 100:>5.0f}% "
+              f"{med_opt('W_100'):>6.2f} {med_opt('s_per_it'):>6.3f}  "
               + ", ".join(f"{p:g}" for p in periods))
     rule = rule_text(var_range, max_err)
     print(f"medians over all evaluated checkpoints; {rule}")
@@ -705,6 +758,10 @@ def merge_results(paths: list[str]) -> list[dict]:
         run_dir = Path(r["snapshot"]).parent
         if run_dir.is_dir():
             r["run_length"] = _run_length(run_dir)
+            if "W_100" not in r:                  # a row written before the column existed: fill it from the logs
+                rec = _run_record(run_dir)
+                r.update(W_100=w_mean(rec["metrics"], r["iteration"]), s_per_it=rec["s_per_it"],
+                         wall_s_per_it=rec["wall_s_per_it"])
         r.setdefault("draw", "config")
     return sorted(rows, key=lambda r: (r["arm"], r["run"], r["iteration"], str(r.get("rollout_seed", ""))))
 
@@ -896,6 +953,9 @@ def self_test() -> None:
     _control_err_and_latent()
     print("control 14: --max-err fails a row on error alone (and flags it borderline within 20 %); latent_pass is "
           "independent of the physics columns")
+    _control_w_and_timing()
+    print("control 15: W_100 weights each logged row by its iterations in the window (one row at --log-every 100); "
+          "s/it is the median training rate; wall time leaves out the gap between sessions")
     print("all positive controls passed")
 
 
@@ -990,6 +1050,23 @@ def _control_err_and_latent() -> None:
     invariant = {**_row(0.1, 0.50, 0.02, 0.05, 0.6), "err_percent": 20.0}
     assert latent_passes(clean_latent_bad_physics) and not checkpoint_passes(clean_latent_bad_physics)
     assert not latent_passes(invariant) and not checkpoint_passes(invariant)
+
+
+def _control_w_and_timing() -> None:
+    rows = [{"iteration": i, "wasserstein": float(i // 100), "iterations_per_second": 4.0} for i in range(100, 1001, 100)]
+    assert w_mean(rows, 1000) == 10.0 and w_mean(rows, 500) == 5.0                 # one row = the window
+    rows[-1]["iterations_per_second"] = 0.1                                          # a row that held an evaluation
+    assert run_timing(rows, [])["s_per_it"] == 0.25 and run_timing(rows, [])["wall_s_per_it"] is None
+    split = [r for r in rows if r["iteration"] != 1000] + [{"iteration": 950, "wasserstein": 2.0},
+                                                         {"iteration": 1000, "wasserstein": 4.0}]
+    split = sorted([r for r in split if r["iteration"] != 900] + [{"iteration": 900, "wasserstein": 9.0}],
+                   key=lambda r: r["iteration"])                                    # a time-limit stop at 950
+    assert abs(w_mean(split, 1000) - 3.0) < 1e-12                                    # 50 x 2 + 50 x 4 over 100
+    assert w_mean(rows, 50) == 1.0 and w_mean([], 1000) is None
+    ev = [{"iteration": 0, "event": "start", "time": 0.0}, {"iteration": 500, "event": "checkpoint", "time": 100.0},
+          {"iteration": 600, "event": "time_limit", "time": 130.0},
+          {"iteration": 600, "event": "resume", "time": 5000.0}, {"iteration": 1000, "event": "checkpoint", "time": 5070.0}]
+    assert abs(run_timing([], ev)["wall_s_per_it"] - 0.2) < 1e-12                    # (130 + 70) s / 1000 iterations
 
 
 def _control_diverged_run() -> None:
