@@ -3,8 +3,8 @@
 # (block variance up to 12 x the MD's) with everything else correct. 24 jobs = 8 arms x 3 seeds, 50k, snapshots
 # every 10k, one full checkpoint at 50k. M 64, sigma units, increments critic, burn-in 7, pair window 4, batch 64,
 # Adam 1e-4 (0, 0.9), gp 10, n_critic 5. NOT in the papers.
-# Code and configs: commit 8f6ebe8 on branch batch8-short-data (this file was added in the commit after it;
-# each run's provenance.json records the commit that actually ran).
+# Training code and configs: commit 8f6ebe8 on branch batch8-short-data, unchanged since; this file and arm-eval's
+# D_tgt columns came in the commits after it (each run's provenance.json records the commit that actually ran).
 #
 # Rewards as in Batch 8's "both" arms unless stated: noise = noise_use_min 0.5 (weight 100); corr(1-3) =
 # corr_reward_blocks 4 (weight 10), 1024 side chains. 50 training trajectories, the same ten held out as in Batches
@@ -22,14 +22,25 @@
 #   c2_both_5ns_mid                     0 1 2  4000-4512       384   as c2_both_5ns, region starting at step 4000 (40 ns)
 #     PURPOSE: does "works from 5 ns" hold on another stretch. Targets differ from 0-512 (below); in the miniature
 #     the stretch's own correlations set where each run ended (MSD 0.6-1.8 x the reference across 4 stretches).
+#     PREDICTION: the arm tracks its own targets, so D differs from c2_both_5ns by what the targets imply. Lag 1 alone
+#     (-0.076 vs -0.141, about two standard errors on ~1000 pairs): (1 - 0.152) / (1 - 0.282) = 1.18 x c2_both_5ns.
+#     With all three targeted lags (sums -0.001 vs -0.159): 0.998 / 0.682 = 1.46 x c2_both_5ns (1.54 x MD, against
+#     1.05 x for c2_both_5ns). "Works from 5 ns" carries the stretch-to-stretch spread of rho_1 at 5 ns, +-0.03 to
+#     0.07, which is +-10 to 20 % in D from the targets alone.
 #   c2_both_2p5ns                       0 1 2  0-256           128   2.56 ns: two 2-block windows' worth per trajectory
 #     PURPOSE: the data floor. PREDICTION (miniature): correlations hold, variance falls.
 #   c2_both_paper                       0 1 2  0-128           0     the paper's data exactly (all 60 trajectories, no
 #                                                                    hold-out, no offsets) plus noise + corr(lag 1 only)
 #     corr_reward_blocks is 2, not 4: 128 steps hold only two blocks, so lags 2-3 cannot be measured (Config refuses
 #     4). The lag-1 target comes from one block pair per trajectory and axis (180 pairs, standard error about 0.07).
-#     PURPOSE: the paper's input budget plus the rewards; open question. With no held-out trajectories, the
-#     held-out evaluation does not apply to this arm.
+#     PURPOSE: the paper's input budget plus the rewards. With no held-out trajectories, the held-out evaluation does
+#     not apply to this arm.
+#     PREDICTION: the lag-1 target is -0.246 against -0.148 on 80 ns: 0.10 low, about 1.3 standard errors, i.e. noise,
+#     and the reward pins the model to it. At equal variance that alone puts D at (1 - 0.49) / (1 - 0.30) = 0.73 x MD.
+#     If the reward works, D comes out about 27 % low because the target is wrong; a "pass" on sum rho would mean
+#     matching the wrong number. Score it two ways: against MD, and against the D its own target implies (arm-eval
+#     columns D_tgt and D/tgt). What it supports: at the paper's budget the limit is the precision of the short-time
+#     statistics, not the model.
 #   c2_both_full_var                    0 1 2  0-8000          7872  c2_both_full + block-variance reward, weight 0.78
 #     variance_reward_weight * log(V_gen / V_target)^2 on the correlation reward's 1024 side chains (same blocks, no
 #     extra forward pass or draw); V_target = the training region's 64-step block-sum variance (dataset.json).
@@ -54,14 +65,19 @@
 #     c2_both_paper        -0.246 (lag 1 only)    9.84 / 0.283   (one block pair per trajectory and axis)
 # A short region's targets are that stretch's own, noise included; the run is pulled to them, not to the 80 ns values.
 #
-# Reading the results: the correlation reward pulls rho at lags 1-3 and the variance reward pulls the 64-step block
-# variance toward the training data's, which are the var/MD and rho(1-3) columns of arm-eval. On rewarded arms those
-# columns are partly matched by construction; the evidence the rewards do not act on directly is the MSD against the
-# reference at 10-78 ns, sum rho at lags 4-30, and err. Judge c2_both_full_var on those.
+# Reading the results (the rule from Batch 9 on): the rewards train on the 64-step block variance and rho_1 to rho_3,
+# so var/MD and rho(1-3) cannot judge a rewarded arm. Judge on err, D, the MSD ratio at 10-78 ns, sum rho(4-30) and the
+# latent criteria (DC share and ACF at lag 100, which the rewards do not target), on the held-out trajectories first.
+# For short-region arms (c2_both_5ns_mid, c2_both_2p5ns, c2_both_paper) also read arm-eval's D_tgt, the D the arm's
+# own targets imply relative to MD, f = (1 + 2 sum t_k) / (1 + 2 sum rho_MD,k) over the targeted lags (equal variance
+# and equal correlations beyond them assumed), and D/tgt = D / f: target error (f) apart from model error (D/tgt).
+# By the targets above, f is about 1.0 (full), 1.05 (5ns), 1.54 (5ns_mid), 0.70 (2p5ns; 0.86 on lag 1 alone) and
+# 0.72 (paper). Laptop check of the column on Batch 8's c2_both_5ns seed 0 at 50k (512 chains): D 1.14 x, f 1.07,
+# D/tgt 1.07.
 #
 # New metrics.jsonl columns, c2_both_full_var only: block_var_ratio (V_gen / V_target), variance_penalty
 # (log ratio^2, unweighted). tools/step0_rollouts.py arm-eval adds W_100 (critic W over the 100 iterations up to
-# each checkpoint) and s_per_it / wall_s_per_it from the run's own logs.
+# each checkpoint), s_per_it / wall_s_per_it from the run's own logs, and D_tgt / D/tgt (above).
 # Read block variance, sum rho and the MSD against the reference at fixed times before D.
 # Disk: about 1.11 GB per run (1.13 GB with the 4-block critic): latest.pt and full_050000.pt 375 MB each (385 MB),
 # five 72 MB snapshots; about 27 GB for the 24 runs. Time: about 0.08 s per iteration on Batch 8's GPUs (0.05-0.24),

@@ -42,6 +42,11 @@ arm-eval     as-trained evaluation of run directories at checkpoints --iteration
              the rows that also hold a checkpoint's evaluation); wall_s_per_it = active wall time per
              iteration (events.jsonl timestamps, summed over sessions from each start/resume to that
              session's last event, so queue time between sessions is not counted).
+             D_target_factor / D_vs_target, for runs whose dataset.json holds corr_reward_targets: the D the
+             arm's own targets imply relative to MD, f = (1 + 2 sum_k t_k) / (1 + 2 sum_k rho_MD,k) over the
+             targeted lags k = 1 .. L-1 (rho_MD from the MD block statistics of this evaluation; equal block
+             variance and equal correlations beyond L-1 assumed), and D_ratio / f. Separates the error of
+             a short region's targets (f) from the model's error against them (D_vs_target).
 
 Usage (repository root):
     python tools/step0_rollouts.py --self-test
@@ -283,6 +288,18 @@ def trajectory_metrics(d_model: torch.Tensor, sigma_nm: float, cfg, ref: np.ndar
     for t in RATIO_NS:
         out[f"ratio@{t}"] = float(msd[int(round(t * 1000 / dt_gen))] / ref[int(round(t * 1000 / dt_ref))])
     return out
+
+
+def target_implied_d(run_dir: Path, md_block: dict, d_ratio: float, same_blocks: bool) -> dict:
+    """D_target_factor = (1 + 2 sum t_k) / (1 + 2 sum rho_MD,k) over the lags the run's correlation reward targets
+    (dataset.json corr_reward_targets), and D_vs_target = D_ratio / that factor. Empty for runs without targets, or
+    when the evaluation's blocks are not the model's M (the targets are M-step block correlations)."""
+    f = Path(run_dir) / "dataset.json"
+    targets = json.loads(f.read_text()).get("corr_reward_targets") if f.exists() else None
+    if not targets or not same_blocks or any(k not in md_block["corr"] for k in range(1, len(targets) + 1)):
+        return {}
+    factor = (1 + 2 * sum(targets)) / (1 + 2 * sum(md_block["corr"][k] for k in range(1, len(targets) + 1)))
+    return {"D_target_factor": float(factor), "D_vs_target": float(d_ratio / factor)}
 
 
 def ballistic_share(msd: np.ndarray, dt_ps: float, t_min_ns: float = 5.0) -> float:
@@ -572,8 +589,10 @@ def _evaluate_one(args, i, snap, ck, cfg, gz, gy, arm, n_blocks, ref, dt_ref, md
            "block_len": cfg.block_len, "rollout_blocks": n_blocks}
     row.update(trajectory_metrics(d, ck.sigma_nm, cfg, ref, dt_ref, md_block, args.block_steps))
     row["block_steps"] = args.block_steps
+    row["rho_md"] = {k: v for k, v in md_block["corr"].items() if k <= 3}       # the MD's rho at lags 1-3, for D_tgt
     if getattr(args, "d_analytic", None):
         row["D_ratio_analytic"] = row["D_gen_m2s"] / args.d_analytic
+    row.update(target_implied_d(snap.parent, md_block, row["D_ratio"], args.block_steps == cfg.block_len))
     ref_steps = int(round(cfg.estimation_time_ps / (dt_ref * cfg.step_skip)))
     if args.rollout_blocks and d.shape[1] > ref_steps:      # only for an explicitly longer rollout
         row.update(horizon_metrics(d, ck.sigma_nm, dt_ref * cfg.step_skip, ref_steps, args.block_steps))
@@ -611,6 +630,7 @@ def _fmt_a(r: dict) -> str:
          f"drift78 {r['drift78']:+.3f}  share78 {r['share78']:.2f}  v2 {r['v2_nm2_per_ns2']:+.4f}  "
          f"var/MD {r['var_over_md']:.2f}  D {r['D_ratio']:.2f}x"
          + (f" (D/D_analytic {r['D_ratio_analytic']:.2f})" if "D_ratio_analytic" in r else "")
+         + (f" (targets imply {r['D_target_factor']:.2f}x, D/that {r['D_vs_target']:.2f})" if "D_target_factor" in r else "")
          + f"  err {r['err_percent']:.1f}%  "
          f"period {r['period_blocks']:.2f}  cycle {r['cycle_share'] * 100:.0f}%"
          + (f"  W {r['W']:.2f}" if r.get("W") is not None else "")
@@ -645,7 +665,7 @@ def summarize_arms(results: list[dict], var_range: tuple | None = None, max_err:
     arms = sorted({r["arm"] for r in results}, key=lambda a: (a != "baseline", a))
     print(f"\n{'arm':<26} {'n':>3} {'Σρ':>6} {'1-3':>6} {'4-30':>6} {'env100':>6} {'DC dim':>6} {'ACF dim':>7} "
           f"{'drift78':>8} {'share78':>7} {'v2':>8} {'var/MD':>6} {'D':>5} {'err%':>6} {'D>MD':>5} {'pass':>5} {'latent':>6} "
-          f"{'W_100':>6} {'s/it':>6}  periods")
+          f"{'W_100':>6} {'s/it':>6} {'D_tgt':>6} {'D/tgt':>6}  periods")
     for arm in arms:
         rr = [r for r in results if r["arm"] == arm]
 
@@ -662,7 +682,7 @@ def summarize_arms(results: list[dict], var_range: tuple | None = None, max_err:
               f"{med('share78'):>7.2f} {med('v2_nm2_per_ns2'):>+8.4f} {med('var_over_md'):>6.2f} {med('D_ratio'):>5.2f} "
               f"{med('err_percent'):>6.1f} {np.mean([x['D_ratio'] > 1 for x in rr]) * 100:>4.0f}% "
               f"{np.mean([x['pass'] for x in rr]) * 100:>4.0f}% {np.mean([x['latent_pass'] for x in rr]) * 100:>5.0f}% "
-              f"{med_opt('W_100'):>6.2f} {med_opt('s_per_it'):>6.3f}  "
+              f"{med_opt('W_100'):>6.2f} {med_opt('s_per_it'):>6.3f} {med_opt('D_target_factor'):>6.2f} {med_opt('D_vs_target'):>6.2f}  "
               + ", ".join(f"{p:g}" for p in periods))
     rule = rule_text(var_range, max_err)
     print(f"medians over all evaluated checkpoints; {rule}")
@@ -758,6 +778,9 @@ def merge_results(paths: list[str]) -> list[dict]:
         run_dir = Path(r["snapshot"]).parent
         if run_dir.is_dir():
             r["run_length"] = _run_length(run_dir)
+            if "D_target_factor" not in r and r.get("block_steps", EVAL_BLOCK_STEPS) == r.get("block_len") \
+                    and "rho_md" in r:              # rows that carry the MD correlations they were scored against
+                r.update(target_implied_d(run_dir, {"corr": {int(k): v for k, v in r["rho_md"].items()}}, r["D_ratio"], True))
             if "W_100" not in r:                  # a row written before the column existed: fill it from the logs
                 rec = _run_record(run_dir)
                 r.update(W_100=w_mean(rec["metrics"], r["iteration"]), s_per_it=rec["s_per_it"],
@@ -956,6 +979,9 @@ def self_test() -> None:
     _control_w_and_timing()
     print("control 15: W_100 weights each logged row by its iterations in the window (one row at --log-every 100); "
           "s/it is the median training rate; wall time leaves out the gap between sessions")
+    _control_target_implied_d()
+    print("control 16: targets at the MD's correlations imply 1.0; a lag-1 target of -0.246 against -0.148 implies "
+          "0.72; runs without targets or with other blocks get no column")
     print("all positive controls passed")
 
 
@@ -1067,6 +1093,22 @@ def _control_w_and_timing() -> None:
           {"iteration": 600, "event": "time_limit", "time": 130.0},
           {"iteration": 600, "event": "resume", "time": 5000.0}, {"iteration": 1000, "event": "checkpoint", "time": 5070.0}]
     assert abs(run_timing([], ev)["wall_s_per_it"] - 0.2) < 1e-12                    # (130 + 70) s / 1000 iterations
+
+
+def _control_target_implied_d() -> None:
+    import tempfile
+    md = {"corr": {1: -0.148, 2: -0.010, 3: -0.018, 4: 0.0}}
+    with tempfile.TemporaryDirectory() as tmp:
+        r = Path(tmp)
+        (r / "dataset.json").write_text(json.dumps({"corr_reward_targets": [-0.148, -0.010, -0.018]}))
+        out = target_implied_d(r, md, 1.3, True)
+        assert abs(out["D_target_factor"] - 1) < 1e-12 and abs(out["D_vs_target"] - 1.3) < 1e-12
+        (r / "dataset.json").write_text(json.dumps({"corr_reward_targets": [-0.246]}))
+        out = target_implied_d(r, md, 0.72, True)
+        assert abs(out["D_target_factor"] - 0.508 / 0.704) < 1e-12 and abs(out["D_vs_target"] - 0.704 / 0.508 * 0.72) < 1e-12
+        assert target_implied_d(r, md, 1.0, False) == {}                      # evaluation blocks are not M
+        (r / "dataset.json").write_text(json.dumps({}))
+        assert target_implied_d(r, md, 1.0, True) == {}                       # no correlation reward
 
 
 def _control_diverged_run() -> None:
