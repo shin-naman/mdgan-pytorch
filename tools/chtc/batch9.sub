@@ -1,0 +1,125 @@
+# Batch 9: the one failure Batch 8 left. With a 2-block critic plus the noise-use and correlation rewards the latent
+# and the block correlations come out right at every data length, but one seed per arm drifts in overall scale
+# (block variance up to 12 x the MD's) with everything else correct. 24 jobs = 8 arms x 3 seeds, 50k, snapshots
+# every 10k, one full checkpoint at 50k. M 64, sigma units, increments critic, burn-in 7, pair window 4, batch 64,
+# Adam 1e-4 (0, 0.9), gp 10, n_critic 5. NOT in the papers.
+# Code and configs: commit 8f6ebe8 on branch batch8-short-data (this file was added in the commit after it;
+# each run's provenance.json records the commit that actually ran).
+#
+# Rewards as in Batch 8's "both" arms unless stated: noise = noise_use_min 0.5 (weight 100); corr(1-3) =
+# corr_reward_blocks 4 (weight 10), 1024 side chains. 50 training trajectories, the same ten held out as in Batches
+# 6-8 (7 9 10 11 32 41 44 45 47 57), unless stated. The paper: 2-block critic, the first 2M = 128 steps (1.28 ns)
+# of all 60 trajectories, no offsets, no rewards.
+#
+# Region = the steps the run trains on. In the code it is 2M + window_offset_max_steps (K) steps starting at
+# region_start_steps; a critic window of L blocks starts anywhere in 0 .. 2M + K - L*M of it.
+#
+#   arm (CFG)                           seeds  region (steps)  K     departure from the paper
+#   c2_both_full (batch8_c2_both_full)  3 4 5  0-8000          7872  80 ns with offsets, both rewards (Batch 8 config)
+#     PURPOSE: with Batch 8's seeds 0-2, a six-seed rate of variance excursions at 80 ns.
+#   c2_both_5ns (batch8_c2_both_5ns)    3 4 5  0-512           384   5.12 ns with offsets, both rewards (Batch 8 config)
+#     PURPOSE: the six-seed rate at 5 ns.
+#   c2_both_5ns_mid                     0 1 2  4000-4512       384   as c2_both_5ns, region starting at step 4000 (40 ns)
+#     PURPOSE: does "works from 5 ns" hold on another stretch. Targets differ from 0-512 (below); in the miniature
+#     the stretch's own correlations set where each run ended (MSD 0.6-1.8 x the reference across 4 stretches).
+#   c2_both_2p5ns                       0 1 2  0-256           128   2.56 ns: two 2-block windows' worth per trajectory
+#     PURPOSE: the data floor. PREDICTION (miniature): correlations hold, variance falls.
+#   c2_both_paper                       0 1 2  0-128           0     the paper's data exactly (all 60 trajectories, no
+#                                                                    hold-out, no offsets) plus noise + corr(lag 1 only)
+#     corr_reward_blocks is 2, not 4: 128 steps hold only two blocks, so lags 2-3 cannot be measured (Config refuses
+#     4). The lag-1 target comes from one block pair per trajectory and axis (180 pairs, standard error about 0.07).
+#     PURPOSE: the paper's input budget plus the rewards; open question. With no held-out trajectories, the
+#     held-out evaluation does not apply to this arm.
+#   c2_both_full_var                    0 1 2  0-8000          7872  c2_both_full + block-variance reward, weight 0.78
+#     variance_reward_weight * log(V_gen / V_target)^2 on the correlation reward's 1024 side chains (same blocks, no
+#     extra forward pass or draw); V_target = the training region's 64-step block-sum variance (dataset.json).
+#     Weight: tools/variance_weight.py on configs/batch8_c2_both_full.json, fresh models (seeds 0-2 x 3 side batches),
+#     ||grad of 10 x corr error|| / ||grad of log-ratio^2|| over G_z + G_Y: median 0.783 (range 0.43-0.85), rounded
+#     0.78. At initialisation V_gen / V_target is 0.08-0.10, so the equality holds where the variance is 10 x low.
+#     PREDICTION: variance stays in [0.8, 1.25] x MD on all seeds.
+#   c2_both_full_rc256                  0 1 2  0-8000          7872  c2_both_full with reward_chains 256 (not 1024)
+#     PREDICTION: the same results as Batch 8's c2_both_full at lower cost.
+#   c4_both_full                        0 1 2  0-8000          7872  c2_both_full with a 4-block critic (windows start
+#                                                                    at 0-7744)
+#     PURPOSE: the one test of critic length as a stabiliser. PREDICTION: 3 of 3 seeds pass with no variance excursion
+#     if the 4-block critic is the stabiliser.
+#
+# Targets (dataset.json: corr_reward_targets; variance_reward_target for _var only), measured on PE by the laptop
+# smoke runs (200 iterations of each arm, CPU: all finite, full checkpoint written):
+#     arm                  corr targets (lags)    block variance (sigma units / nm^2; the variance reward's target for _var)
+#     c2_both_full         -0.148 -0.010 -0.018   9.11 / 0.255   (also _var, _rc256, c4_both_full)
+#     c2_both_5ns          -0.141 +0.007 -0.025   8.56 / 0.240
+#     c2_both_5ns_mid      -0.076 +0.054 +0.021   9.00 / 0.257   (steps 4000-4512: lag 1 half the 0-512 value)
+#     c2_both_2p5ns        -0.198 -0.008 -0.068   10.67 / 0.299  (one block grid; lag 3 from 50 x 3 pairs)
+#     c2_both_paper        -0.246 (lag 1 only)    9.84 / 0.283   (one block pair per trajectory and axis)
+# A short region's targets are that stretch's own, noise included; the run is pulled to them, not to the 80 ns values.
+#
+# Reading the results: the correlation reward pulls rho at lags 1-3 and the variance reward pulls the 64-step block
+# variance toward the training data's, which are the var/MD and rho(1-3) columns of arm-eval. On rewarded arms those
+# columns are partly matched by construction; the evidence the rewards do not act on directly is the MSD against the
+# reference at 10-78 ns, sum rho at lags 4-30, and err. Judge c2_both_full_var on those.
+#
+# New metrics.jsonl columns, c2_both_full_var only: block_var_ratio (V_gen / V_target), variance_penalty
+# (log ratio^2, unweighted). tools/step0_rollouts.py arm-eval adds W_100 (critic W over the 100 iterations up to
+# each checkpoint) and s_per_it / wall_s_per_it from the run's own logs.
+# Read block variance, sum rho and the MSD against the reference at fixed times before D.
+# Disk: about 1.11 GB per run (1.13 GB with the 4-block critic): latest.pt and full_050000.pt 375 MB each (385 MB),
+# five 72 MB snapshots; about 27 GB for the 24 runs. Time: about 0.08 s per iteration on Batch 8's GPUs (0.05-0.24),
+# so 1-3.5 h per run with evaluations.
+# Submit from the repository root in /home:  condor_submit tools/chtc/batch9.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+executable                = tools/chtc/run_train.sh
+should_transfer_files     = YES
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+
+request_gpus              = 1
+# The container's PyTorch (2.5.1, CUDA 12.4) has GPU code for compute capability 5.0-9.0 only;
+# newer GPUs fail at the first CUDA call ('no kernel image is available'). 9.0 = H100, 8.9 = L40.
+gpus_minimum_capability   = 7.0
+gpus_maximum_capability   = 9.0
+# gpu2008: its GPU fails every job at the first CUDA call (busy or unavailable), Nov 2026
+requirements              = (Machine != "gpu2008.chtc.wisc.edu")
++WantGPULab               = true
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 5GB
+
+arguments                 = $(ARM)_c$(Cluster)_seed$(SEED) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=$(CFG).json"
+transfer_input_files      = src, configs/$(CFG).json, data/cache/PE.npz
+transfer_checkpoint_files = run_$(ARM)_c$(Cluster)_seed$(SEED)
+transfer_output_files     = run_$(ARM)_c$(Cluster)_seed$(SEED)
+log                       = logs/$(ARM)_c$(Cluster)_seed$(SEED).log
+output                    = logs/$(ARM)_c$(Cluster)_seed$(SEED).out
+error                     = logs/$(ARM)_c$(Cluster)_seed$(SEED).err
+
+queue ARM, CFG, SEED from (
+  c2_both_full, batch8_c2_both_full, 3
+  c2_both_full, batch8_c2_both_full, 4
+  c2_both_full, batch8_c2_both_full, 5
+  c2_both_5ns, batch8_c2_both_5ns, 3
+  c2_both_5ns, batch8_c2_both_5ns, 4
+  c2_both_5ns, batch8_c2_both_5ns, 5
+  c2_both_5ns_mid, batch9_c2_both_5ns_mid, 0
+  c2_both_5ns_mid, batch9_c2_both_5ns_mid, 1
+  c2_both_5ns_mid, batch9_c2_both_5ns_mid, 2
+  c2_both_2p5ns, batch9_c2_both_2p5ns, 0
+  c2_both_2p5ns, batch9_c2_both_2p5ns, 1
+  c2_both_2p5ns, batch9_c2_both_2p5ns, 2
+  c2_both_paper, batch9_c2_both_paper, 0
+  c2_both_paper, batch9_c2_both_paper, 1
+  c2_both_paper, batch9_c2_both_paper, 2
+  c2_both_full_var, batch9_c2_both_full_var, 0
+  c2_both_full_var, batch9_c2_both_full_var, 1
+  c2_both_full_var, batch9_c2_both_full_var, 2
+  c2_both_full_rc256, batch9_c2_both_full_rc256, 0
+  c2_both_full_rc256, batch9_c2_both_full_rc256, 1
+  c2_both_full_rc256, batch9_c2_both_full_rc256, 2
+  c4_both_full, batch9_c4_both_full, 0
+  c4_both_full, batch9_c4_both_full, 1
+  c4_both_full, batch9_c4_both_full, 2
+)
