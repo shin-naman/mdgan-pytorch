@@ -22,12 +22,21 @@ with the targets measured once from the training region (WindowDataset.block_sum
 of squares on purpose: a form that can go negative is minimised by distorting single chains. Gradients
 reach G_Y and, through every transition from z_0 on, G_z.
 
-Block-sum variance (variance_reward_weight = w > 0; needs the correlation reward). On the SAME block sums as
+Sub-block correlations (subcorr_block_steps = s > 0, subcorr_lags = K; needs the side chain). The same decoded,
+centred L blocks are cut into L*M/s consecutive s-step sub-blocks and summed; rho_k (k = 1..K) is pooled over
+chains, positions and axes as for the blocks. The term is
+    subcorr_weight * sum_k (rho_k - subcorr_target_k)^2
+with targets from the training region cut the same way (WindowDataset.subblock_sum_correlations). A block
+lag-1 correlation is a fixed combination of the sub-block correlations at lags 1 .. 2M/s - 1, so at s = M/4 lags
+1-7 constrain the block lag 1 and the variance of the block sums. No further forward pass or draw.
+
+Block-sum variance (variance_reward_weight = w > 0; needs the correlation reward's side chain, at any weight). On the SAME block sums as
 the correlations (no further forward pass, no further draw), V_gen = their variance pooled over chains, blocks
 and axes. The term is
     w * (log(V_gen / V_target))^2
 with V_target measured once from the training region (WindowDataset.block_sum_variance, on the trajectories
-and block grids the correlation targets use). Symmetric in the log-ratio: a factor 2 too large costs as much
+and block grids the correlation targets use). With the sub-block reward on, V is the variance of the s-step
+sub-block sums instead, generated and target alike (WindowDataset.subblock_sum_variance). Symmetric in the log-ratio: a factor 2 too large costs as much
 as a factor 2 too small. Gradients reach G_Y and G_z as for the correlations. At w = 0 nothing is computed,
 so a run without it is the run before the term existed.
 
@@ -79,6 +88,25 @@ def block_sum_variance(sums: torch.Tensor) -> torch.Tensor:
     return (x - x.mean()).square().mean()
 
 
+def reward_targets(config, dataset) -> dict:
+    """Every target the enabled rewards need, measured once from the training region, with its sample count:
+    corr (block lags 1..L-1), subcorr and subcorr_pairs (sub-block lags 1..K), variance and variance_count (of the
+    block sums, or of the sub-block sums when subcorr_block_steps > 0). Only the enabled terms' keys."""
+    out, s = {}, config.subcorr_block_steps
+    if config.corr_reward_blocks:
+        out["corr"] = dataset.block_sum_correlations(config.corr_reward_blocks)
+    if s:
+        out["subcorr"] = dataset.subblock_sum_correlations(s, config.subcorr_lags)
+        out["subcorr_pairs"] = dataset.subblock_pair_counts(s, config.subcorr_lags)
+    if config.variance_reward_weight > 0:
+        if s:
+            out["variance"], out["variance_count"] = dataset.subblock_sum_variance(s)
+        else:
+            out["variance"] = dataset.block_sum_variance(config.corr_reward_blocks)
+            out["variance_count"] = dataset.block_sum_count(config.corr_reward_blocks)
+    return out
+
+
 def reward_metric_names(config) -> tuple[str, ...]:
     """The extra columns of metrics.jsonl for this config (none with every reward off). Unweighted values,
     then reward_loss, the weighted sum that was added to the generator loss. block_var_ratio = V_gen / V_target
@@ -88,6 +116,8 @@ def reward_metric_names(config) -> tuple[str, ...]:
         names += ("noise_use_share", "noise_use_penalty")
     if config.corr_reward_blocks:
         names += ("corr_error",)
+    if config.subcorr_block_steps:
+        names += ("subcorr_error",)
     if config.variance_reward_weight > 0:
         names += ("block_var_ratio", "variance_penalty")
     return names + ("reward_loss",) if names else ()
@@ -95,10 +125,12 @@ def reward_metric_names(config) -> tuple[str, ...]:
 
 def generator_rewards(gz, gy, config, corr_targets: torch.Tensor | None = None,
                       generator: torch.Generator | None = None,
-                      variance_target: float | None = None) -> tuple[torch.Tensor, dict]:
+                      variance_target: float | None = None,
+                      subcorr_targets: torch.Tensor | None = None) -> tuple[torch.Tensor, dict]:
     """(weighted sum of the enabled terms, {name: detached value} for reward_metric_names(config)).
     corr_targets: (corr_reward_blocks - 1,) on the models' device; needed when that reward is on.
-    variance_target: V_target > 0 (WindowDataset.block_sum_variance); needed when the variance reward is on."""
+    variance_target: V_target > 0 (reward_targets(...)["variance"]); needed when the variance reward is on.
+    subcorr_targets: (subcorr_lags,) on the models' device; needed when the sub-block reward is on."""
     n, blocks = config.reward_chains, config.corr_reward_blocks
     if not config.rewards_on:
         raise ValueError("no reward is enabled in this config")
@@ -106,6 +138,8 @@ def generator_rewards(gz, gy, config, corr_targets: torch.Tensor | None = None,
         raise ValueError(f"corr_targets must hold the {blocks - 1} target correlations")
     if config.variance_reward_weight > 0 and not (variance_target is not None and variance_target > 0):
         raise ValueError("variance_target must be the positive target block-sum variance")
+    if config.subcorr_block_steps and (subcorr_targets is None or subcorr_targets.shape != (config.subcorr_lags,)):
+        raise ValueError(f"subcorr_targets must hold the {config.subcorr_lags} target sub-block correlations")
     param = next(gz.parameters())
 
     def step(z):
@@ -131,6 +165,13 @@ def generator_rewards(gz, gy, config, corr_targets: torch.Tensor | None = None,
         error = (block_sum_correlations(sums, blocks - 1) - corr_targets).square().sum()
         total = total + config.corr_reward_weight * error
         stats["corr_error"] = error.detach()
+        if config.subcorr_block_steps:                        # the same centred blocks, cut finer: no pass, no draw
+            sub = y.reshape(n, blocks * config.block_len // config.subcorr_block_steps, config.subcorr_block_steps,
+                            -1).sum(dim=2)                                                  # (n, L*M/s, C)
+            sub_error = (block_sum_correlations(sub, config.subcorr_lags) - subcorr_targets).square().sum()
+            total = total + config.subcorr_weight * sub_error
+            stats["subcorr_error"] = sub_error.detach()
+            sums = sub                                        # the variance term, if on, is that of the sub-blocks
         if config.variance_reward_weight > 0:                 # the same sums: no forward pass, no draw
             ratio = block_sum_variance(sums) / variance_target
             penalty = torch.log(ratio).square()

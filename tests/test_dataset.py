@@ -612,3 +612,105 @@ def test_region_start_must_leave_room_for_the_region():
     for bad in (-1, 2.5, True):
         with pytest.raises(ValueError, match="region_start_steps"):
             WindowDataset(sys_, block_len=M, step_skip=1, region_start_steps=bad)
+
+
+# --- sub-block sums (the sub-block correlation reward) ---------------------------------------------------------
+
+def _ar_sub_system(phi, steps, n_traj=40, n_sub=64, seed=0):
+    """Displacements whose consecutive `steps`-step sub-block sums are an AR(1) chain with coefficient phi (rho_k =
+    phi^k at the sub-block level): each sub-block's sum spread evenly plus noise that sums to zero inside it."""
+    rng = np.random.default_rng(seed)
+    s = np.zeros((n_traj, n_sub, 3))
+    s[:, 0] = rng.normal(size=(n_traj, 3))
+    for t in range(1, n_sub):
+        s[:, t] = phi * s[:, t - 1] + np.sqrt(1 - phi ** 2) * rng.normal(size=(n_traj, 3))
+    e = rng.normal(size=(n_traj, n_sub, steps, 3))
+    d = (s[:, :, None, :] / steps + (e - e.mean(axis=2, keepdims=True))).reshape(n_traj, n_sub * steps, 3)
+    return SystemData(name="ar_sub", displacements=d.astype(np.float32), dt_ps=10.0,
+                      box_nm=np.full((n_traj, 3), 4.75), meta={})
+
+
+def test_subblock_targets_equal_an_independent_computation():
+    """np.corrcoef on explicitly summed sub-blocks, pairs within each trajectory, pooled; np.var for the variance;
+    pair and sample counts by hand. Both the papers' region (K = 0) and a longer one."""
+    s = 2
+    sys_ = _ar_sub_system(-0.4, s)
+    d = sys_.displacements.astype(np.float64)
+    for k_max in (0, 2 * M):
+        ds = WindowDataset(sys_, block_len=M, step_skip=1, scale_inputs=False, window_offset_max_steps=k_max)
+        span = 2 * M + k_max
+        sums = np.stack([d[:, i * s:(i + 1) * s].sum(axis=1) for i in range(span // s)], axis=1)     # (N, nb, C)
+        nb = sums.shape[1]
+        expected = [np.corrcoef(sums[:, :-k].ravel(), sums[:, k:].ravel())[0, 1] for k in range(1, 8)]
+        np.testing.assert_allclose(ds.subblock_sum_correlations(s, 7), expected, rtol=0, atol=1e-6)
+        assert ds.subblock_pair_counts(s, 7) == [40 * (nb - k) * 3 for k in range(1, 8)]
+        v, n = ds.subblock_sum_variance(s)
+        np.testing.assert_allclose(v, np.var(sums), rtol=1e-5)
+        assert n == 40 * nb * 3
+
+
+@pytest.mark.statistical
+def test_subblock_targets_recover_a_planted_ar1():
+    """Sub-block sums AR(1) with phi = -0.4: rho_k = (-0.4)^k. 200 x 3 series of 120 sub-blocks give at least
+    200 * 3 * 113 = 67,800 pairs per lag, a standard error near 1 / sqrt(67,800) = 0.004; tolerance 0.02."""
+    sys_ = _ar_sub_system(-0.4, 2, n_traj=200, n_sub=120)
+    ds = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=120 * 2 - 2 * M)
+    np.testing.assert_allclose(ds.subblock_sum_correlations(2, 7), (-0.4) ** np.arange(1, 8), rtol=0, atol=0.02)
+
+
+def _block_lag1_from_subblocks(rho, q):
+    """Block lag-1 correlation of sums of q consecutive sub-blocks from the sub-block correlations rho_1..rho_{2q-1}
+    of a stationary series: Cov(B_j, B_j+1) = sum_d (q - |d - q|) gamma_d, Var(B) = q gamma_0 + 2 sum_{d<q} (q - d) gamma_d."""
+    num = sum((q - abs(d - q)) * rho[d - 1] for d in range(1, 2 * q))
+    den = q + 2 * sum((q - d) * rho[d - 1] for d in range(1, q))
+    return num / den
+
+
+@pytest.mark.statistical
+@pytest.mark.parametrize("phi", [-0.4, 0.3])
+def test_subblock_lags_1_to_7_fix_the_block_lag_1(phi):
+    """With M = 4 s, the block lag-1 correlation of a stationary series is a fixed combination of its sub-block
+    correlations at lags 1-7, so the sub-block reward constrains what the block reward does. Steps AR(1) with
+    coefficient phi (stationary step by step, so every block grid sees the same statistics). 300 x 3 series of 40
+    blocks give about 35,000 block pairs per grid (standard error near 0.005); both sides are estimates, and the
+    tolerance 0.02 is four of those standard errors."""
+    rng = np.random.default_rng(5)
+    n_traj, n = 300, 40 * M
+    d = np.zeros((n_traj, n, 3))
+    d[:, 0] = rng.normal(size=(n_traj, 3))
+    for t in range(1, n):
+        d[:, t] = phi * d[:, t - 1] + np.sqrt(1 - phi ** 2) * rng.normal(size=(n_traj, 3))
+    sys_ = SystemData(name="ar_step", displacements=d.astype(np.float32), dt_ps=10.0,
+                      box_nm=np.full((n_traj, 3), 4.75), meta={})
+    ds = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=n - 2 * M)
+    implied = _block_lag1_from_subblocks(ds.subblock_sum_correlations(M // 4, 7), 4)
+    assert implied == pytest.approx(ds.block_sum_correlations(2)[0], abs=0.02)
+    assert abs(implied) > 0.03                                # a real correlation, not two zeros agreeing
+
+
+@pytest.mark.parametrize("phi", [-0.6, -0.4, 0.3, 0.8])
+def test_subblock_identity_is_exact_for_population_values(phi):
+    """The same identity with no sampling: AR(1) steps have gamma_k = phi^|k|, so every sub-block and block
+    covariance is a finite sum; the combination of the exact sub-block correlations equals the exact block lag 1."""
+    s = M // 4
+    cov = lambda a, b, n: sum(phi ** abs(i - j) for i in range(a, a + n) for j in range(b, b + n))   # noqa: E731
+    rho_sub = [cov(0, d * s, s) / cov(0, 0, s) for d in range(1, 8)]
+    assert _block_lag1_from_subblocks(rho_sub, 4) == pytest.approx(cov(0, M, M) / cov(0, 0, M), rel=1e-12)
+
+
+def test_subblock_targets_use_training_trajectories_and_the_region_only():
+    sys_ = _ar_sub_system(-0.4, 2)
+    full = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=6 * M)
+    held = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=6 * M, holdout_trajectories=(0, 1, 2))
+    kept = WindowDataset(_kept_system(sys_, (0, 1, 2)), block_len=M, step_skip=1, window_offset_max_steps=6 * M)
+    np.testing.assert_array_equal(held.subblock_sum_correlations(2, 7), kept.subblock_sum_correlations(2, 7))
+    assert held.subblock_sum_variance(2) == kept.subblock_sum_variance(2) != full.subblock_sum_variance(2)
+    short = WindowDataset(sys_, block_len=M, step_skip=1)
+    assert not np.allclose(short.subblock_sum_correlations(2, 7), full.subblock_sum_correlations(2, 7))
+
+
+@pytest.mark.parametrize("steps,lags", [(2, 8), (2, 0), (16, 1), (0, 1)])
+def test_subblock_targets_need_the_sub_blocks(steps, lags):
+    ds = WindowDataset(_ar_sub_system(-0.4, 2), block_len=M, step_skip=1)            # 16 steps: 8 sub-blocks of 2
+    with pytest.raises(ValueError):
+        ds.subblock_sum_correlations(steps, lags)

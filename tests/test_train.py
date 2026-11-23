@@ -1013,8 +1013,8 @@ class TestVarianceReward:
 
         trainer(tmp_path / "now", tiny(**self.ON)).run()
 
-        def frozen(*a, variance_target=None, **kw):
-            assert variance_target is None
+        def frozen(*a, variance_target=None, subcorr_targets=None, **kw):
+            assert variance_target is None and subcorr_targets is None
             return _generator_rewards_6e41f72(*a, **kw)
 
         monkeypatch.setattr(train_module, "generator_rewards", frozen)
@@ -1144,3 +1144,85 @@ class TestRegionStart:
         torch.save(ck, out / LATEST)
         with pytest.raises(ValueError, match="dataset differs"):
             trainer(out, tiny(region_start_steps=16), resume=True)
+
+
+# =============================================================================
+class TestSubblockRewardTraining:
+    """The sub-block reward in training (not in the papers; off by default). TINY's M = 8, sub-blocks of 2 steps."""
+
+    ON = {"window_offset_max_steps": 16, "noise_use_min": 0.9, "corr_reward_blocks": 2, "corr_reward_weight": 0.0,
+          "subcorr_block_steps": 2, "subcorr_lags": 7, "subcorr_weight": 3.0, "variance_reward_weight": 2.0,
+          "reward_chains": 16}
+
+    def test_batch9_variance_reward_trains_exactly_as_a1358ef(self, tmp_path, monkeypatch):
+        """With the sub-block reward off, a Batch 9 variance run is the run of a1358ef: the frozen a1358ef reward in
+        place of today's gives the same weights, generator state and logged values."""
+        import mdgan.train as train_module
+        from test_rewards import _generator_rewards_a1358ef
+        c = tiny(window_offset_max_steps=16, noise_use_min=0.9, corr_reward_blocks=4, reward_chains=16,
+                 variance_reward_weight=2.0)
+        trainer(tmp_path / "now", c).run()
+
+        def frozen(*a, subcorr_targets=None, **kw):
+            assert subcorr_targets is None
+            return _generator_rewards_a1358ef(*a, **kw)
+
+        monkeypatch.setattr(train_module, "generator_rewards", frozen)
+        trainer(tmp_path / "then", c).run()
+        assert_same_weights(weights(tmp_path / "now" / LATEST), weights(tmp_path / "then" / LATEST))
+        assert torch.equal(load_checkpoint(tmp_path / "now" / LATEST).generator_state,
+                           load_checkpoint(tmp_path / "then" / LATEST).generator_state)
+        drop = lambda rows: [{k: v for k, v in r.items() if k != "iterations_per_second"} for r in rows]   # noqa: E731
+        assert drop(jsonl(tmp_path / "now" / "metrics.jsonl")) == drop(jsonl(tmp_path / "then" / "metrics.jsonl"))
+        saved = json.loads((tmp_path / "now" / "dataset.json").read_text())
+        assert "subcorr_targets" not in saved and saved["variance_reward_target"] == t_var(c)
+
+    def test_columns_targets_and_counts(self, tmp_path):
+        t = trainer(tmp_path / "run", tiny(**self.ON))
+        t.run()
+        names = ("noise_use_share", "noise_use_penalty", "corr_error", "subcorr_error", "block_var_ratio",
+                 "variance_penalty", "reward_loss")
+        assert t.metric_names == METRIC_NAMES + names
+        saved = json.loads((tmp_path / "run" / "dataset.json").read_text())
+        np.testing.assert_allclose(saved["subcorr_targets"], t.dataset.subblock_sum_correlations(2, 7), rtol=1e-6)
+        assert saved["subcorr_pair_counts"] == t.dataset.subblock_pair_counts(2, 7)
+        v, n = t.dataset.subblock_sum_variance(2)
+        assert (saved["variance_reward_target"], saved["variance_reward_count"]) == (v, n)
+        rows = jsonl(tmp_path / "run" / "metrics.jsonl")
+        assert len(rows) == 6 and all(np.isfinite([r[k] for k in t.metric_names]).all() for r in rows)
+        for r in rows:                     # the correlation term is off: it is logged but adds nothing
+            assert r["reward_loss"] == pytest.approx(100 * r["noise_use_penalty"] + 3.0 * r["subcorr_error"]
+                                                     + 2.0 * r["variance_penalty"], rel=1e-4)
+
+    def test_time_limit_restarts_are_bit_exact(self, tmp_path):
+        c = tiny(**self.ON)
+        trainer(tmp_path / "straight", c).run()
+        out = tmp_path / "chunked"
+        status, sessions = trainer(out, c).run(max_seconds=0), 1
+        while status == "time_limit" and sessions < 20:
+            status, sessions = trainer(out, c, resume=True).run(max_seconds=0), sessions + 1
+        assert status == "done" and sessions == 6
+        assert_same_weights(weights(tmp_path / "straight" / LATEST), weights(out / LATEST))
+
+    @pytest.mark.parametrize("key", ["subcorr_targets", "variance_reward_target"])
+    def test_resume_checks_the_recorded_targets(self, tmp_path, key):
+        out = tmp_path / "run"
+        trainer(out, tiny(**{**self.ON, "n_iterations": 3})).run()
+        f = out / "dataset.json"
+        saved = json.loads(f.read_text())
+        saved[key] = [x * 1.001 for x in saved[key]] if isinstance(saved[key], list) else saved[key] * 1.001
+        f.write_text(json.dumps(saved))
+        with pytest.raises(ValueError, match=key):
+            trainer(out, tiny(**self.ON), resume=True)
+
+    @pytest.mark.parametrize("change", [{"subcorr_block_steps": 4, "subcorr_lags": 3}, {"subcorr_lags": 5},
+                                        {"subcorr_weight": 1.0}], ids=lambda p: next(iter(p)))
+    def test_resume_refuses_a_change(self, tmp_path, change):
+        out = tmp_path / "run"
+        trainer(out, tiny(**{**self.ON, "n_iterations": 3})).run()
+        with pytest.raises(ValueError, match="config differs from the checkpoint"):
+            trainer(out, tiny(**{**self.ON, **change}), resume=True)
+
+
+def t_var(c):
+    return windows(brownian(), c).block_sum_variance(c.corr_reward_blocks)

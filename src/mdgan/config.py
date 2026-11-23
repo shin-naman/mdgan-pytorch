@@ -75,6 +75,11 @@ class Config:
     # w > 0: add w * log(V_gen / V_target)^2, V = the variance of M-step block sums, on the correlation reward's side
     # chains (so it needs corr_reward_blocks); V_target from the same training region as the correlation targets
     variance_reward_weight: float = 0.0
+    # s > 0: also match the correlations of s-step sub-block sums at lags 1..subcorr_lags, cut from the same side chain,
+    # to the training region's (weight subcorr_weight); the variance reward then uses the s-step sums too
+    subcorr_block_steps: int = 0
+    subcorr_lags: int = 0
+    subcorr_weight: float = 0.0
     reward_chains: int = 1024
 
     # --- checkpoints and estimation ------------------------------------------------------
@@ -144,6 +149,22 @@ class Config:
         if isinstance(self.variance_reward_weight, bool) or not isinstance(self.variance_reward_weight, (int, float)) \
                 or not self.variance_reward_weight >= 0:
             raise ValueError("variance_reward_weight must be a non-negative number")
+        for name in ("subcorr_block_steps", "subcorr_lags"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if isinstance(self.subcorr_weight, bool) or not isinstance(self.subcorr_weight, (int, float)) \
+                or not self.subcorr_weight >= 0:
+            raise ValueError("subcorr_weight must be a non-negative number")
+        if self.subcorr_block_steps:
+            if not self.corr_reward_blocks:
+                raise ValueError("subcorr_block_steps > 0 needs corr_reward_blocks > 0: the sub-blocks are cut from the "
+                                 "correlation reward's side chain")
+            if self.block_len % self.subcorr_block_steps:
+                raise ValueError("subcorr_block_steps must divide block_len")
+            n_sub = self.corr_reward_blocks * self.block_len // self.subcorr_block_steps
+            if not 1 <= self.subcorr_lags < n_sub:
+                raise ValueError(f"subcorr_lags must be in [1, {n_sub - 1}]: the side chain holds {n_sub} sub-blocks")
         if self.variance_reward_weight > 0 and not self.corr_reward_blocks:
             raise ValueError("variance_reward_weight > 0 needs corr_reward_blocks > 0: the block variance is measured "
                              "on the correlation reward's side chains")

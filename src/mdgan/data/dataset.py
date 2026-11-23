@@ -234,6 +234,46 @@ class WindowDataset:
         generator's variance reward (mdgan.rewards, Config.variance_reward_weight)."""
         return float(np.mean([((x - x.mean()) ** 2).mean() for x in (s.ravel() for s in self._block_sum_grids(n_blocks))]))
 
+    def block_sum_count(self, n_blocks: int) -> int:
+        """How many M-step block sums (trajectories x blocks x axes, over every grid used) block_sum_variance pools."""
+        return int(sum(x.size for x in self._block_sum_grids(n_blocks)))
+
+    def _subblock_sums(self, steps: int) -> np.ndarray:
+        """(W, nb, C): each training trajectory's region cut into consecutive `steps`-step sub-blocks from its first
+        step (one grid), each summed; a remainder shorter than `steps` is dropped."""
+        positive_int("steps", steps)
+        series = (self._windows if self._series is None else self._series).numpy().astype(np.float64)
+        w, span, c = series.shape
+        nb = span // steps
+        if nb < 2:
+            raise ValueError(f"the region ({span} steps) holds fewer than two {steps}-step sub-blocks")
+        return series[:, :nb * steps].reshape(w, nb, steps, c).sum(axis=2)
+
+    def subblock_sum_correlations(self, steps: int, lags: int) -> np.ndarray:
+        """(lags,) correlations of `steps`-step sub-block sums k = 1 .. lags apart: pairs taken within each
+        trajectory's region, pooled over all pairs, trajectories and axes, each side's mean removed over the pool.
+        The target of the sub-block correlation reward (Config.subcorr_block_steps)."""
+        sums = self._subblock_sums(steps)
+        if not 1 <= lags < sums.shape[1]:
+            raise ValueError(f"lags must be in [1, {sums.shape[1] - 1}] for {sums.shape[1]} sub-blocks")
+        rho = []
+        for k in range(1, lags + 1):
+            x, y = sums[:, :-k].ravel(), sums[:, k:].ravel()
+            x, y = x - x.mean(), y - y.mean()
+            rho.append((x * y).mean() / np.sqrt((x * x).mean() * (y * y).mean()))
+        return np.array(rho)
+
+    def subblock_pair_counts(self, steps: int, lags: int) -> list[int]:
+        """Pairs behind each lag of subblock_sum_correlations: trajectories x (sub-blocks - k) x axes."""
+        w, nb, c = self._subblock_sums(steps).shape
+        return [w * (nb - k) * c for k in range(1, lags + 1)]
+
+    def subblock_sum_variance(self, steps: int) -> tuple[float, int]:
+        """(variance, count) of the `steps`-step sub-block sums, pooled over trajectories, sub-blocks and axes with
+        one mean removed: the variance reward's target when the sub-block reward is on."""
+        x = self._subblock_sums(steps).ravel()
+        return float(((x - x.mean()) ** 2).mean()), int(x.size)
+
     @property
     def metadata(self) -> dict:
         """What a checkpoint must record to reproduce this training set."""

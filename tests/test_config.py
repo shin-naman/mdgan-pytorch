@@ -28,6 +28,7 @@ class TestDefaults:
         assert c.critic_blocks == 2 and (c.noise_use_min, c.corr_reward_blocks) == (0.0, 0) and not c.rewards_on
         assert (c.noise_use_weight, c.corr_reward_weight, c.reward_chains) == (100.0, 10.0, 1024)
         assert c.variance_reward_weight == 0.0 and c.region_start_steps == 0
+        assert (c.subcorr_block_steps, c.subcorr_lags, c.subcorr_weight) == (0, 0, 0.0)
         assert (c.step_skip, c.phase_mode, c.scale_inputs) == (1, "single", True)
         assert (c.batch_size, c.n_iterations, c.n_critic) == (64, 300_000, 5)
         assert (c.lr, c.betas, c.gp_lambda) == (1e-4, (0.0, 0.9), 10.0)
@@ -196,3 +197,31 @@ class TestNoDrift:
         from mdgan.losses import critic_loss, gradient_penalty
         for fn in (gradient_penalty, critic_loss):
             assert inspect.signature(fn).parameters["gp_lambda"].default == Config().gp_lambda
+
+# =============================================================================
+class TestSubblockReward:
+    """subcorr_block_steps, subcorr_lags, subcorr_weight (not in the papers; off by default)."""
+
+    def test_valid(self):
+        Config(corr_reward_blocks=2, subcorr_block_steps=16, subcorr_lags=7, subcorr_weight=3.0)
+        Config(corr_reward_blocks=2, corr_reward_weight=0.0, subcorr_block_steps=16, subcorr_lags=1,
+               variance_reward_weight=1.0)
+        Config(subcorr_lags=3, subcorr_weight=2.0)          # off: the other two are not read
+
+    @pytest.mark.parametrize("bad,match", [
+        (dict(subcorr_block_steps=16, subcorr_lags=7), "needs corr_reward_blocks"),
+        (dict(corr_reward_blocks=2, subcorr_block_steps=24, subcorr_lags=3), "divide block_len"),
+        (dict(corr_reward_blocks=2, subcorr_block_steps=16, subcorr_lags=8), "subcorr_lags must be in"),
+        (dict(corr_reward_blocks=2, subcorr_block_steps=16, subcorr_lags=0), "subcorr_lags must be in"),
+        (dict(subcorr_block_steps=-1), "non-negative integer"), (dict(subcorr_block_steps=2.0), "non-negative integer"),
+        (dict(subcorr_lags=True), "non-negative integer"), (dict(subcorr_weight=-1.0), "subcorr_weight"),
+        (dict(subcorr_weight=float("nan")), "subcorr_weight"),
+    ])
+    def test_invalid(self, bad, match):
+        with pytest.raises(ValueError, match=match):
+            Config(**bad)
+
+    def test_variance_reward_with_the_correlation_weight_at_zero_is_accepted(self):
+        """Batch 10 runs the variance term with the correlation term off: the side chain is still decoded."""
+        c = Config(corr_reward_blocks=2, corr_reward_weight=0.0, variance_reward_weight=1.0)
+        assert c.rewards_on

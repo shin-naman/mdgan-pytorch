@@ -8,8 +8,8 @@ One ITERATION = one generator update:
      frozen critic (no parameter gradients for D_G), Adam step on G_z + G_Y.
      With a generator reward enabled (mdgan.rewards; off by default, not in the papers)
      its terms are added to that loss before the step. The rewards' targets are written to
-     dataset.json (corr_reward_targets, variance_reward_target); the variance target is checked
-     against it on resume.
+     dataset.json (corr_reward_targets, subcorr_targets, variance_reward_target, with their
+     sample counts); the sub-block and variance targets are checked against it on resume.
   3. every checkpoint_every iterations (and at the end): latest.pt (full resume
      state, overwritten), snap_XXXXXX.pt (generators only), and, if an MD
      reference was given, an evaluation appended to evaluations.jsonl.
@@ -66,7 +66,7 @@ from mdgan.data.dataset import WindowDataset
 from mdgan.evaluate import evaluate
 from mdgan.losses import critic_loss, generator_loss
 from mdgan.models import build_models
-from mdgan.rewards import generator_rewards, reward_metric_names
+from mdgan.rewards import generator_rewards, reward_metric_names, reward_targets
 from mdgan.rollout import make_fake_window
 
 LATEST = "latest.pt"
@@ -225,13 +225,12 @@ class Trainer:
         self.rollbacks: list[dict] = []
         self._rollbacks_since_checkpoint = 0
         self.metric_names = METRIC_NAMES + reward_metric_names(config)     # METRIC_NAMES alone without rewards
-        # the correlation reward's targets: the training region's block-sum correlations, fixed for the run
-        self.corr_targets = (torch.as_tensor(dataset.block_sum_correlations(config.corr_reward_blocks),
-                                             dtype=torch.float32, device=self.device)
-                             if config.corr_reward_blocks else None)
-        # the variance reward's target, from the same trajectories and block grids; None (never computed) when off
-        self.variance_target = (dataset.block_sum_variance(config.corr_reward_blocks)
-                                if config.variance_reward_weight > 0 else None)
+        # the rewards' targets, measured once from the training region and fixed for the run; None where a term is off
+        self.targets = reward_targets(config, dataset) if config.rewards_on else {}
+        as_t = lambda key: (torch.as_tensor(self.targets[key], dtype=torch.float32, device=self.device)   # noqa: E731
+                            if key in self.targets else None)
+        self.corr_targets, self.subcorr_targets = as_t("corr"), as_t("subcorr")
+        self.variance_target = self.targets.get("variance")
 
         torch.manual_seed(config.seed)
         self.gz, self.gy, self.dg = (m.to(self.device) for m in build_models(config))
@@ -257,7 +256,11 @@ class Trainer:
             {**self.dataset.metadata, "position_rms_ratio": self.dataset.position_rms_ratio,
              **({"D_analytic_m2s": self.dataset.analytic_D_m2s} if self.dataset.analytic_D_m2s is not None else {}),
              **({"corr_reward_targets": self.corr_targets.tolist()} if self.corr_targets is not None else {}),
-             **({"variance_reward_target": self.variance_target} if self.variance_target is not None else {})},
+             **({"subcorr_targets": [float(x) for x in self.targets["subcorr"]],
+                 "subcorr_pair_counts": self.targets["subcorr_pairs"]}
+                if self.subcorr_targets is not None else {}),
+             **({"variance_reward_target": self.variance_target, "variance_reward_count": self.targets["variance_count"]}
+                if self.variance_target is not None else {})},
             indent=2))
         (self.out / "provenance.json").write_text(json.dumps({
             **_git_state(), "torch": torch.__version__, "python": platform.python_version(),
@@ -279,8 +282,8 @@ class Trainer:
             raise ValueError(f"config differs from the checkpoint (only n_iterations may change): {diff}")
         if ck.dataset != self.dataset.metadata:
             raise ValueError("dataset differs from the one this run was trained on (metadata mismatch)")
-        if self.variance_target is not None:
-            self._check_variance_target()
+        if self.variance_target is not None or self.subcorr_targets is not None:
+            self._check_recorded_targets()
         self._copy_from(ck)
         torch.set_rng_state(ck.torch_rng_state)
         self.rollbacks = list(ck.extra.get("rollbacks", []))
@@ -289,16 +292,24 @@ class Trainer:
             _truncate_jsonl(self.out / name, self.iteration)
         self._event("resume")
 
-    def _check_variance_target(self) -> None:
-        """On resume with the variance reward: the target recomputed now must be the one dataset.json recorded at
-        the start (relative 1e-9: the same data on the same platform gives it to rounding)."""
+    def _check_recorded_targets(self) -> None:
+        """On resume with the variance or sub-block reward: the targets recomputed now must be the ones dataset.json
+        recorded at the start (relative 1e-9: the same data on the same platform gives them to rounding)."""
         try:
-            stored = json.loads((self.out / "dataset.json").read_text())["variance_reward_target"]
-        except (OSError, ValueError, KeyError) as e:
-            raise ValueError(f"cannot resume: {self.out / 'dataset.json'} holds no variance_reward_target") from e
-        if not abs(stored / self.variance_target - 1) <= 1e-9:
-            raise ValueError(f"variance_reward_target {self.variance_target!r} differs from the {stored!r} this run "
-                             "started with")
+            saved = json.loads((self.out / "dataset.json").read_text())
+        except (OSError, ValueError) as e:
+            raise ValueError(f"cannot resume: {self.out / 'dataset.json'} cannot be read") from e
+        now = {}
+        if self.variance_target is not None:
+            now["variance_reward_target"] = [self.variance_target]
+        if self.subcorr_targets is not None:
+            now["subcorr_targets"] = [float(x) for x in self.targets["subcorr"]]
+        for key, values in now.items():
+            if key not in saved:
+                raise ValueError(f"cannot resume: {self.out / 'dataset.json'} holds no {key}")
+            stored = saved[key] if isinstance(saved[key], list) else [saved[key]]
+            if len(stored) != len(values) or not all(abs(a - b) <= 1e-9 * max(abs(b), 1e-12) for a, b in zip(stored, values, strict=True)):
+                raise ValueError(f"{key} {values!r} differs from the {stored!r} this run started with")
 
     def _copy_from(self, ck) -> None:
         """Copy a full checkpoint into the existing modules, optimizers and generator (strict)."""
@@ -338,7 +349,8 @@ class Trainer:
             total, rewards = loss, {}
             if self.config.rewards_on:                 # drawn after the fake window, from the same generator
                 reward, rewards = generator_rewards(self.gz, self.gy, self.config, self.corr_targets, generator=self.gen,
-                                                    variance_target=self.variance_target)
+                                                    variance_target=self.variance_target,
+                                                    subcorr_targets=self.subcorr_targets)
                 total = loss + reward
             self.opt_g.zero_grad(set_to_none=True)
             total.backward()

@@ -373,3 +373,147 @@ class TestVarianceReward:
         with pytest.raises(ValueError, match="variance_target"):
             generator_rewards(gz, gy, config(corr_reward_blocks=3, variance_reward_weight=1.0), torch.zeros(2),
                               variance_target=bad)
+
+
+
+# =============================================================================
+# generator_rewards and block_sum_variance exactly as they were at a1358ef (Batch 9), before the sub-block reward.
+# The reference that subcorr_block_steps = 0 must reproduce bit for bit, the variance reward included. Do not edit.
+def _block_sum_variance_a1358ef(sums: torch.Tensor) -> torch.Tensor:
+    """Variance of block sums pooled over chains, blocks and axes (one mean removed). sums: (B, L, C).
+    The torch twin of WindowDataset.block_sum_variance for one block grid."""
+    if sums.dim() != 3:
+        raise ValueError(f"sums must be (B, L, C); got {tuple(sums.shape)}")
+    x = sums.reshape(-1)
+    return (x - x.mean()).square().mean()
+
+
+def _generator_rewards_a1358ef(gz, gy, config, corr_targets: torch.Tensor | None = None,
+                      generator: torch.Generator | None = None,
+                      variance_target: float | None = None) -> tuple[torch.Tensor, dict]:
+    """(weighted sum of the enabled terms, {name: detached value} for reward_metric_names(config)).
+    corr_targets: (corr_reward_blocks - 1,) on the models' device; needed when that reward is on.
+    variance_target: V_target > 0 (WindowDataset.block_sum_variance); needed when the variance reward is on."""
+    n, blocks = config.reward_chains, config.corr_reward_blocks
+    if not config.rewards_on:
+        raise ValueError("no reward is enabled in this config")
+    if blocks and (corr_targets is None or corr_targets.shape != (blocks - 1,)):
+        raise ValueError(f"corr_targets must hold the {blocks - 1} target correlations")
+    if config.variance_reward_weight > 0 and not (variance_target is not None and variance_target > 0):
+        raise ValueError("variance_target must be the positive target block-sum variance")
+    param = next(gz.parameters())
+
+    def step(z):
+        return gz(z, gz.sample_noise(n, device=z.device, dtype=z.dtype, generator=generator))
+
+    z = _initial_latents(gz, n, generator, param.device, param.dtype)
+    with torch.set_grad_enabled(blocks > 0):          # the noise-use term starts from a detached z_c
+        for _ in range(config.burn_in):
+            z = step(z)
+    total, stats = 0.0, {}
+    if config.noise_use_min > 0:
+        share = noise_use_share(step(z.detach()), step(z.detach()))
+        penalty = torch.relu(config.noise_use_min - share).square().mean()
+        total = total + config.noise_use_weight * penalty
+        stats["noise_use_share"], stats["noise_use_penalty"] = share.mean().detach(), penalty.detach()
+    if blocks:
+        states = [z]
+        for _ in range(blocks - 1):
+            states.append(step(states[-1]))
+        y = torch.cat([gy.generate(s, generator=generator) for s in states], dim=1)        # (n, L*M, C)
+        y = _center(y) if config.mean_operation else y
+        sums = y.reshape(n, blocks, config.block_len, -1).sum(dim=2)                       # (n, L, C)
+        error = (block_sum_correlations(sums, blocks - 1) - corr_targets).square().sum()
+        total = total + config.corr_reward_weight * error
+        stats["corr_error"] = error.detach()
+        if config.variance_reward_weight > 0:                 # the same sums: no forward pass, no draw
+            ratio = _block_sum_variance_a1358ef(sums) / variance_target
+            penalty = torch.log(ratio).square()
+            total = total + config.variance_reward_weight * penalty
+            stats["block_var_ratio"], stats["variance_penalty"] = ratio.detach(), penalty.detach()
+    stats["reward_loss"] = total.detach()
+    return total, stats
+
+
+def _side_chain(gz, gy, c, seed):
+    """The centred side-chain blocks generator_rewards(..., generator=manual_seed(seed)) decodes, by hand."""
+    g = torch.Generator().manual_seed(seed)
+    n, L = c.reward_chains, c.corr_reward_blocks
+    z = gz.unroll(torch.rand(n, LAT, generator=g), c.burn_in, generator=g)[-1]
+    if c.noise_use_min > 0:
+        gz.sample_noise(n, generator=g), gz.sample_noise(n, generator=g)
+    states = gz.unroll(z, L - 1, generator=g)
+    y = torch.cat([gy.generate(s, generator=g) for s in states], dim=1)
+    return y - y.mean(0, keepdim=True)
+
+
+class TestSubblockReward:
+    """subcorr_block_steps (not in the papers; off by default). SMALL's M = 8; sub-blocks of 2 steps, 8 per 2 blocks."""
+
+    ON = dict(corr_reward_blocks=2, subcorr_block_steps=2, subcorr_lags=7, subcorr_weight=3.0)
+
+    @pytest.mark.parametrize("kw", [{"corr_reward_blocks": 4}, {"corr_reward_blocks": 2, "noise_use_min": 0.5},
+                                    {"corr_reward_blocks": 2, "corr_reward_weight": 0.0, "variance_reward_weight": 2.0},
+                                    {"corr_reward_blocks": 4, "noise_use_min": 0.9, "variance_reward_weight": 0.5}],
+                             ids=["corr", "lag1_noise", "variance_corr_off", "everything_batch9"])
+    def test_off_is_the_batch9_reward_bit_for_bit(self, gz, gy, kw):
+        """subcorr_block_steps = 0 (default): loss, gradients, logged values and the generator state after the call
+        equal generator_rewards at a1358ef exactly, the variance reward included."""
+        c, t = config(**kw), torch.linspace(-0.3, 0.1, kw["corr_reward_blocks"] - 1)
+        vt = 0.7 if kw.get("variance_reward_weight") else None
+        params = [*gz.parameters(), *gy.parameters()]
+        g_new, g_old = torch.Generator().manual_seed(31), torch.Generator().manual_seed(31)
+        new, s_new = generator_rewards(gz, gy, c, t, generator=g_new, variance_target=vt)
+        old, s_old = _generator_rewards_a1358ef(gz, gy, c, t, generator=g_old, variance_target=vt)
+        assert torch.equal(new, old) and torch.equal(g_new.get_state(), g_old.get_state())
+        assert list(s_new) == list(s_old) and all(torch.equal(s_new[k], s_old[k]) for k in s_new)
+        for a, b in zip(torch.autograd.grad(new, params, allow_unused=True),
+                        torch.autograd.grad(old, params, allow_unused=True), strict=True):
+            assert (a is None and b is None) or torch.equal(a, b)
+
+    def test_matches_hand_construction_and_draws_nothing_more(self, gz, gy):
+        c = config(**self.ON, noise_use_min=0.9)
+        t, st = torch.tensor([-0.2]), torch.linspace(-0.3, 0.2, 7)
+        g = torch.Generator().manual_seed(32)
+        loss, stats = generator_rewards(gz, gy, c, t, generator=g, subcorr_targets=st)
+        g0 = torch.Generator().manual_seed(32)
+        base, s0 = generator_rewards(gz, gy, config(corr_reward_blocks=2, noise_use_min=0.9), t, generator=g0)
+        assert torch.equal(g.get_state(), g0.get_state())
+        y = _side_chain(gz, gy, c, 32)
+        sub = y.reshape(32, 8, 2, C).sum(2)
+        err = (block_sum_correlations(sub, 7) - st).square().sum()
+        torch.testing.assert_close(loss, base + 3.0 * err, rtol=1e-6, atol=0)
+        torch.testing.assert_close(stats["subcorr_error"], err, rtol=1e-6, atol=0)
+        assert tuple(stats) == reward_metric_names(c) and not any(x.requires_grad for x in stats.values())
+
+    def test_zero_at_its_own_targets_and_positive_away(self, gz, gy):
+        c = config(**{**self.ON, "corr_reward_weight": 0.0})
+        own = block_sum_correlations(_side_chain(gz, gy, c, 33).reshape(32, 8, 2, C).sum(2), 7).detach()
+        run = lambda st: generator_rewards(gz, gy, c, torch.zeros(1), generator=torch.Generator().manual_seed(33),  # noqa: E731
+                                           subcorr_targets=st)
+        loss, s = run(own)
+        assert float(loss.detach()) < 1e-10 and float(s["subcorr_error"]) < 1e-10
+        assert float(run(own + 0.2)[0].detach()) == pytest.approx(3.0 * 7 * 0.04, rel=1e-4)
+
+    def test_variance_term_uses_the_sub_block_sums(self, gz, gy):
+        c = config(**{**self.ON, "corr_reward_weight": 0.0, "subcorr_weight": 0.0, "variance_reward_weight": 1.0})
+        loss, stats = generator_rewards(gz, gy, c, torch.zeros(1), generator=torch.Generator().manual_seed(34),
+                                        variance_target=0.5, subcorr_targets=torch.zeros(7))
+        v = block_sum_variance(_side_chain(gz, gy, c, 34).reshape(32, 8, 2, C).sum(2))
+        torch.testing.assert_close(stats["block_var_ratio"], (v / 0.5).detach(), rtol=1e-6, atol=0)
+        torch.testing.assert_close(loss, torch.log(v / 0.5).square(), rtol=1e-5, atol=0)
+
+    def test_gradient_reaches_g_y_and_the_transitions(self, gz, gy):
+        c = config(**{**self.ON, "corr_reward_weight": 0.0})
+        loss, _ = generator_rewards(gz, gy, c, torch.zeros(1), generator=torch.Generator().manual_seed(35),
+                                    subcorr_targets=torch.full((7,), 0.5))
+        loss.backward()
+        assert all(p.grad is not None and p.grad.abs().max() > 0 for p in gy.parameters())
+        assert gz.input_layer.weight.grad is not None and gz.input_layer.weight.grad.abs().max() > 0
+
+    def test_metric_names_and_refusal_without_targets(self, gz, gy):
+        assert reward_metric_names(config(**self.ON, variance_reward_weight=1.0)) == \
+            ("corr_error", "subcorr_error", "block_var_ratio", "variance_penalty", "reward_loss")
+        for bad in (None, torch.zeros(6)):
+            with pytest.raises(ValueError, match="subcorr_targets"):
+                generator_rewards(gz, gy, config(**self.ON), torch.zeros(1), subcorr_targets=bad)
