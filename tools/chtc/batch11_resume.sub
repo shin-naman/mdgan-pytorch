@@ -1,0 +1,52 @@
+# Batch 11, resumes: 3 jobs, Batch 10's c2_both_paper_var seeds 0-2 (cluster 9045163), 150k -> 300k.
+# PREDICTIONS (with batch11.sub's seeds 3-5): typical err at or below the authors' 16.3 % median over all 30
+# checkpoints; median D within 0.85-1.15; no checkpoint with share78 above 0.2; best-of-30 err against their
+# 4.7-7.6 %; variance within 0.8-1.25 of MD through 300k (c2_both_paper, without the variance reward, degraded after
+# 150k: at 300k two of its three seeds had D 49 x and 120 x MD).
+# resume_c2_both_paper_var.json is configs/batch10_c2_both_paper_var.json with n_iterations 300000 and nothing else
+# changed (resume refuses anything else), so the one full checkpoint stays at 150k; latest.pt is written at 300k.
+# Checked on the laptop for the three latest.pt files (iteration 150000, full checkpoints, trained at fbeedbf): the
+# config run_train.sh builds on resume (checkpoint config <- this JSON <- seed) differs from the checkpoint's only in
+# n_iterations, field by field. The Batch 11 code trains bit-identically to fbeedbf, also when a run started there is
+# resumed by it (laptop, CPU, batch10_c2_both_paper_var and two other configs).
+# Code: branch batch8-short-data (see batch11.sub). NOT in the papers (the rewards).
+# Each job takes its run directory in under its original name (the folders must be on the submit node);
+# --auto-resume continues from latest.pt. 150k more iterations at 0.062-0.103 s each: 3-5 h, one 11 h session.
+# Disk: each folder grows from about 1.8 GB to about 2.9 GB (15 more 72 MB snapshots). Logs get a _resume_c<Cluster>
+# suffix.
+# Submit from the repository root in /home:  condor_submit tools/chtc/batch11_resume.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+executable                = tools/chtc/run_train.sh
+should_transfer_files     = YES
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+
+request_gpus              = 1
+# The container's PyTorch (2.5.1, CUDA 12.4) has GPU code for compute capability 5.0-9.0 only;
+# newer GPUs fail at the first CUDA call ('no kernel image is available'). 9.0 = H100, 8.9 = L40.
+gpus_minimum_capability   = 7.0
+gpus_maximum_capability   = 9.0
+# gpu2008: its GPU fails every job at the first CUDA call (busy or unavailable), Nov 2026
+requirements              = (Machine != "gpu2008.chtc.wisc.edu")
++WantGPULab               = true
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 5GB
+
+arguments                 = $(RUN) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=$(CFG).json"
+transfer_input_files      = src, configs/$(CFG).json, data/cache/PE.npz, run_$(RUN)
+transfer_checkpoint_files = run_$(RUN)
+transfer_output_files     = run_$(RUN)
+log                       = logs/$(RUN)_resume_c$(Cluster).log
+output                    = logs/$(RUN)_resume_c$(Cluster).out
+error                     = logs/$(RUN)_resume_c$(Cluster).err
+
+queue CFG, RUN, SEED from (
+  resume_c2_both_paper_var, c2_both_paper_var_c9045163_seed0, 0
+  resume_c2_both_paper_var, c2_both_paper_var_c9045163_seed1, 1
+  resume_c2_both_paper_var, c2_both_paper_var_c9045163_seed2, 2
+)

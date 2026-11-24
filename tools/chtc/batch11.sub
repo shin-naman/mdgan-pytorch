@@ -1,0 +1,97 @@
+# Batch 11: confirmation at the authors' budget, and fewer training windows. 9 jobs.
+# Every arm is configs/batch10_c2_both_paper_var.json exactly as trained (the first 128 steps (1.28 ns) of each PE
+# trajectory, no offsets, 2-block increments critic, M 64, sigma units, noise-use reward min 0.5 / weight 100,
+# block lag-1 correlation reward weight 10, variance reward weight 0.92, side chain 2 blocks x 1024 chains) with
+# only the fields below changed. NOT in the papers (the rewards).
+# Code and configs: branch batch8-short-data, the commit before this file's (each run's provenance.json records
+# the commit that ran). The code adds one key to dataset.json, corr_reward_pairs; training is bit-identical to
+# fbeedbf (Batch 10), also when a run started there is resumed by it.
+#
+#   arm (config batch11_<arm>.json)  seeds  iterations  departure from batch10_c2_both_paper_var
+#   c2_both_paper_var                3-5    300k        n_iterations 300000, full checkpoint at 300000 only
+#   c2_both_paper_var_n30            0-2    50k         full checkpoint at 50000; trains on 30 trajectories (30 held out)
+#   c2_both_paper_var_n15            0-2    50k         full checkpoint at 50000; trains on 15 trajectories (45 held out)
+# Seeds 0-2 of c2_both_paper_var are continued to 300k by batch11_resume.sub. Weights are the base's (0.92 and 10),
+# not re-measured on the subsets: one configuration at different data sizes.
+#
+# Subsets: one permutation of the 60 trajectory indices, numpy.random.default_rng(11).permutation(60). n15 trains
+# on its first 15 entries, n30 on its first 30, so the sets are nested and the arms differ only by added data:
+#   permutation  26 52 11 59 5 4 53 24 34 43 6 45 1 15 9 | 38 3 44 37 33 57 41 29 18 40 46 32 42 7 56 | 8 51 0 55 47
+#                36 2 17 23 49 35 21 27 22 58 28 12 25 50 54 20 31 13 48 19 30 10 39 16 14
+#   n15 trains on  1 4 5 6 9 11 15 24 26 34 43 45 52 53 59
+#   n30 trains on  1 3 4 5 6 7 9 11 15 18 24 26 29 32 33 34 37 38 40 41 42 43 44 45 46 52 53 56 57 59
+# The configs list the complement as holdout_trajectories. Held-out trajectories never enter sigma, the windows or
+# the targets; the reference MSD the runs evaluate against stays on all 60. With 15 or 30 windows a 64-window critic
+# batch repeats windows.
+#
+# Sigma and targets (dataset.json, with counts; training trajectories only, region 0-128):
+#   arm                     windows  sigma (nm)  block lag-1 target (pairs)  block variance target (block sums)
+#   c2_both_paper_var       60       0.16963     -0.2457 (180)               9.835 sigma^2 = 0.2830 nm^2 (360)
+#   c2_both_paper_var_n30   30       0.16564     -0.2520 (90)                8.297 sigma^2 = 0.2276 nm^2 (180)
+#   c2_both_paper_var_n15   15       0.16300     -0.2543 (45)                7.206 sigma^2 = 0.1915 nm^2 (90)
+# This draw's subsets have low block-sum variance: 0.80 x (n30) and 0.68 x (n15) the all-60 value in nm^2, both at
+# about the 5th percentile of random subsets of their size (medians 1.00 and 0.98, 5000 draws). With the lag-1
+# targets, D ~ V (1 + 2 rho_1) gives target-implied D of about 0.78 x (n30) and 0.65 x (n15) the all-60 arm's.
+#
+# PREDICTIONS
+#   c2_both_paper_var (resumes and seeds 3-5): typical err at or below the authors' 16.3 % median over all 30
+#     checkpoints (10k-300k); median D within 0.85-1.15; no checkpoint with share78 above 0.2; per-run best-of-30 err
+#     to be compared with their 4.7-7.6 %. Variance stays within 0.8-1.25 of MD through 300k (c2_both_paper, without
+#     the variance reward, degraded after 150k; this one should not).
+#   c2_both_paper_var_n30: latent passes at every checkpoint; across-seed spread in D roughly +/- 35 %.
+#   c2_both_paper_var_n15: latent passes; spread roughly +/- 50 %. The lag-1 target may be far enough from the truth
+#     to fail on D by construction; then D against the target-implied D (above, 0.65 x the all-60 arm) is the number
+#     to read.
+#
+# Reading the results: arm-eval at every 10k (30 checkpoints for the 300k runs) on data/cache/PE.npz. The rewards
+# train on block variance and block lag 1, so var/MD and rho(1-3) cannot judge these arms on their own; judge on
+# err, D, the MSD ratio at 10-78 ns, sum rho(4-30) and the latent criteria. arm-eval's D_tgt reads only the lag-1
+# target; the variance target moves the implied D too (above).
+#
+# Disk: a 300k run about 2.9 GB (latest.pt and full_300000.pt 375 MB each, thirty 72 MB snapshots), a 50k run about
+# 1.1 GB: about 15 GB for these 9 runs, about 24 GB with the resumes. Clear Batch 10 from the submit node first,
+# keeping run_c2_both_paper_var_c9045163_seed{0,1,2} (batch11_resume.sub needs them).
+# Time: Batch 10's c2_both_paper_var ran at 0.062-0.103 s per iteration: a 300k run 5-9 h (one or two 11 h
+# sessions), a 50k run about 1-1.5 h.
+# Submit from the repository root in /home:  condor_submit tools/chtc/batch11.sub
+
+universe                  = container
+container_image           = docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+executable                = tools/chtc/run_train.sh
+should_transfer_files     = YES
+when_to_transfer_output   = ON_EXIT
+checkpoint_exit_code      = 85
+
+request_gpus              = 1
+# The container's PyTorch (2.5.1, CUDA 12.4) has GPU code for compute capability 5.0-9.0 only;
+# newer GPUs fail at the first CUDA call ('no kernel image is available'). 9.0 = H100, 8.9 = L40.
+gpus_minimum_capability   = 7.0
+gpus_maximum_capability   = 9.0
+# gpu2008: its GPU fails every job at the first CUDA call (busy or unavailable), Nov 2026
+requirements              = (Machine != "gpu2008.chtc.wisc.edu")
++WantGPULab               = true
++GPUJobLength             = "short"
+request_cpus              = 2
+request_memory            = 4GB
+request_disk              = 5GB
+
+arguments                 = $(ARM)_c$(Cluster)_seed$(SEED) $(SEED)
+environment               = "MAX_HOURS=11 CONFIG=batch11_$(ARM).json"
+transfer_input_files      = src, configs/batch11_$(ARM).json, data/cache/PE.npz
+transfer_checkpoint_files = run_$(ARM)_c$(Cluster)_seed$(SEED)
+transfer_output_files     = run_$(ARM)_c$(Cluster)_seed$(SEED)
+log                       = logs/$(ARM)_c$(Cluster)_seed$(SEED).log
+output                    = logs/$(ARM)_c$(Cluster)_seed$(SEED).out
+error                     = logs/$(ARM)_c$(Cluster)_seed$(SEED).err
+
+queue ARM, SEED from (
+  c2_both_paper_var, 3
+  c2_both_paper_var, 4
+  c2_both_paper_var, 5
+  c2_both_paper_var_n30, 0
+  c2_both_paper_var_n30, 1
+  c2_both_paper_var_n30, 2
+  c2_both_paper_var_n15, 0
+  c2_both_paper_var_n15, 1
+  c2_both_paper_var_n15, 2
+)
