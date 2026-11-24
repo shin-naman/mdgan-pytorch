@@ -90,11 +90,12 @@ def block_sum_variance(sums: torch.Tensor) -> torch.Tensor:
 
 def reward_targets(config, dataset) -> dict:
     """Every target the enabled rewards need, measured once from the training region, with its sample count:
-    corr (block lags 1..L-1), subcorr and subcorr_pairs (sub-block lags 1..K), variance and variance_count (of the
+    corr and corr_pairs (block lags 1..L-1), subcorr and subcorr_pairs (sub-block lags 1..K), variance and variance_count (of the
     block sums, or of the sub-block sums when subcorr_block_steps > 0). Only the enabled terms' keys."""
     out, s = {}, config.subcorr_block_steps
     if config.corr_reward_blocks:
         out["corr"] = dataset.block_sum_correlations(config.corr_reward_blocks)
+        out["corr_pairs"] = dataset.block_pair_counts(config.corr_reward_blocks)
     if s:
         out["subcorr"] = dataset.subblock_sum_correlations(s, config.subcorr_lags)
         out["subcorr_pairs"] = dataset.subblock_pair_counts(s, config.subcorr_lags)

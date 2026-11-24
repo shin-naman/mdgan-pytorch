@@ -1186,6 +1186,7 @@ class TestSubblockRewardTraining:
         saved = json.loads((tmp_path / "run" / "dataset.json").read_text())
         np.testing.assert_allclose(saved["subcorr_targets"], t.dataset.subblock_sum_correlations(2, 7), rtol=1e-6)
         assert saved["subcorr_pair_counts"] == t.dataset.subblock_pair_counts(2, 7)
+        assert saved["corr_reward_pairs"] == t.dataset.block_pair_counts(t.config.corr_reward_blocks)
         v, n = t.dataset.subblock_sum_variance(2)
         assert (saved["variance_reward_target"], saved["variance_reward_count"]) == (v, n)
         rows = jsonl(tmp_path / "run" / "metrics.jsonl")

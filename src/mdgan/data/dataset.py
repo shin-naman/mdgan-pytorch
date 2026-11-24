@@ -238,6 +238,12 @@ class WindowDataset:
         """How many M-step block sums (trajectories x blocks x axes, over every grid used) block_sum_variance pools."""
         return int(sum(x.size for x in self._block_sum_grids(n_blocks)))
 
+    def block_pair_counts(self, n_blocks: int) -> list[int]:
+        """Pairs behind each lag k = 1 .. n_blocks - 1 of block_sum_correlations: trajectories x (blocks - k) x axes,
+        summed over the block grids it averages."""
+        grids = [s.shape for s in self._block_sum_grids(n_blocks)]
+        return [int(sum(w * (nb - k) * c for w, nb, c in grids)) for k in range(1, n_blocks)]
+
     def _subblock_sums(self, steps: int) -> np.ndarray:
         """(W, nb, C): each training trajectory's region cut into consecutive `steps`-step sub-blocks from its first
         step (one grid), each summed; a remainder shorter than `steps` is dropped."""

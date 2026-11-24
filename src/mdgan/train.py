@@ -255,7 +255,8 @@ class Trainer:
         (self.out / "dataset.json").write_text(json.dumps(
             {**self.dataset.metadata, "position_rms_ratio": self.dataset.position_rms_ratio,
              **({"D_analytic_m2s": self.dataset.analytic_D_m2s} if self.dataset.analytic_D_m2s is not None else {}),
-             **({"corr_reward_targets": self.corr_targets.tolist()} if self.corr_targets is not None else {}),
+             **({"corr_reward_targets": self.corr_targets.tolist(), "corr_reward_pairs": self.targets["corr_pairs"]}
+                if self.corr_targets is not None else {}),
              **({"subcorr_targets": [float(x) for x in self.targets["subcorr"]],
                  "subcorr_pair_counts": self.targets["subcorr_pairs"]}
                 if self.subcorr_targets is not None else {}),

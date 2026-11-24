@@ -570,6 +570,22 @@ def test_block_sum_variance_needs_the_blocks_in_the_region(n):
         ds.block_sum_variance(n)
 
 
+def test_block_pair_counts_by_hand():
+    """trajectories x (blocks - k) x axes on each block grid, summed over grids; held-out trajectories excluded.
+    The papers' region (2M, one grid of 2 blocks) gives one pair per trajectory and axis."""
+    sys_ = _plain_system(n_steps=4 * M)
+    paper = WindowDataset(sys_, block_len=M, step_skip=1)
+    assert paper.block_pair_counts(2) == [5 * 1 * 3]
+    held = WindowDataset(sys_, block_len=M, step_skip=1, holdout_trajectories=(1, 3))
+    assert held.block_pair_counts(2) == [3 * 1 * 3]
+    k = M // 2                                          # region 2.5 M: grids o <= M/2 hold 2 blocks
+    ds = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=k)
+    assert ds.block_pair_counts(2) == [(M // 2 + 1) * 5 * 1 * 3]
+    four = WindowDataset(sys_, block_len=M, step_skip=1, window_offset_max_steps=2 * M)   # region 4 M
+    expected = [sum(5 * ((4 * M - o) // M - lag) * 3 for o in range(M) if (4 * M - o) // M >= 4) for lag in (1, 2, 3)]
+    assert four.block_pair_counts(4) == expected == [5 * 3 * 3, 5 * 2 * 3, 5 * 1 * 3]
+
+
 # --- region start (not in the papers) ----------------------------------------------------------------------
 
 def _plain_system(n_steps=200):
